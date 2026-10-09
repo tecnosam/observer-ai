@@ -1,0 +1,15 @@
+{
+  "question": "Who wrote the novel that the 1997 film Jackie Brown is based on?",
+  "tool_calls": [
+    {"name": "search", "args": {"query": "Jackie Brown 1997 film based on"}, "status": "ok"},
+    {"name": "search", "args": {"query": "Rum Punch author"}, "status": "ok"}
+  ],
+  "evidence": [
+    "Jackie Brown is a 1997 American crime film written and directed by Quentin Tarantino.",
+    "The film is based on the 1992 novel Rum Punch.",
+    "Rum Punch is a novel by Elmore Leonard.",
+    "FOURTH ITEM: must not appear in the slice.",
+    "FIFTH ITEM: must not appear in the slice."
+  ],
+  "final_answer": "Elmore Leonard"
+}

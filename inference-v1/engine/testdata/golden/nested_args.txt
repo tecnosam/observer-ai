@@ -1,0 +1,22 @@
+USER QUESTION:
+How many open orders are over the limit?
+
+TOOL CALLS:
+1. query_orders({'filter': {'status': ['open', 'pending'], 'amount': {'gt': 100, 'lte': 2500.5}}, 'limit': 10, 'offset': 0, 'strict': True, 'dry_run': False, 'cursor': None, 'tags': [], 'meta': {}, 'matrix': [[1, 2], [3, [4, {'deep': [None, True, 'x']}]]]}) -> ok
+2. math({'one': 1.0, 'tenth': 0.1, 'neg': -2.5, 'neg_zero_int': 0, 'neg_zero_float': -0.0, 'big_exp': 1e+16, 'below_exp': 1000000000000000.0, 'small': 0.0001, 'smaller': 1e-05, 'upper_e': 100000.0, 'precise': 3.141592653589793, 'third': 0.30000000000000004, 'huge': 1.7976931348623157e+308, 'tiny': 5e-324, 'overflow': inf, 'neg_overflow': -inf, 'underflow': 0.0, 'big_int': 123456789012345678901234567890, 'neg_int': -42, 'sci_int': 12000.0, 'frac_exp': 1.5e-07, 'long_frac': 123456789.12345679}) -> ok
+3. dup_keys({'a': 3, 'b': 2}) -> ok
+4. list_args(['a', 1, 2.0, None, {'k': 'v'}]) -> ok
+5. int_arg(7) -> ok
+6. bool_arg(True) -> ok
+7. null_arg(None) -> ok
+8. no_args('') -> ok
+9. empty_string_arg('') -> ok
+10. null_status('x') -> None
+11. int_status('x') -> 404
+12. empty_status('x') -> 
+
+EVIDENCE:
+[1] 3 orders match.
+
+FINAL ANSWER:
+3

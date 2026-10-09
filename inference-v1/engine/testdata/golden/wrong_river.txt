@@ -1,0 +1,13 @@
+USER QUESTION:
+Which river flows through the capital of the country where the Eiffel Tower is?
+
+TOOL CALLS:
+1. search({'query': 'Eiffel Tower location'}) -> ok
+2. search({'query': 'rivers in Lyon'}) -> ok
+
+EVIDENCE:
+[1] The Eiffel Tower is a wrought-iron tower in Paris, France.
+[2] Lyon sits at the confluence of the Rhône and Saône rivers.
+
+FINAL ANSWER:
+The Rhône flows through the capital, Lyon.

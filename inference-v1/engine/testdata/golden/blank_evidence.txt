@@ -1,0 +1,13 @@
+USER QUESTION:
+What does the empty document say?
+
+Please be brief.
+
+TOOL CALLS:
+1. read({'path': 'empty.txt'}) -> ok
+
+EVIDENCE:
+[1] 
+
+FINAL ANSWER:
+Nothing.

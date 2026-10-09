@@ -1,0 +1,331 @@
+openapi: 3.0.3
+info:
+  title: Observer.ai inference engine
+  version: 0.1.0
+  description: |
+    Decides which LLM agent traces are worth keeping for review. Each trace is
+    rendered into a state string, scored by the Kev decision model, and passed
+    through a keep/drop policy. Kept traces are exported to Arize Phoenix.
+servers:
+  - url: /
+    description: This server
+tags:
+  - name: traces
+    description: Submit agent traces for a keep/drop decision
+  - name: health
+    description: Liveness and readiness
+paths:
+  /v1/traces:
+    post:
+      tags: [traces]
+      operationId: enqueueTrace
+      summary: Queue a trace
+      description: |
+        Validates the trace, puts it on the bounded worker queue and returns
+        immediately. The decision is made in the background and written to
+        the engine's log; kept traces are exported to Phoenix.
+      requestBody:
+        $ref: "#/components/requestBodies/Trace"
+      responses:
+        "202":
+          description: The trace was queued.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Accepted"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "413":
+          $ref: "#/components/responses/TooLarge"
+        "503":
+          description: The queue is full or the server is shutting down. Retry later.
+          headers:
+            Retry-After:
+              description: Seconds to wait before retrying.
+              schema:
+                type: integer
+                example: 1
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                error: queue full, retry later
+  /v1/traces:score:
+    post:
+      tags: [traces]
+      operationId: scoreTrace
+      summary: Score a trace synchronously
+      description: |
+        Runs the same pipeline as `POST /v1/traces` but waits for the result
+        and returns the decision. Meant for testing and demos. If the trace is
+        kept, the export is flushed before the response is sent.
+
+        If Kev cannot be reached after its retries the request still succeeds:
+        the decision is a random keep at the `random_floor` rate with reason
+        `fallback`, and `p_keep` and `p_keep_raw` are null.
+      requestBody:
+        $ref: "#/components/requestBodies/Trace"
+      responses:
+        "200":
+          description: The decision for the trace.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Decision"
+              examples:
+                keep:
+                  summary: Kept by Kev
+                  value:
+                    trace_id: wrong-river-001
+                    decision: keep
+                    p_keep: 0.626
+                    p_keep_raw: 0.6087
+                    reason: kev
+                    severity: normal
+                    model: kev-latest
+                    latency_ms: 78.5
+                    exported: true
+                drop:
+                  summary: Dropped
+                  value:
+                    trace_id: 7f3a91c2e8
+                    decision: drop
+                    p_keep: 0.2608
+                    p_keep_raw: 0.2903
+                    reason: below_threshold
+                    severity: none
+                    model: kev-latest
+                    latency_ms: 26
+                    exported: false
+                fallback:
+                  summary: Kev unreachable
+                  value:
+                    trace_id: wrong-river-001
+                    decision: drop
+                    p_keep: null
+                    p_keep_raw: null
+                    reason: fallback
+                    severity: none
+                    model: kev-latest
+                    latency_ms: 7512.4
+                    exported: false
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "413":
+          $ref: "#/components/responses/TooLarge"
+  /healthz:
+    get:
+      tags: [health]
+      operationId: healthz
+      summary: Liveness
+      description: Returns 200 whenever the process is up, whether or not Kev is reachable.
+      responses:
+        "200":
+          description: The process is up.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Status"
+              example:
+                status: ok
+  /readyz:
+    get:
+      tags: [health]
+      operationId: readyz
+      summary: Readiness
+      description: Returns 200 only if the Kev server answers a cheap probe within 2 seconds.
+      responses:
+        "200":
+          description: Kev is reachable.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Status"
+              example:
+                status: ready
+        "503":
+          description: Kev is not reachable.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Status"
+              example:
+                status: unavailable
+                error: "kev is not reachable: connection refused"
+components:
+  requestBodies:
+    Trace:
+      required: true
+      description: One agent trace. The body is parsed as JSON whatever its Content-Type.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Trace"
+          examples:
+            wrong_answer:
+              summary: An answer the evidence does not support
+              value:
+                trace_id: wrong-river-001
+                question: Which river flows through the capital of the country where the Eiffel Tower is?
+                tool_calls:
+                  - name: search
+                    args: {query: Eiffel Tower location}
+                    status: ok
+                  - name: search
+                    args: {query: rivers in Lyon}
+                    status: ok
+                evidence:
+                  - The Eiffel Tower is a wrought-iron tower in Paris, France.
+                  - Lyon sits at the confluence of the Rhône and Saône rivers.
+                final_answer: The Rhône flows through the capital, Lyon.
+            correct_answer:
+              summary: A supported answer
+              value:
+                trace_id: 7f3a91c2e8
+                question: Which river flows through the capital of France?
+                tool_calls:
+                  - name: search
+                    args: {query: capital of France}
+                    status: ok
+                evidence:
+                  - Paris is the capital of France.
+                  - The Seine flows through Paris.
+                final_answer: The Seine
+            minimal:
+              summary: Only the required fields
+              value:
+                question: What is 2 + 2?
+                final_answer: "4"
+  responses:
+    BadRequest:
+      description: The body is not valid JSON or a required field is missing.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error: final_answer is required
+    TooLarge:
+      description: The request body is larger than 8 MiB.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error: request body too large
+  schemas:
+    Trace:
+      type: object
+      required: [question, final_answer]
+      properties:
+        trace_id:
+          type: string
+          description: Your identifier for the trace. If omitted, the engine generates 32 hex characters.
+          example: 7f3a91c2e8
+        question:
+          type: string
+          minLength: 1
+          description: The user's question to the agent.
+        tool_calls:
+          type: array
+          description: Tool calls the agent made, in order.
+          items:
+            $ref: "#/components/schemas/ToolCall"
+        evidence:
+          type: array
+          description: |
+            Evidence the agent gathered. Only the first 3 items, each cut to
+            1500 characters, are shown to the model; all of them are exported.
+          items:
+            type: string
+        final_answer:
+          type: string
+          minLength: 1
+          description: The agent's final answer.
+    ToolCall:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          example: search
+        args:
+          description: The call's arguments. Any JSON value, usually an object or a string.
+          example: {query: capital of France}
+        status:
+          type: string
+          description: Outcome of the call.
+          default: ok
+          example: ok
+    Accepted:
+      type: object
+      required: [trace_id]
+      properties:
+        trace_id:
+          type: string
+          description: The trace's ID, generated if the request had none.
+          example: c68863b8105c8e95f34eba6666e18d91
+    Decision:
+      type: object
+      required: [trace_id, decision, p_keep, p_keep_raw, reason, severity, model, latency_ms, exported]
+      properties:
+        trace_id:
+          type: string
+        decision:
+          type: string
+          enum: [keep, drop]
+        p_keep:
+          type: number
+          format: double
+          nullable: true
+          minimum: 0
+          maximum: 1
+          description: Calibrated probability that the answer is wrong. Null on fallback.
+        p_keep_raw:
+          type: number
+          format: double
+          nullable: true
+          minimum: 0
+          maximum: 1
+          description: Kev's uncalibrated answer to the decision question. Null on fallback.
+        reason:
+          type: string
+          enum: [kev, random_floor, below_threshold, fallback]
+          description: |
+            - `kev`: kept because `p_keep` reached the keep threshold
+            - `random_floor`: below the threshold, kept as a random sample
+            - `below_threshold`: below the threshold and not sampled; dropped
+            - `fallback`: Kev was unreachable; kept or dropped at random
+        severity:
+          type: string
+          enum: [high, normal, none]
+          description: "`high` if kept and `p_keep` reached `alert.severity_high`, `normal` for other keeps, `none` for drops."
+        model:
+          type: string
+          description: The model that scored the trace.
+          example: kev-latest
+        latency_ms:
+          type: number
+          format: double
+          description: Kev's reported latency, or the measured time if Kev reported none or on fallback.
+        exported:
+          type: boolean
+          description: The trace was kept and its flush to Phoenix did not fail.
+    Status:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [ok, ready, unavailable]
+        error:
+          type: string
+          description: Why the server is not ready.
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string

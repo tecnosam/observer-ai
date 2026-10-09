@@ -1,0 +1,11 @@
+USER QUESTION:
+Is the sky blue?
+
+TOOL CALLS:
+(none)
+
+EVIDENCE:
+(none)
+
+FINAL ANSWER:
+Yes

@@ -1,0 +1,1 @@
+{"model":"kev-latest","answers":{"answer_wrong":{"type":"noul","noul":0.93},"answers_question":{"type":"score","score":0.948,"legend":{"0":"Wrong","1":"Partially correct","2":"Fully correct"},"probabilities":{"0":0.454,"1":0.144,"2":0.402},"confidence":0.0}},"usage":{"input_tokens":410,"output_tokens":0},"latency_ms":93}

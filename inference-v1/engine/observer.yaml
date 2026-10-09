@@ -1,0 +1,29 @@
+# Observer.ai inference engine configuration.
+# Every key is optional except scorer.manifest; the values below are the defaults.
+
+server:
+  addr: ":8080"
+  workers: 8             # concurrent scoring workers for POST /v1/traces
+  queue_size: 1000       # queued traces before the API returns 503
+  shutdown_timeout: 30s  # time allowed to drain the queue and flush exports
+
+scorer:
+  endpoint: http://localhost:8010/v1/systemone   # env: OBSERVER_SCORER_ENDPOINT
+  model: kev-latest                              # model name sent to Kev
+  # Relative paths resolve against this file's directory.
+  manifest: ../../finetune/notebooks/runs/observer-kev-0.8b-ft/manifest.json
+  decision_question: answer_wrong
+  timeout: 10s           # per attempt
+  max_retries: 3         # retries after the first attempt
+  backoff: [500ms, 2s, 5s]
+
+policy:
+  keep_threshold: 0.5
+  random_floor: 0.02
+
+alert:
+  severity_high: 0.8
+
+export:
+  phoenix_endpoint: http://localhost:6006/v1/traces   # env: OBSERVER_PHOENIX_ENDPOINT
+  project: observer-ai

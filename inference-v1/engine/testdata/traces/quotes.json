@@ -1,0 +1,13 @@
+{
+  "question": "What did O'Brien mean by \"doublethink\"?",
+  "tool_calls": [
+    {"name": "search", "args": "it's", "status": "ok"},
+    {"name": "search", "args": "say \"hi\"", "status": "ok"},
+    {"name": "search", "args": "it's \"both\"", "status": "ok"},
+    {"name": "search", "args": {"query": "O'Brien", "note": "a \"quoted\" word", "both": "'x' and \"y\""}, "status": "ok"},
+    {"name": "read", "args": {"path": "C:\\Users\\o'brien\\notes.txt", "lines": "a\nb\tc\r\n"}, "status": "error"},
+    {"name": "search", "args": {"it's a key": 1, "\"k\"": 2}}
+  ],
+  "evidence": ["O'Brien says: \"Who controls the past controls the future.\"", "A backslash \\ and a tab\there."],
+  "final_answer": "He meant holding 'two' \"contradictory\" beliefs.\nBoth at once."
+}

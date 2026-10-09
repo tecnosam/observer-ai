@@ -1,0 +1,18 @@
+{
+  "model": "observer-kev-test",
+  "questions": {
+    "answer_wrong": {
+      "type": "noul",
+      "instructions": "Is the final answer wrong or only partially correct for the user's question?"
+    },
+    "answers_question": {
+      "type": "score",
+      "instructions": "How completely and correctly does the final answer address the user's question?",
+      "criteria": ["Wrong", "Partially correct", "Fully correct"]
+    }
+  },
+  "temperatures": {
+    "answer_wrong": 0.86
+  },
+  "created_at": "2026-10-09T10:43:31Z"
+}

@@ -1,0 +1,7 @@
+{
+  "trace_id": "7f3a91c2e8",
+  "question": "Which river flows through the capital of France?",
+  "tool_calls": [{"name": "search", "args": {"query": "capital of France"}, "status": "ok"}],
+  "evidence": ["Paris is the capital of France.", "The Seine flows through Paris."],
+  "final_answer": "The Seine"
+}

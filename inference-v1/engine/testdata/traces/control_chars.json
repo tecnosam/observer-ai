@@ -1,0 +1,12 @@
+{
+  "question": "¿Qué significa «naïve» en español? 日本語もOK 😀",
+  "tool_calls": [
+    {"name": "search", "args": {"q": "naïve café 日本語 😀 \ud83d\ude80", "ключ": "значение"}, "status": "ok"},
+    {"name": "raw", "args": "nul:\u0000 bell:\u0007 esc:\u001b del:\u007f c1:\u0085 nbsp:\u00a0 shy:\u00ad", "status": "ok"},
+    {"name": "raw", "args": "zwsp:\u200b ls:\u2028 ps:\u2029 bom:\ufeff emsp:\u2003 pua:\ue000 rlo:\u202e", "status": "ok"},
+    {"name": "raw", "args": "tag:\udb40\udc01 astral-pua:\udb80\udc00 math:\ud835\udc00 combining:e\u0301", "status": "ok"},
+    {"name": "raw", "args": {"\u0000key\n": "\ttab", "é": "\\u00e9"}, "status": "tímed\nout"}
+  ],
+  "evidence": ["Línea uno\nlínea dos\u00a0con nbsp y \u200b zwsp", "😀 emoji evidence stays raw"],
+  "final_answer": "«Ingenuo» — naïve."
+}

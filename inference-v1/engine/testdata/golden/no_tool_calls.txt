@@ -1,0 +1,11 @@
+USER QUESTION:
+What is 2 + 2?
+
+TOOL CALLS:
+(none)
+
+EVIDENCE:
+(none)
+
+FINAL ANSWER:
+4

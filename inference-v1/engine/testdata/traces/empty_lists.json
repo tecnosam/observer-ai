@@ -1,0 +1,6 @@
+{
+  "question": "Is the sky blue?",
+  "tool_calls": [],
+  "evidence": [],
+  "final_answer": "Yes"
+}

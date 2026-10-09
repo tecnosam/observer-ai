@@ -1,0 +1,12 @@
+USER QUESTION:
+Which river flows through the capital of France?
+
+TOOL CALLS:
+1. search({'query': 'capital of France'}) -> ok
+
+EVIDENCE:
+[1] Paris is the capital of France.
+[2] The Seine flows through Paris.
+
+FINAL ANSWER:
+The Seine

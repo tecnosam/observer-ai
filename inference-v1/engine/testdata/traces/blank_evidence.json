@@ -1,0 +1,6 @@
+{
+  "question": "What does the empty document say?\n\nPlease be brief.",
+  "tool_calls": [{"name": "read", "args": {"path": "empty.txt"}, "status": "ok"}],
+  "evidence": [""],
+  "final_answer": "Nothing."
+}

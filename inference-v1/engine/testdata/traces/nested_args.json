@@ -1,0 +1,44 @@
+{
+  "question": "How many open orders are over the limit?",
+  "tool_calls": [
+    {
+      "name": "query_orders",
+      "args": {
+        "filter": {"status": ["open", "pending"], "amount": {"gt": 100, "lte": 2500.5}},
+        "limit": 10,
+        "offset": 0,
+        "strict": true,
+        "dry_run": false,
+        "cursor": null,
+        "tags": [],
+        "meta": {},
+        "matrix": [[1, 2], [3, [4, {"deep": [null, true, "x"]}]]]
+      },
+      "status": "ok"
+    },
+    {
+      "name": "math",
+      "args": {
+        "one": 1.0, "tenth": 0.1, "neg": -2.5, "neg_zero_int": -0, "neg_zero_float": -0.0,
+        "big_exp": 1e16, "below_exp": 1e15, "small": 0.0001, "smaller": 0.00001,
+        "upper_e": 1E5, "precise": 3.141592653589793, "third": 0.30000000000000004,
+        "huge": 1.7976931348623157e308, "tiny": 5e-324, "overflow": 1e999, "neg_overflow": -1e999,
+        "underflow": 1e-999, "big_int": 123456789012345678901234567890, "neg_int": -42,
+        "sci_int": 12e3, "frac_exp": 1.5e-7, "long_frac": 123456789.123456789
+      },
+      "status": "ok"
+    },
+    {"name": "dup_keys", "args": {"a": 1, "b": 2, "a": 3}, "status": "ok"},
+    {"name": "list_args", "args": ["a", 1, 2.0, null, {"k": "v"}], "status": "ok"},
+    {"name": "int_arg", "args": 7},
+    {"name": "bool_arg", "args": true},
+    {"name": "null_arg", "args": null},
+    {"name": "no_args"},
+    {"name": "empty_string_arg", "args": ""},
+    {"name": "null_status", "args": "x", "status": null},
+    {"name": "int_status", "args": "x", "status": 404},
+    {"name": "empty_status", "args": "x", "status": ""}
+  ],
+  "evidence": ["3 orders match."],
+  "final_answer": "3"
+}
