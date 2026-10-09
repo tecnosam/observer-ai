@@ -1,0 +1,28 @@
+[project]
+name = "observer-agent"
+version = "0.1.0"
+description = "Small ReAct agent over local search tools that generates HotpotQA traces for Observer.ai"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "google-adk",
+    "litellm",
+    "opentelemetry-sdk",
+    "opentelemetry-exporter-otlp-proto-http",
+    "openinference-instrumentation-google-adk",
+]
+
+[dependency-groups]
+dev = [
+    "pytest",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["observer_agent"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
