@@ -1,0 +1,145 @@
+# ============================================
+# Go
+# ============================================
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+bin/
+dist/
+
+# Test binaries and coverage
+*.test
+*.out
+coverage.*
+*.coverprofile
+profile.cov
+
+# Go workspace (keep go.work out unless you intentionally share it)
+go.work
+go.work.sum
+
+# Vendor (uncomment if you don't commit vendored deps)
+# vendor/
+
+# ============================================
+# Python
+# ============================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyd
+
+# Packaging / build
+build/
+develop-eggs/
+eggs/
+.eggs/
+*.egg-info/
+*.egg
+wheels/
+sdist/
+pip-wheel-metadata/
+MANIFEST
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+.python-version
+.pdm-python
+__pypackages__/
+
+# Testing / linting / typing caches
+.pytest_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+.hypothesis/
+.mypy_cache/
+.pyre/
+.pytype/
+.ruff_cache/
+.dmypy.json
+dmypy.json
+
+# Cython
+cython_debug/
+
+# ============================================
+# Jupyter
+# ============================================
+.ipynb_checkpoints/
+*/.ipynb_checkpoints/*
+.jupyter/
+.virtual_documents/
+profile_default/
+ipython_config.py
+
+# ============================================
+# ML training artifacts
+# ============================================
+# Data (track via DVC, LFS, or object storage instead)
+data/
+datasets/
+*.csv
+*.parquet
+*.feather
+*.h5
+*.hdf5
+*.npy
+*.npz
+*.tfrecord
+
+# Model weights and checkpoints
+checkpoints/
+models/
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.onnx
+*.pb
+*.pkl
+*.joblib
+*.bin
+
+# Experiment tracking
+mlruns/
+wandb/
+lightning_logs/
+runs/
+outputs/
+logs/
+tb_logs/
+*.tfevents.*
+
+# Hugging Face / misc caches
+.cache/
+hf_cache/
+
+# ============================================
+# Secrets / env
+# ============================================
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+
+# ============================================
+# Editors / OS
+# ============================================
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
