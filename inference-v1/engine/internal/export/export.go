@@ -1,11 +1,15 @@
 // Package export sends kept traces to Arize Phoenix as OpenInference spans
-// over OTLP/HTTP.
+// over OTLP/HTTP. A trace that arrived as OTLP spans is forwarded as those
+// spans; a trace from the JSON API is rebuilt as an agent_run span with one
+// child per tool call.
 package export
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"time"
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -13,7 +17,10 @@ import (
 	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	oteltrace "go.opentelemetry.io/otel/trace"
+	commonpb "go.opentelemetry.io/proto/otlp/common/v1"
+	tracepb "go.opentelemetry.io/proto/otlp/trace/v1"
 
+	"github.com/observer-ai/engine/internal/otlp"
 	"github.com/observer-ai/engine/internal/policy"
 	"github.com/observer-ai/engine/internal/trace"
 )
@@ -27,7 +34,17 @@ const (
 	spanKindTool   = "TOOL"
 	decisionKeep   = "keep"
 	evidenceKeyFmt = "observer.evidence.%d"
+
+	// A forward runs inside a queue worker, so it has to give up well
+	// within the queue's ack_wait.
+	forwardTimeout    = 10 * time.Second
+	forwardMaxElapsed = 15 * time.Second
 )
+
+// Uploader sends OTLP spans to a backend. The OTLP/HTTP client implements it.
+type Uploader interface {
+	UploadTraces(ctx context.Context, spans []*tracepb.ResourceSpans) error
+}
 
 // Record is one decided trace.
 type Record struct {
@@ -44,12 +61,34 @@ type Exporter struct {
 	tracer   oteltrace.Tracer
 	flush    func(context.Context) error
 	shutdown func(context.Context) error
+
+	// forwarder and project are set when original spans can be forwarded.
+	forwarder Uploader
+	project   string
+	logger    *slog.Logger
+}
+
+// Option configures an Exporter.
+type Option func(*Exporter)
+
+// WithForwarder makes the Exporter forward traces that carry their original
+// OTLP spans through u, filed under the given Phoenix project.
+func WithForwarder(u Uploader, project string) Option {
+	return func(e *Exporter) { e.forwarder, e.project = u, project }
+}
+
+// WithLogger sets where forwarding failures are logged.
+func WithLogger(l *slog.Logger) Option {
+	return func(e *Exporter) { e.logger = l }
 }
 
 // New returns an Exporter that creates spans on tp. If tp can flush and shut
 // down (as the SDK's TracerProvider can), Flush and Shutdown use it.
-func New(tp oteltrace.TracerProvider) *Exporter {
-	e := &Exporter{tracer: tp.Tracer(tracerName)}
+func New(tp oteltrace.TracerProvider, opts ...Option) *Exporter {
+	e := &Exporter{tracer: tp.Tracer(tracerName), logger: slog.Default()}
+	for _, opt := range opts {
+		opt(e)
+	}
 	if f, ok := tp.(interface{ ForceFlush(context.Context) error }); ok {
 		e.flush = f.ForceFlush
 	}
@@ -63,7 +102,7 @@ func New(tp oteltrace.TracerProvider) *Exporter {
 // Phoenix OTLP/HTTP endpoint (a full URL, e.g. http://localhost:6006/v1/traces)
 // under the given Phoenix project. It does not connect until the first
 // export, so Phoenix may be down at start-up.
-func NewPhoenix(ctx context.Context, endpoint, project string) (*Exporter, error) {
+func NewPhoenix(ctx context.Context, endpoint, project string, logger *slog.Logger) (*Exporter, error) {
 	exp, err := otlptracehttp.New(ctx, otlptracehttp.WithEndpointURL(endpoint))
 	if err != nil {
 		return nil, fmt.Errorf("export: create OTLP exporter: %w", err)
@@ -76,7 +115,29 @@ func NewPhoenix(ctx context.Context, endpoint, project string) (*Exporter, error
 		sdktrace.WithBatcher(exp),
 		sdktrace.WithResource(res),
 	)
-	return New(tp), nil
+
+	// A second client forwards spans that arrived over OTLP. The SDK
+	// pipeline above cannot: it only exports spans it created itself.
+	forwarder := otlptracehttp.NewClient(
+		otlptracehttp.WithEndpointURL(endpoint),
+		otlptracehttp.WithTimeout(forwardTimeout),
+		otlptracehttp.WithRetry(otlptracehttp.RetryConfig{
+			Enabled:         true,
+			InitialInterval: time.Second,
+			MaxInterval:     5 * time.Second,
+			MaxElapsedTime:  forwardMaxElapsed,
+		}),
+	)
+	if err := forwarder.Start(ctx); err != nil {
+		return nil, fmt.Errorf("export: start OTLP forwarder: %w", err)
+	}
+
+	e := New(tp, WithForwarder(forwarder, project), WithLogger(logger))
+	stopProvider := e.shutdown
+	e.shutdown = func(ctx context.Context) error {
+		return errors.Join(stopProvider(ctx), forwarder.Stop(ctx))
+	}
+	return e, nil
 }
 
 // LogErrors routes OpenTelemetry's asynchronous errors, which is where
@@ -88,12 +149,19 @@ func LogErrors(logger *slog.Logger) {
 	}))
 }
 
-// Export emits the spans for a kept trace and reports whether it did.
-// Dropped traces emit nothing. Spans are handed to the provider's span
+// Export sends a kept trace to Phoenix and reports whether it did. Dropped
+// traces send nothing.
+//
+// A trace carrying its original OTLP spans is forwarded as those spans,
+// synchronously, so the result reflects whether Phoenix accepted them. Any
+// other trace is rebuilt as spans and handed to the provider's span
 // processor; with the batching provider, delivery happens in the background.
 func (e *Exporter) Export(ctx context.Context, rec Record) bool {
 	if !rec.Decision.Keep {
 		return false
+	}
+	if len(rec.Trace.OTLP) > 0 && e.forwarder != nil {
+		return e.forward(ctx, rec)
 	}
 	t, d := rec.Trace, rec.Decision
 
@@ -134,6 +202,35 @@ func (e *Exporter) Export(ctx context.Context, rec Record) bool {
 		span.End()
 	}
 	root.End()
+	return true
+}
+
+// forward sends the trace's own spans on, unchanged except for the eval.*
+// attributes on the root span and the Phoenix project on the resource. The
+// trace keeps its trace and span IDs.
+func (e *Exporter) forward(ctx context.Context, rec Record) bool {
+	d := rec.Decision
+	attrs := []*commonpb.KeyValue{
+		otlp.StringAttr("eval.decision", decisionKeep),
+		otlp.StringAttr("eval.reason", d.Reason),
+		otlp.StringAttr("eval.severity", d.Severity),
+		otlp.StringAttr("eval.model", rec.Model),
+		otlp.FloatAttr("eval.latency_ms", rec.LatencyMS),
+	}
+	if d.Scored {
+		attrs = append(attrs,
+			otlp.FloatAttr("eval.p_keep", d.PKeep),
+			otlp.FloatAttr("eval.p_keep_raw", d.PKeepRaw),
+		)
+	}
+	spans, err := otlp.Annotate(rec.Trace.OTLP, e.project, attrs)
+	if err == nil {
+		err = e.forwarder.UploadTraces(ctx, spans)
+	}
+	if err != nil {
+		e.logger.Error("trace export failed", "trace_id", rec.Trace.TraceID, "error", err.Error())
+		return false
+	}
 	return true
 }
 

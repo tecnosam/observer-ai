@@ -218,7 +218,7 @@ func TestPhoenixDownIsLoggedNotFatal(t *testing.T) {
 	t.Cleanup(func() { otel.SetErrorHandler(prev) })
 	LogErrors(slog.New(slog.NewTextHandler(countWriter{&logged}, nil)))
 
-	exp, err := NewPhoenix(context.Background(), url, "observer-ai")
+	exp, err := NewPhoenix(context.Background(), url, "observer-ai", slog.Default())
 	if err != nil {
 		t.Fatalf("NewPhoenix with Phoenix down: %v", err)
 	}
@@ -247,7 +247,7 @@ func TestPhoenixReceivesOTLP(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	exp, err := NewPhoenix(context.Background(), srv.URL+"/v1/traces", "my-project")
+	exp, err := NewPhoenix(context.Background(), srv.URL+"/v1/traces", "my-project", slog.Default())
 	if err != nil {
 		t.Fatal(err)
 	}

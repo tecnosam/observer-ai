@@ -269,6 +269,26 @@ func retryable(err error) bool {
 	return true // timeout or connection error
 }
 
+// IsSystemError reports whether a Score failure is the scoring system's
+// fault rather than the trace's: Kev unreachable, timing out, answering 5xx,
+// refusing the caller (401, 404, 429, ...) or returning something
+// unparseable. Only a 400, 413 or 422, where Kev rejects this particular
+// request, is not a system error. Trying such a trace again later cannot
+// help; trying a system error again can.
+func IsSystemError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var status *StatusError
+	if errors.As(err, &status) {
+		switch status.Code {
+		case http.StatusBadRequest, http.StatusRequestEntityTooLarge, http.StatusUnprocessableEntity:
+			return false
+		}
+	}
+	return true
+}
+
 func sleep(ctx context.Context, d time.Duration) error {
 	t := time.NewTimer(d)
 	defer t.Stop()

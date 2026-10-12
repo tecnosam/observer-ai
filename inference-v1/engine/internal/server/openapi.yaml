@@ -1,11 +1,20 @@
 openapi: 3.0.3
 info:
   title: Observer.ai inference engine
-  version: 0.1.0
+  version: 0.3.0
   description: |
     Decides which LLM agent traces are worth keeping for review. Each trace is
     rendered into a state string, scored by the Kev decision model, and passed
     through a keep/drop policy. Kept traces are exported to Arize Phoenix.
+
+    `POST /v1/traces` stores the trace in a NATS JetStream queue; a worker
+    pool scores it afterwards. `POST /v1/traces:score` skips the queue and
+    returns the decision directly.
+
+    This document covers the JSON API on port 8080. The engine also accepts
+    traces as OpenTelemetry spans through the standard OTLP receivers: gRPC
+    on port 4317 and HTTP on port 4318 (`POST /v1/traces`, protobuf or JSON).
+    Those follow the OTLP specification and are not described here.
 servers:
   - url: /
     description: This server
@@ -21,14 +30,22 @@ paths:
       operationId: enqueueTrace
       summary: Queue a trace
       description: |
-        Validates the trace, puts it on the bounded worker queue and returns
-        immediately. The decision is made in the background and written to
-        the engine's log; kept traces are exported to Phoenix.
+        Validates the trace and stores it in the JetStream work queue. The 202
+        is sent only after the queue has confirmed the trace, so an accepted
+        trace survives a restart of the engine.
+
+        A worker scores it afterwards: the decision is written to the engine's
+        log and kept traces are exported to Phoenix. Delivery is at least
+        once, so a trace can occasionally be scored twice.
+
+        If Kev is unavailable (down, timing out, answering 5xx) the trace is
+        not given a fallback decision. It is redelivered with a delay and,
+        after `queue.max_deliver` attempts, moved to the dead-letter stream.
       requestBody:
         $ref: "#/components/requestBodies/Trace"
       responses:
         "202":
-          description: The trace was queued.
+          description: The trace is stored in the queue.
           content:
             application/json:
               schema:
@@ -38,7 +55,9 @@ paths:
         "413":
           $ref: "#/components/responses/TooLarge"
         "503":
-          description: The queue is full or the server is shutting down. Retry later.
+          description: |
+            The trace was not queued: the queue is at `queue.max_messages`, or
+            NATS could not be reached. Retry later.
           headers:
             Retry-After:
               description: Seconds to wait before retrying.
@@ -49,16 +68,23 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Error"
-              example:
-                error: queue full, retry later
+              examples:
+                full:
+                  summary: Queue at its limit
+                  value:
+                    error: queue full, retry later
+                unavailable:
+                  summary: NATS unreachable
+                  value:
+                    error: queue unavailable, retry later
   /v1/traces:score:
     post:
       tags: [traces]
       operationId: scoreTrace
       summary: Score a trace synchronously
       description: |
-        Runs the same pipeline as `POST /v1/traces` but waits for the result
-        and returns the decision. Meant for testing and demos. If the trace is
+        Runs the same pipeline as the queue workers, without the queue, and
+        returns the decision. Meant for testing and demos. If the trace is
         kept, the export is flushed before the response is sent.
 
         If Kev cannot be reached after its retries the request still succeeds:
@@ -119,7 +145,7 @@ paths:
       tags: [health]
       operationId: healthz
       summary: Liveness
-      description: Returns 200 whenever the process is up, whether or not Kev is reachable.
+      description: Returns 200 whenever the process is up, whether or not Kev and NATS are reachable.
       responses:
         "200":
           description: The process is up.
@@ -134,10 +160,12 @@ paths:
       tags: [health]
       operationId: readyz
       summary: Readiness
-      description: Returns 200 only if the Kev server answers a cheap probe within 2 seconds.
+      description: |
+        Returns 200 only if the connection to NATS is up and the Kev server
+        answers a cheap probe within 2 seconds.
       responses:
         "200":
-          description: Kev is reachable.
+          description: NATS and Kev are reachable.
           content:
             application/json:
               schema:
@@ -145,7 +173,7 @@ paths:
               example:
                 status: ready
         "503":
-          description: Kev is not reachable.
+          description: NATS or Kev is not reachable.
           content:
             application/json:
               schema:

@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/observer-ai/engine/internal/queue"
 	"github.com/observer-ai/engine/internal/trace"
 )
 
@@ -18,28 +19,31 @@ const (
 	retryAfterSeconds   = "1"
 )
 
+// Publisher puts a validated trace on the work queue. *queue.Queue
+// implements it.
+type Publisher interface {
+	// Publish returns queue.ErrFull when the queue is at its limit.
+	Publish(ctx context.Context, t trace.Trace) error
+	// Ready reports whether the queue can currently be reached.
+	Ready() error
+}
+
 // Options configures a Server.
 type Options struct {
-	Engine    *Engine
-	Workers   int
-	QueueSize int
+	Engine *Engine
+	Queue  Publisher
 	// MaxBodyBytes caps a request body; 0 means 8 MiB.
 	MaxBodyBytes int64
 	Logger       *slog.Logger
 }
 
-// Server holds the HTTP handlers and the worker pool behind POST /v1/traces.
+// Server holds the HTTP handlers.
 type Server struct {
 	engine       *Engine
-	pool         *pool
+	queue        Publisher
 	mux          *http.ServeMux
 	logger       *slog.Logger
 	maxBodyBytes int64
-
-	// workCtx is the context queued traces are processed under. It outlives
-	// any request and is cancelled only when a drain runs out of time.
-	workCtx    context.Context
-	cancelWork context.CancelFunc
 }
 
 func New(opts Options) *Server {
@@ -51,15 +55,11 @@ func New(opts Options) *Server {
 	}
 	s := &Server{
 		engine:       opts.Engine,
+		queue:        opts.Queue,
 		mux:          http.NewServeMux(),
 		logger:       opts.Logger,
 		maxBodyBytes: opts.MaxBodyBytes,
 	}
-	s.workCtx, s.cancelWork = context.WithCancel(context.Background())
-	s.pool = newPool(opts.Workers, opts.QueueSize, func(t trace.Trace) {
-		s.engine.Process(s.workCtx, t)
-	})
-
 	s.mux.HandleFunc("POST /v1/traces", s.handleEnqueue)
 	s.mux.HandleFunc("POST /v1/traces:score", s.handleScore)
 	s.mux.HandleFunc("GET /healthz", s.handleHealthz)
@@ -71,36 +71,24 @@ func New(opts Options) *Server {
 
 func (s *Server) Handler() http.Handler { return s.mux }
 
-// Drain stops accepting queued work and waits for the workers to finish
-// what is queued. If ctx ends first, in-flight Kev calls are cancelled so
-// the remaining traces get fallback decisions instead of being lost, and
-// Drain returns ctx's error once the workers have exited.
-func (s *Server) Drain(ctx context.Context) error {
-	s.pool.close()
-	err := s.pool.wait(ctx)
-	if err != nil {
-		s.cancelWork()
-		<-s.pool.done
-	}
-	s.cancelWork()
-	return err
-}
-
+// handleEnqueue answers 202 only after the queue has confirmed the trace is
+// stored, so an accepted trace survives a restart of this process.
 func (s *Server) handleEnqueue(w http.ResponseWriter, r *http.Request) {
 	t, ok := s.readTrace(w, r)
 	if !ok {
 		return
 	}
-	switch err := s.pool.submit(t); {
-	case errors.Is(err, errQueueFull):
+	switch err := s.queue.Publish(r.Context(), t); {
+	case err == nil:
+		writeJSON(w, http.StatusAccepted, map[string]string{"trace_id": t.TraceID})
+	case errors.Is(err, queue.ErrFull):
 		s.logger.Warn("queue full, rejecting trace", "trace_id", t.TraceID)
 		w.Header().Set("Retry-After", retryAfterSeconds)
 		writeError(w, http.StatusServiceUnavailable, "queue full, retry later")
-	case errors.Is(err, errClosed):
-		w.Header().Set("Retry-After", retryAfterSeconds)
-		writeError(w, http.StatusServiceUnavailable, "server is shutting down")
 	default:
-		writeJSON(w, http.StatusAccepted, map[string]string{"trace_id": t.TraceID})
+		s.logger.Error("queue publish failed, rejecting trace", "trace_id", t.TraceID, "error", err.Error())
+		w.Header().Set("Retry-After", retryAfterSeconds)
+		writeError(w, http.StatusServiceUnavailable, "queue unavailable, retry later")
 	}
 }
 
@@ -130,11 +118,14 @@ func (s *Server) handleHealthz(w http.ResponseWriter, _ *http.Request) {
 func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), readyTimeout)
 	defer cancel()
-	if err := s.engine.Scorer.Ready(ctx); err != nil {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{
-			"status": "unavailable",
-			"error":  "kev is not reachable: " + err.Error(),
-		})
+	var problem string
+	if err := s.queue.Ready(); err != nil {
+		problem = "queue is not reachable: " + err.Error()
+	} else if err := s.engine.Scorer.Ready(ctx); err != nil {
+		problem = "kev is not reachable: " + err.Error()
+	}
+	if problem != "" {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "unavailable", "error": problem})
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ready"})
@@ -156,6 +147,7 @@ func (s *Server) readTrace(w http.ResponseWriter, r *http.Request) (trace.Trace,
 	if t.TraceID == "" {
 		t.TraceID = trace.NewID()
 	}
+	t.OTLP = nil // spans come in through the OTLP receivers, not this API
 	return t, true
 }
 

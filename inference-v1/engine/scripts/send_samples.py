@@ -5,15 +5,23 @@ Picks an equal number of traces per label (wrong / partial / correct) from one
 split of labeled_traces.jsonl and posts each to the engine. Only the fields
 the API accepts are sent; labels and gold answers stay behind.
 
+With --otlp the same traces are sent as OpenTelemetry spans instead (an AGENT
+root span and one TOOL span per tool call, OTLP/JSON over HTTP), the way an
+instrumented agent would export them.
+
 Usage:
   python3 scripts/send_samples.py                 # 30 held-out traces, queued
   python3 scripts/send_samples.py -n 60 --sync    # wait for each decision
+  python3 scripts/send_samples.py --otlp          # as spans to the OTLP receiver
 """
 import argparse
 import collections
 import json
 import random
+import re
+import secrets
 import sys
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -33,6 +41,56 @@ def to_api_trace(row):
         "evidence": row.get("evidence", []),
         "final_answer": row["final_answer"],
     }
+
+
+def _attr(key, value):
+    return {"key": key, "value": {"stringValue": value}}
+
+
+def to_otlp_request(row):
+    """One trace as an OTLP/JSON export request.
+
+    Evidence and tool statuses go in the observer.* override attributes, so
+    the engine builds exactly the slice it builds for the JSON form.
+    """
+    trace_id = row["trace_id"] if re.fullmatch(r"[0-9a-f]{32}", row["trace_id"]) else secrets.token_hex(16)
+    root_id = secrets.token_hex(8)
+    start = time.time_ns()
+    calls = row.get("tool_calls", [])
+
+    root_attrs = [
+        _attr("openinference.span.kind", "AGENT"),
+        _attr("input.value", row["question"]),
+        _attr("output.value", row["final_answer"]),
+    ]
+    root_attrs += [_attr(f"observer.evidence.{i}", e) for i, e in enumerate(row.get("evidence", []))]
+    spans = [{
+        "traceId": trace_id, "spanId": root_id, "name": "observer_agent.run", "kind": 1,
+        "startTimeUnixNano": str(start), "endTimeUnixNano": str(start + (len(calls) + 1) * 1_000_000),
+        "attributes": root_attrs,
+    }]
+    for i, call in enumerate(calls):
+        attrs = [
+            _attr("openinference.span.kind", "TOOL"),
+            _attr("tool.name", call["name"]),
+            _attr("observer.tool.status", str(call.get("status", "ok"))),
+        ]
+        if "args" in call:
+            attrs.append(_attr("input.value", json.dumps(call["args"])))
+        spans.append({
+            "traceId": trace_id, "spanId": secrets.token_hex(8), "parentSpanId": root_id,
+            "name": f"execute_tool {call['name']}", "kind": 1,
+            "startTimeUnixNano": str(start + (i + 1) * 1_000_000),
+            "endTimeUnixNano": str(start + (i + 1) * 1_000_000 + 500_000),
+            "attributes": attrs,
+        })
+    return {"resourceSpans": [{
+        "resource": {"attributes": [
+            _attr("service.name", "send_samples"),
+            _attr("openinference.project.name", "send_samples"),
+        ]},
+        "scopeSpans": [{"scope": {"name": "send_samples"}, "spans": spans}],
+    }]}
 
 
 def pick(rows, n, rng):
@@ -61,6 +119,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--dataset", type=Path, default=DEFAULT_DATASET)
     ap.add_argument("--url", default="http://localhost:8080", help="engine base URL")
+    ap.add_argument("--otlp", action="store_true", help="send as spans to the OTLP/HTTP receiver")
+    ap.add_argument("--otlp-url", default="http://localhost:4318", help="OTLP/HTTP receiver base URL")
     ap.add_argument("-n", type=int, default=30, help="number of traces to send")
     ap.add_argument("--split", default="heldout", help="dataset split to sample from ('all' for every row)")
     ap.add_argument("--seed", type=int, default=0)
@@ -75,11 +135,17 @@ def main():
     if not rows:
         sys.exit(f"no usable traces in split {args.split!r} of {args.dataset}")
 
+    if args.otlp and args.sync:
+        sys.exit("--otlp and --sync cannot be combined: the OTLP receiver has no synchronous path")
+
     picked = pick(rows, args.n, random.Random(args.seed))
-    endpoint = args.url.rstrip("/") + ("/v1/traces:score" if args.sync else "/v1/traces")
+    if args.otlp:
+        endpoint = args.otlp_url.rstrip("/") + "/v1/traces"
+    else:
+        endpoint = args.url.rstrip("/") + ("/v1/traces:score" if args.sync else "/v1/traces")
     statuses = collections.Counter()
     for row in picked:
-        status, body = post(endpoint, to_api_trace(row))
+        status, body = post(endpoint, to_otlp_request(row) if args.otlp else to_api_trace(row))
         statuses[status] += 1
         if args.sync and status == 200:
             p = body["p_keep"]

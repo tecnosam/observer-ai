@@ -19,6 +19,12 @@ type Trace struct {
 	ToolCalls   []ToolCall `json:"tool_calls,omitempty"`
 	Evidence    []string   `json:"evidence,omitempty"`
 	FinalAnswer string     `json:"final_answer"`
+
+	// OTLP holds the trace's original spans (a serialized OTLP TracesData)
+	// when the trace arrived through the OTLP receivers. A kept trace is
+	// then forwarded as these spans instead of being rebuilt from the
+	// fields above. The JSON API does not accept it.
+	OTLP []byte `json:"otlp_spans,omitempty"`
 }
 
 // ToolCall is one tool invocation. Args and Status stay as raw JSON because

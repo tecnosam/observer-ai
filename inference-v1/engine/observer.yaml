@@ -3,18 +3,48 @@
 
 server:
   addr: ":8080"
-  workers: 8             # concurrent scoring workers for POST /v1/traces
-  queue_size: 1000       # queued traces before the API returns 503
-  shutdown_timeout: 30s  # time allowed to drain the queue and flush exports
+  workers: 8             # concurrent workers pulling traces from the queue
+  shutdown_timeout: 30s  # time allowed for in-flight traces on shutdown
+
+# NATS JetStream work queue between the API and the workers.
+queue:
+  url: nats://localhost:4222        # env: OBSERVER_NATS_URL
+  connect_timeout: 30s              # how long to wait for NATS at start-up
+  stream: OBSERVER_TRACES
+  subject: observer.traces
+  consumer: observer-workers        # replicas sharing this name share the work
+  max_messages: 100000              # queued traces before the API returns 503
+  ack_wait: 2m                      # a worker's time limit per trace before redelivery
+  # System errors (Kev down, timing out, 5xx): the trace is redelivered with
+  # these delays, and dead-lettered after max_deliver attempts.
+  max_deliver: 5
+  redelivery_backoff: [5s, 30s, 2m, 5m]
+  dlq_stream: OBSERVER_TRACES_DLQ
+  dlq_subject: observer.traces.dlq
+  dlq_max_age: 168h                 # how long dead letters are kept
+
+# OpenTelemetry receivers. Spans are stored in NATS by trace ID, assembled
+# into a trace once it goes quiet, then scored like any other trace.
+otlp:
+  grpc_addr: ":4317"                # env: OBSERVER_OTLP_GRPC_ADDR; "" turns gRPC off
+  http_addr: ":4318"                # env: OBSERVER_OTLP_HTTP_ADDR; POST /v1/traces
+  idle_timeout: 10s                 # no spans for this long: the trace is complete
+  max_wait: 2m                      # assemble anyway this long after the first span
+  assemblers: 4
+  span_stream: OBSERVER_SPANS
+  span_subject: observer.spans      # spans go to observer.spans.<trace id>
+  span_max_age: 1h                  # spans never assembled are removed after this
+  pending_stream: OBSERVER_PENDING
+  pending_subject: observer.pending
 
 scorer:
   endpoint: http://localhost:8010/v1/systemone   # env: OBSERVER_SCORER_ENDPOINT
   model: kev-latest                              # model name sent to Kev
-  # Relative paths resolve against this file's directory.
+  # Relative paths resolve against this file's directory. env: OBSERVER_MANIFEST
   manifest: ../../finetune/notebooks/runs/observer-kev-0.8b-ft/manifest.json
   decision_question: answer_wrong
   timeout: 10s           # per attempt
-  max_retries: 3         # retries after the first attempt
+  max_retries: 3         # in-process retries after the first attempt
   backoff: [500ms, 2s, 5s]
 
 policy:

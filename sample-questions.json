@@ -1,0 +1,24 @@
+{
+  "grounded": {
+    "type": "noul",
+    "instructions": "Is every claim in the final answer supported by the evidence?"
+  },
+  "answers_question": {
+    "type": "score",
+    "instructions": "How completely and correctly does the final answer address the user's question?",
+    "criteria": [
+      "Wrong",
+      "Partially correct",
+      "Fully correct"
+    ]
+  },
+  "tool_use": {
+    "type": "choice",
+    "instructions": "How well did the agent use its tools?",
+    "criteria": {
+      "appropriate": "Tools and queries fit the question",
+      "misdirected": "Searched for the wrong thing or drew the wrong conclusion",
+      "insufficient": "Stopped before gathering enough evidence"
+    }
+  }
+}

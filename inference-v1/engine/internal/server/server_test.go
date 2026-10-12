@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -23,7 +24,9 @@ import (
 
 	"github.com/observer-ai/engine/internal/export"
 	"github.com/observer-ai/engine/internal/policy"
+	"github.com/observer-ai/engine/internal/queue"
 	"github.com/observer-ai/engine/internal/scorer"
+	"github.com/observer-ai/engine/internal/trace"
 )
 
 const (
@@ -32,6 +35,8 @@ const (
 )
 
 var quiet = slog.New(slog.NewTextHandler(io.Discard, nil))
+
+func jsonLogger(w io.Writer) *slog.Logger { return slog.New(slog.NewJSONHandler(w, nil)) }
 
 func readFile(t *testing.T, parts ...string) []byte {
 	t.Helper()
@@ -60,57 +65,79 @@ func fixedScore(p float64) func(context.Context, string) (scorer.Result, error) 
 	}
 }
 
+// fakeQueue is an in-memory Publisher that records what it was given.
+type fakeQueue struct {
+	mu         sync.Mutex
+	published  []trace.Trace
+	publishErr error
+	readyErr   error
+}
+
+func (q *fakeQueue) Publish(_ context.Context, t trace.Trace) error {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.publishErr != nil {
+		return q.publishErr
+	}
+	q.published = append(q.published, t)
+	return nil
+}
+
+func (q *fakeQueue) Ready() error { return q.readyErr }
+
 type harness struct {
 	srv      *Server
+	engine   *Engine
+	queue    *fakeQueue
 	recorder *tracetest.SpanRecorder
 }
 
 type harnessOpts struct {
-	scorer    Scorer
-	workers   int
-	queueSize int
-	rand      func() float64
-	temp      float64
-	maxBody   int64
+	scorer  Scorer
+	queue   Publisher // defaults to a fakeQueue
+	rand    func() float64
+	temp    float64
+	maxBody int64
+	logger  *slog.Logger
+	// uploader, when set, receives traces that carry their original spans.
+	uploader export.Uploader
 }
 
 func newHarness(t *testing.T, o harnessOpts) *harness {
 	t.Helper()
-	if o.workers == 0 {
-		o.workers = 2
-	}
-	if o.queueSize == 0 {
-		o.queueSize = 16
-	}
 	if o.rand == nil {
 		o.rand = func() float64 { return 0.99 } // never take the random floor
 	}
 	if o.temp == 0 {
 		o.temp = 1
 	}
+	if o.logger == nil {
+		o.logger = quiet
+	}
+	fq := &fakeQueue{}
+	if o.queue == nil {
+		o.queue = fq
+	}
 	rec := tracetest.NewSpanRecorder()
 	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(rec))
-	srv := New(Options{
-		Engine: &Engine{
-			Scorer:      o.scorer,
-			Policy:      policy.New(policy.Config{KeepThreshold: 0.5, RandomFloor: 0.02, SeverityHigh: 0.8}, o.rand),
-			Exporter:    export.New(tp),
-			Temperature: o.temp,
-			Model:       "kev-latest",
-			Logger:      quiet,
-		},
-		Workers:      o.workers,
-		QueueSize:    o.queueSize,
-		MaxBodyBytes: o.maxBody,
-		Logger:       quiet,
-	})
-	t.Cleanup(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		srv.Drain(ctx)
-		tp.Shutdown(ctx)
-	})
-	return &harness{srv: srv, recorder: rec}
+	t.Cleanup(func() { tp.Shutdown(context.Background()) })
+	engine := &Engine{
+		Scorer:      o.scorer,
+		Policy:      policy.New(policy.Config{KeepThreshold: 0.5, RandomFloor: 0.02, SeverityHigh: 0.8}, o.rand),
+		Exporter:    newExporter(tp, o.uploader),
+		Temperature: o.temp,
+		Model:       "kev-latest",
+		Logger:      o.logger,
+	}
+	srv := New(Options{Engine: engine, Queue: o.queue, MaxBodyBytes: o.maxBody, Logger: quiet})
+	return &harness{srv: srv, engine: engine, queue: fq, recorder: rec}
+}
+
+func newExporter(tp *sdktrace.TracerProvider, u export.Uploader) *export.Exporter {
+	if u == nil {
+		return export.New(tp)
+	}
+	return export.New(tp, export.WithForwarder(u, "observer-ai"), export.WithLogger(quiet))
 }
 
 func (h *harness) do(method, path, body string) *httptest.ResponseRecorder {
@@ -146,18 +173,20 @@ func rootAttrs(t *testing.T, rec *tracetest.SpanRecorder) map[string]attribute.V
 	return nil
 }
 
-func TestEnqueueAccepted(t *testing.T) {
+func TestEnqueuePublishesToQueue(t *testing.T) {
 	h := newHarness(t, harnessOpts{scorer: &fakeScorer{score: fixedScore(0.9)}})
 
-	w := h.do("POST", "/v1/traces", `{"trace_id": "abc123", "question": "q", "final_answer": "a"}`)
+	body := string(readFile(t, "traces", "correct_river.json"))
+	w := h.do("POST", "/v1/traces", body)
 	if w.Code != http.StatusAccepted {
 		t.Fatalf("status = %d, want 202; body %s", w.Code, w.Body)
 	}
-	if got := decodeBody[map[string]string](t, w); got["trace_id"] != "abc123" {
-		t.Errorf("trace_id = %q, want abc123", got["trace_id"])
+	if got := decodeBody[map[string]string](t, w); got["trace_id"] != "7f3a91c2e8" {
+		t.Errorf("trace_id = %q, want 7f3a91c2e8", got["trace_id"])
 	}
 
-	// No trace_id: the server generates 32 hex chars.
+	// No trace_id: the server generates 32 hex chars and queues the trace
+	// under that ID.
 	w = h.do("POST", "/v1/traces", `{"question": "q2", "final_answer": "a2"}`)
 	if w.Code != http.StatusAccepted {
 		t.Fatalf("status = %d, want 202", w.Code)
@@ -167,22 +196,19 @@ func TestEnqueueAccepted(t *testing.T) {
 		t.Errorf("generated trace_id = %q, want 32 hex chars", generated)
 	}
 
-	// Both traces are processed in the background and exported.
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if err := h.srv.Drain(ctx); err != nil {
-		t.Fatalf("Drain: %v", err)
+	if len(h.queue.published) != 2 {
+		t.Fatalf("%d traces published, want 2", len(h.queue.published))
 	}
-	ids := map[string]bool{}
-	for _, s := range h.recorder.Ended() {
-		for _, kv := range s.Attributes() {
-			if kv.Key == "observer.source_trace_id" {
-				ids[kv.Value.AsString()] = true
-			}
-		}
+	first, second := h.queue.published[0], h.queue.published[1]
+	if first.TraceID != "7f3a91c2e8" || first.FinalAnswer != "The Seine" || len(first.ToolCalls) != 1 || len(first.Evidence) != 2 {
+		t.Errorf("published trace = %+v", first)
 	}
-	if !ids["abc123"] || !ids[generated] || len(ids) != 2 {
-		t.Errorf("exported source trace IDs = %v, want abc123 and %s", ids, generated)
+	if second.TraceID != generated || second.Question != "q2" {
+		t.Errorf("published trace = %+v, want the generated ID", second)
+	}
+	// Scoring happens in the workers, not in the request.
+	if n := len(h.recorder.Started()); n != 0 {
+		t.Errorf("%d spans started by the enqueue handler, want 0", n)
 	}
 }
 
@@ -212,6 +238,9 @@ func TestBadRequests(t *testing.T) {
 	if n := len(h.recorder.Started()); n != 0 {
 		t.Errorf("%d spans started for rejected requests", n)
 	}
+	if n := len(h.queue.published); n != 0 {
+		t.Errorf("%d rejected requests reached the queue", n)
+	}
 }
 
 func TestBodyTooLarge(t *testing.T) {
@@ -232,105 +261,51 @@ func TestMethodAndRouteMatching(t *testing.T) {
 	}
 }
 
-func TestQueueFull(t *testing.T) {
-	started := make(chan struct{}, 8)
-	release := make(chan struct{})
-	var once sync.Once
-	unblock := func() { once.Do(func() { close(release) }) }
-	t.Cleanup(unblock)
+func TestEnqueueWhenQueueRefuses(t *testing.T) {
+	tests := []struct {
+		name    string
+		err     error
+		wantErr string
+	}{
+		{"full", queue.ErrFull, "queue full"},
+		{"wrapped full", fmt.Errorf("publish: %w", queue.ErrFull), "queue full"},
+		{"unavailable", fmt.Errorf("%w: nats: timeout", queue.ErrUnavailable), "queue unavailable"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := newHarness(t, harnessOpts{scorer: &fakeScorer{score: fixedScore(0.9)}})
+			h.queue.publishErr = tt.err
 
-	h := newHarness(t, harnessOpts{
-		workers:   1,
-		queueSize: 1,
-		scorer: &fakeScorer{score: func(context.Context, string) (scorer.Result, error) {
-			started <- struct{}{}
-			<-release
-			return scorer.Result{PRaw: 0.9, Model: "kev-latest"}, nil
-		}},
-	})
-	body := `{"question": "q", "final_answer": "a"}`
-
-	// First trace: taken by the only worker, which then blocks in Kev.
-	if w := h.do("POST", "/v1/traces", body); w.Code != http.StatusAccepted {
-		t.Fatalf("first trace: status = %d, want 202", w.Code)
-	}
-	select {
-	case <-started:
-	case <-time.After(5 * time.Second):
-		t.Fatal("worker never picked up the first trace")
-	}
-	// Second trace: fills the one queue slot.
-	if w := h.do("POST", "/v1/traces", body); w.Code != http.StatusAccepted {
-		t.Fatalf("second trace: status = %d, want 202", w.Code)
-	}
-	// Third trace: nowhere to go.
-	w := h.do("POST", "/v1/traces", body)
-	if w.Code != http.StatusServiceUnavailable {
-		t.Fatalf("third trace: status = %d, want 503", w.Code)
-	}
-	if got := w.Header().Get("Retry-After"); got != "1" {
-		t.Errorf("Retry-After = %q, want \"1\"", got)
-	}
-	if got := decodeBody[map[string]string](t, w)["error"]; !strings.Contains(got, "queue full") {
-		t.Errorf("error = %q", got)
-	}
-
-	// Once the worker is free, the queue accepts work again and nothing
-	// accepted earlier was lost.
-	unblock()
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if err := h.srv.Drain(ctx); err != nil {
-		t.Fatalf("Drain: %v", err)
-	}
-	if n := len(h.recorder.Ended()); n != 2 {
-		t.Errorf("%d traces exported, want the 2 that were accepted", n)
+			w := h.do("POST", "/v1/traces", `{"question": "q", "final_answer": "a"}`)
+			if w.Code != http.StatusServiceUnavailable {
+				t.Fatalf("status = %d, want 503", w.Code)
+			}
+			if got := w.Header().Get("Retry-After"); got != "1" {
+				t.Errorf("Retry-After = %q, want \"1\"", got)
+			}
+			if got := decodeBody[map[string]string](t, w)["error"]; !strings.Contains(got, tt.wantErr) {
+				t.Errorf("error = %q, want it to contain %q", got, tt.wantErr)
+			}
+			// NATS internals stay in the log, not in the response.
+			if strings.Contains(w.Body.String(), "nats:") {
+				t.Errorf("response leaks the queue error: %s", w.Body)
+			}
+		})
 	}
 }
 
-func TestEnqueueAfterDrainIsRejected(t *testing.T) {
+// The sync path does not touch the queue, so it keeps working without it.
+func TestScoreWorksWhenQueueIsDown(t *testing.T) {
 	h := newHarness(t, harnessOpts{scorer: &fakeScorer{score: fixedScore(0.9)}})
-	if err := h.srv.Drain(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	w := h.do("POST", "/v1/traces", `{"question": "q", "final_answer": "a"}`)
-	if w.Code != http.StatusServiceUnavailable {
-		t.Errorf("status = %d, want 503", w.Code)
-	}
-}
+	h.queue.publishErr = queue.ErrUnavailable
+	h.queue.readyErr = errors.New("nats is reconnecting")
 
-// A drain that runs out of time cancels in-flight Kev calls; the traces
-// still get a (fallback) decision rather than disappearing.
-func TestDrainTimeoutFallsBack(t *testing.T) {
-	var decided atomic.Int32
-	started := make(chan struct{}, 4)
-	h := newHarness(t, harnessOpts{
-		workers: 1,
-		rand:    func() float64 { return 0 }, // fallback keeps
-		scorer: &fakeScorer{score: func(ctx context.Context, _ string) (scorer.Result, error) {
-			started <- struct{}{}
-			<-ctx.Done()
-			decided.Add(1)
-			return scorer.Result{}, ctx.Err()
-		}},
-	})
-	for range 3 {
-		if w := h.do("POST", "/v1/traces", `{"question": "q", "final_answer": "a"}`); w.Code != http.StatusAccepted {
-			t.Fatalf("status = %d, want 202", w.Code)
-		}
+	w := h.do("POST", "/v1/traces:score", `{"question": "q", "final_answer": "a"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
 	}
-	<-started
-
-	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
-	defer cancel()
-	if err := h.srv.Drain(ctx); !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("Drain = %v, want a deadline error", err)
-	}
-	if decided.Load() != 3 {
-		t.Errorf("%d traces decided, want all 3", decided.Load())
-	}
-	if n := len(h.recorder.Ended()); n != 3 {
-		t.Errorf("%d fallback keeps exported, want 3", n)
+	if got := decodeBody[Result](t, w); got.Decision != "keep" {
+		t.Errorf("result = %+v", got)
 	}
 }
 
@@ -358,7 +333,18 @@ func TestReadyz(t *testing.T) {
 	if w.Code != http.StatusServiceUnavailable {
 		t.Errorf("status = %d, want 503 when Kev is down", w.Code)
 	}
-	if got := decodeBody[map[string]string](t, w)["error"]; !strings.Contains(got, "connection refused") {
+	if got := decodeBody[map[string]string](t, w)["error"]; !strings.Contains(got, "kev is not reachable: connection refused") {
+		t.Errorf("error = %q", got)
+	}
+
+	// Kev back, queue gone.
+	fs.ready = nil
+	h.queue.readyErr = errors.New("nats is reconnecting")
+	w = h.do("GET", "/readyz", "")
+	if w.Code != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want 503 when the queue is down", w.Code)
+	}
+	if got := decodeBody[map[string]string](t, w)["error"]; !strings.Contains(got, "queue is not reachable: nats is reconnecting") {
 		t.Errorf("error = %q", got)
 	}
 }
@@ -598,9 +584,8 @@ func TestScoreWhenExportFlushFails(t *testing.T) {
 			Model:       "kev-latest",
 			Logger:      quiet,
 		},
-		Workers: 1, QueueSize: 1, Logger: quiet,
+		Queue: &fakeQueue{}, Logger: quiet,
 	})
-	defer srv.Drain(context.Background())
 
 	w := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(w, httptest.NewRequest("POST", "/v1/traces:score",
@@ -617,23 +602,11 @@ func TestScoreWhenExportFlushFails(t *testing.T) {
 // One JSON log line per decision with the fields operators filter on.
 func TestDecisionLogLine(t *testing.T) {
 	var buf strings.Builder
-	rec := tracetest.NewSpanRecorder()
-	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(rec))
-	defer tp.Shutdown(context.Background())
-	eng := &Engine{
-		Scorer:      &fakeScorer{score: fixedScore(0.9)},
-		Policy:      policy.New(policy.Config{KeepThreshold: 0.5, RandomFloor: 0, SeverityHigh: 0.8}, nil),
-		Exporter:    export.New(tp),
-		Temperature: 1,
-		Model:       "kev-latest",
-		Logger:      slog.New(slog.NewJSONHandler(&buf, nil)),
-	}
-	srv := New(Options{Engine: eng, Workers: 1, QueueSize: 1, Logger: quiet})
-	defer srv.Drain(context.Background())
-
-	w := httptest.NewRecorder()
-	srv.Handler().ServeHTTP(w, httptest.NewRequest("POST", "/v1/traces:score",
-		strings.NewReader(`{"trace_id": "log-1", "question": "q", "final_answer": "a"}`)))
+	h := newHarness(t, harnessOpts{
+		scorer: &fakeScorer{score: fixedScore(0.9)},
+		logger: jsonLogger(&buf),
+	})
+	h.do("POST", "/v1/traces:score", `{"trace_id": "log-1", "question": "q", "final_answer": "a"}`)
 
 	lines := strings.Split(strings.TrimSpace(buf.String()), "\n")
 	if len(lines) != 1 {

@@ -1,5 +1,6 @@
-// Package server exposes the engine over HTTP: an asynchronous intake backed
-// by a bounded worker pool, a synchronous scoring path, and health checks.
+// Package server exposes the engine over HTTP: an asynchronous intake that
+// publishes to the work queue, a synchronous scoring path, and health checks.
+// It also holds the Engine, the pipeline both paths and the queue workers run.
 package server
 
 import (
@@ -55,23 +56,42 @@ type Engine struct {
 	Logger *slog.Logger
 }
 
-// Process decides one trace. It always returns a decision: if Kev cannot be
-// reached after its retries, the policy's random fallback decides.
+// Process decides one trace on the synchronous path. It always returns a
+// decision: if Kev cannot score the trace, the policy's random fallback
+// decides.
 func (e *Engine) Process(ctx context.Context, t trace.Trace) Result {
+	res, _ := e.process(ctx, t, false)
+	return res
+}
+
+// ProcessQueued decides one trace taken from the queue. Unlike Process it
+// does not paper over a system error (Kev down, timing out, answering 5xx):
+// it returns the error without deciding or exporting, so the queue can
+// redeliver the trace and eventually dead-letter it. A trace that Kev
+// rejects outright still gets the random fallback, because retrying it
+// cannot help.
+func (e *Engine) ProcessQueued(ctx context.Context, t trace.Trace) (Result, error) {
+	return e.process(ctx, t, true)
+}
+
+func (e *Engine) process(ctx context.Context, t trace.Trace, deferSystemErrors bool) (Result, error) {
 	start := time.Now()
 	out := Result{TraceID: t.TraceID, Model: e.Model}
 
 	var decision policy.Decision
 	res, err := e.Scorer.Score(ctx, trace.BuildState(t))
-	if err != nil {
+	switch {
+	case err == nil:
+		decision = e.Policy.Decide(res.PRaw, scorer.Calibrate(res.PRaw, e.Temperature))
+		out.PKeep, out.PKeepRaw = &decision.PKeep, &decision.PKeepRaw
+		out.Model, out.LatencyMS = res.Model, res.LatencyMS
+	case deferSystemErrors && scorer.IsSystemError(err):
+		return Result{}, err
+	default:
 		e.Logger.Warn("kev scoring failed, falling back to a random decision",
 			"trace_id", t.TraceID, "attempts", res.Attempts, "error", err.Error())
 		decision = e.Policy.Fallback()
 		out.LatencyMS = msSince(start)
-	} else {
-		decision = e.Policy.Decide(res.PRaw, scorer.Calibrate(res.PRaw, e.Temperature))
-		out.PKeep, out.PKeepRaw = &decision.PKeep, &decision.PKeepRaw
-		out.Model, out.LatencyMS = res.Model, res.LatencyMS
 	}
 
 	out.Decision = "drop"
@@ -97,7 +117,7 @@ func (e *Engine) Process(ctx context.Context, t trace.Trace) Result {
 		attrs = append(attrs, "p_keep", decision.PKeep, "p_keep_raw", decision.PKeepRaw)
 	}
 	e.Logger.Info("decision", attrs...)
-	return out
+	return out, nil
 }
 
 func msSince(t time.Time) float64 {

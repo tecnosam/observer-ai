@@ -1,0 +1,9 @@
+# Only go.mod, go.sum, cmd/, internal/ and observer.yaml are needed.
+*
+!go.mod
+!go.sum
+!cmd/
+!internal/
+!observer.yaml
+**/*_test.go
+internal/queue/queuetest/

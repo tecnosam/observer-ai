@@ -413,3 +413,44 @@ func TestNewRejectsBadConfig(t *testing.T) {
 		t.Error("expected an error for a missing decision question")
 	}
 }
+
+func TestIsSystemError(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil", nil, false},
+		{"connection refused", errors.New("dial tcp: connection refused"), true},
+		{"timeout", context.DeadlineExceeded, true},
+		{"500", &StatusError{Code: 500}, true},
+		{"503", &StatusError{Code: 503}, true},
+		{"404 model or route missing", &StatusError{Code: 404}, true},
+		{"429", &StatusError{Code: 429}, true},
+		{"401", &StatusError{Code: 401}, true},
+		{"malformed response", permanent(errors.New("decode kev response")), true},
+		{"400", &StatusError{Code: 400}, false},
+		{"413", &StatusError{Code: 413}, false},
+		{"422", &StatusError{Code: 422}, false},
+	}
+	for _, tt := range tests {
+		if got := IsSystemError(tt.err); got != tt.want {
+			t.Errorf("IsSystemError(%s) = %v, want %v", tt.name, got, tt.want)
+		}
+	}
+}
+
+// The classification must survive the wrapping Score adds.
+func TestIsSystemErrorOnScoreErrors(t *testing.T) {
+	for code, want := range map[int]bool{500: true, 422: false} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(code)
+		}))
+		c, _ := newClient(t, srv.URL, func(cfg *Config) { cfg.MaxRetries = 1 })
+		_, err := c.Score(context.Background(), "s")
+		srv.Close()
+		if got := IsSystemError(err); got != want {
+			t.Errorf("HTTP %d: IsSystemError(%v) = %v, want %v", code, err, got, want)
+		}
+	}
+}

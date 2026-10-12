@@ -1,0 +1,60 @@
+# Runs the inference engine and its NATS JetStream queue.
+#
+#   docker compose up --build        # or: make up
+#
+# Kev and Phoenix are not part of this file. By default the engine reaches
+# them on the Docker host (ports 8010 and 6006); override the variables below
+# to point elsewhere.
+
+name: observer
+
+services:
+  nats:
+    image: nats:2.15-alpine
+    command: ["-c", "/etc/nats/nats.conf"]
+    ports:
+      # Loopback only: this NATS has no authentication.
+      - "127.0.0.1:4222:4222"   # clients, e.g. `make run` on the host
+      - "127.0.0.1:8222:8222"   # monitoring: http://localhost:8222
+    volumes:
+      - nats-data:/data          # spans, queued traces and dead letters survive restarts
+      - ./nats.conf:/etc/nats/nats.conf:ro
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8222/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    restart: unless-stopped
+
+  observer:
+    build: .
+    image: observer-engine:local
+    depends_on:
+      nats:
+        condition: service_healthy
+    environment:
+      OBSERVER_NATS_URL: nats://nats:4222
+      OBSERVER_SCORER_ENDPOINT: ${OBSERVER_SCORER_ENDPOINT:-http://host.docker.internal:8010/v1/systemone}
+      OBSERVER_PHOENIX_ENDPOINT: ${OBSERVER_PHOENIX_ENDPOINT:-http://host.docker.internal:6006/v1/traces}
+    volumes:
+      # The model manifest from the fine-tuning run. The image reads it from
+      # /etc/observer/manifest.json (OBSERVER_MANIFEST).
+      - ${OBSERVER_MANIFEST_FILE:-../../finetune/notebooks/runs/observer-kev-0.8b-ft/manifest.json}:/etc/observer/manifest.json:ro
+    extra_hosts:
+      # Makes host.docker.internal resolve on Linux too.
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "${OBSERVER_PORT:-8080}:8080"             # JSON API and Swagger UI
+      # OTLP gRPC. The container listens on 4317; the host port defaults to
+      # 14317 because Phoenix, which usually runs on the same host, takes
+      # 4317 for its own OTLP gRPC receiver.
+      - "${OBSERVER_OTLP_GRPC_PORT:-14317}:4317"
+      - "${OBSERVER_OTLP_HTTP_PORT:-4318}:4318"   # OTLP HTTP: POST /v1/traces
+    # Enough time for in-flight traces (server.shutdown_timeout) and the
+    # final export flush before Docker kills the process.
+    stop_grace_period: 45s
+    restart: unless-stopped
+
+volumes:
+  nats-data:
