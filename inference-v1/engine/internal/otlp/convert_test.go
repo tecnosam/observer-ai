@@ -269,6 +269,41 @@ func TestAssembleQuestionAndAnswerFromJSON(t *testing.T) {
 	}
 }
 
+// A run that gave up still has an output.value, an empty one. It is scored
+// like any other trace instead of being discarded.
+func TestAssembleEmptyAnswer(t *testing.T) {
+	adkEmpty := `{"content": {"parts": [{"text": ""}], "role": "model"}, "author": "agent"}`
+	for _, output := range []string{"", "  ", `""`, adkEmpty} {
+		got, err := assemble(t, []*tracepb.Span{
+			span(1, 0, "run", 100, attrSpanKind, kindAgent, attrInputValue, "q", attrOutputValue, output),
+		})
+		if err != nil {
+			t.Errorf("output %q: %v", output, err)
+			continue
+		}
+		if got.Question != "q" || got.FinalAnswer != "" {
+			t.Errorf("output %q: got %q / %q, want an empty answer", output, got.Question, got.FinalAnswer)
+		}
+	}
+}
+
+// The root span of a Google ADK run, as its OpenInference instrumentor
+// records it when the agent adds no span of its own.
+func TestAssembleADKInvocation(t *testing.T) {
+	input := `{"user_id": "u", "session_id": "s", "new_message": {"parts": [{"text": "Which river flows through Paris?"}], "role": "user"}, "run_config": {"max_llm_calls": 10}}`
+	output := `{"content": {"parts": [{"text": "thinking", "thought": true}, {"text": "The Seine"}], "role": "model"}, "author": "agent", "actions": {"state_delta": {}}}`
+	got, err := assemble(t, []*tracepb.Span{
+		span(1, 0, "invocation [agent]", 100, attrSpanKind, kindChain, attrInputValue, input, attrOutputValue, output),
+		span(2, 1, "agent_run [agent]", 110, attrSpanKind, kindAgent, attrOutputValue, output),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Question != "Which river flows through Paris?" || got.FinalAnswer != "The Seine" {
+		t.Errorf("got %q / %q", got.Question, got.FinalAnswer)
+	}
+}
+
 func TestAssembleNotScorable(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -277,7 +312,6 @@ func TestAssembleNotScorable(t *testing.T) {
 	}{
 		{"no question", []*tracepb.Span{span(1, 0, "GET /users", 100, "http.method", "GET")}, "has no input.value"},
 		{"no answer", []*tracepb.Span{span(1, 0, "run", 100, attrSpanKind, kindAgent, attrInputValue, "q")}, "has no output.value"},
-		{"blank answer", []*tracepb.Span{span(1, 0, "run", 100, attrSpanKind, kindAgent, attrInputValue, "q", attrOutputValue, "  ")}, "has no output.value"},
 		// Only children arrived: the best available root is a tool span.
 		{"root span missing", []*tracepb.Span{span(2, 1, "search", 100, attrSpanKind, kindTool, attrInputValue, `{"q": 1}`)}, "has no output.value"},
 	}

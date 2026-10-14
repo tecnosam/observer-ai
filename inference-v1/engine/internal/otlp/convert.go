@@ -49,7 +49,8 @@ const (
 )
 
 // ErrNotScorable means the spans do not describe an agent run the model can
-// judge: there is no root span carrying both a question and an answer.
+// judge: there is no root span carrying a question and an answer. An answer
+// that is present but empty counts: the agent ran and failed to answer.
 var ErrNotScorable = errors.New("trace is not scorable")
 
 // Split groups spans by trace. The result maps each trace ID (32 hex
@@ -114,7 +115,9 @@ func validID(id []byte, size int) bool {
 // Assemble merges the span batches collected for one trace (as produced by
 // Split) and builds the trace record the model is asked about. The record
 // carries the merged spans in its OTLP field. It returns ErrNotScorable when
-// the spans hold no agent run with a question and an answer.
+// the spans hold no agent run with a question and an answer. A root span
+// whose output.value is set but empty gives a record with an empty
+// FinalAnswer, so a run that gave up is still scored.
 func Assemble(traceID string, payloads [][]byte) (trace.Trace, error) {
 	merged, spans, err := merge(payloads)
 	if err != nil {
@@ -125,12 +128,16 @@ func Assemble(traceID string, payloads [][]byte) (trace.Trace, error) {
 		return trace.Trace{}, fmt.Errorf("%w: no spans", ErrNotScorable)
 	}
 	question := messageText(attr(root, attrInputValue), questionKeys)
-	answer := messageText(attr(root, attrOutputValue), answerKeys)
 	if strings.TrimSpace(question) == "" {
 		return trace.Trace{}, fmt.Errorf("%w: root span %q has no %s", ErrNotScorable, root.GetName(), attrInputValue)
 	}
-	if strings.TrimSpace(answer) == "" {
+	output, answered := lookup(root, attrOutputValue)
+	if !answered {
 		return trace.Trace{}, fmt.Errorf("%w: root span %q has no %s", ErrNotScorable, root.GetName(), attrOutputValue)
+	}
+	answer := messageText(output, answerKeys)
+	if strings.TrimSpace(answer) == "" {
+		answer = ""
 	}
 
 	tools := spansOfKind(spans, kindTool)
@@ -315,7 +322,9 @@ var (
 // messageText extracts the text from an input or output value. Plain text is
 // returned as is. A JSON object is searched for the first of keys holding a
 // string, after stepping into a "response" object (the shape of a function
-// response); a JSON string is unquoted. Anything else is returned unchanged.
+// response); a JSON string is unquoted. An object holding a message with
+// text parts (see partsText) gives that text. Anything else is returned
+// unchanged.
 func messageText(value string, keys []string) string {
 	trimmed := strings.TrimSpace(value)
 	if trimmed == "" {
@@ -344,8 +353,44 @@ func messageText(value string, keys []string) string {
 				return s
 			}
 		}
+		if text, ok := partsText(obj); ok {
+			return text
+		}
 	}
 	return value
+}
+
+// messageKeys name the message inside the input and output of a Google ADK
+// run, as its OpenInference instrumentor records them: the request holds the
+// user's message under "new_message", the final event holds the model's
+// under "content".
+var messageKeys = []string{"new_message", "content"}
+
+// partsText returns the text of a message shaped {"parts": [{"text": ...}]},
+// found under one of messageKeys. Parts without text, such as function
+// calls, and the model's thoughts are skipped; a message with no text gives
+// "".
+func partsText(obj map[string]json.RawMessage) (string, bool) {
+	for _, key := range messageKeys {
+		var message struct {
+			Parts []struct {
+				Text    string `json:"text"`
+				Thought bool   `json:"thought"`
+			} `json:"parts"`
+		}
+		raw, ok := obj[key]
+		if !ok || json.Unmarshal(raw, &message) != nil || message.Parts == nil {
+			continue
+		}
+		var b strings.Builder
+		for _, part := range message.Parts {
+			if !part.Thought {
+				b.WriteString(part.Text)
+			}
+		}
+		return b.String(), true
+	}
+	return "", false
 }
 
 func attr(s *tracepb.Span, key string) string {

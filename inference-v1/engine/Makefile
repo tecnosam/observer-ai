@@ -5,7 +5,7 @@ FUZZ   := $(or $(TMPDIR),/tmp)/observer-fuzz-golden.jsonl
 
 NATS_BOX := docker run --rm --network observer_default natsio/nats-box:latest nats -s nats://nats:4222
 
-.PHONY: build test run lint fmt golden fuzz-golden clean nats up down logs dlq
+.PHONY: build test run lint fmt golden fuzz-golden clean nats phoenix up down logs dlq agent
 
 build:
 	go build -o $(BIN) ./cmd/observer
@@ -16,7 +16,8 @@ test:
 	go vet ./...
 	go test -race ./...
 
-# Needs NATS on localhost:4222 (`make nats`), plus Kev and Phoenix.
+# Needs NATS on localhost:4222 (`make nats`) and Phoenix on localhost:6006
+# (`make phoenix`), plus Kev.
 run: build
 	$(BIN) -config $(CONFIG)
 
@@ -24,16 +25,26 @@ run: build
 nats:
 	docker compose up -d nats
 
-# Build and start the engine and NATS in Docker.
+# Start only Phoenix, for running the engine on the host with `make run`.
+phoenix:
+	docker compose up -d phoenix
+
+# Build and start the engine, NATS and Phoenix in Docker.
 up:
 	docker compose up --build -d
 
-# Stop both. Queued traces and dead letters stay in the nats-data volume.
+# Stop all three. Queued traces and dead letters stay in the nats-data
+# volume, Phoenix's traces in phoenix-data.
 down:
 	docker compose down
 
 logs:
 	docker compose logs -f observer
+
+# Start the test agent's chat UI in the browser, exporting its traces to this
+# engine. Needs Ollama. See finetune/testagents.
+agent:
+	$(MAKE) -C ../../finetune/testagents chat EXPORTING=1
 
 # Show the dead-letter stream. Needs the compose stack to be up.
 dlq:

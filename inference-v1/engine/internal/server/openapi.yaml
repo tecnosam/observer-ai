@@ -269,8 +269,7 @@ components:
             type: string
         final_answer:
           type: string
-          minLength: 1
-          description: The agent's final answer.
+          description: The agent's final answer. Send an empty string for a run that ended without an answer; it is still scored.
     ToolCall:
       type: object
       required: [name]

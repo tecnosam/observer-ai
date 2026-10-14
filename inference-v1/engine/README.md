@@ -33,43 +33,55 @@ Requirements:
 - Docker, to run NATS and (optionally) the engine itself
 - Go 1.26 or newer, to build or test outside Docker
 - Python 3, only for regenerating the golden slice files and sending samples
-- A Kev server and a Phoenix instance (not needed for tests)
+- A Kev server (not needed for tests). Phoenix runs from the compose file.
 
 ### With Docker Compose
 
 ```sh
-make up       # docker compose up --build -d: the engine and NATS JetStream
+make up       # docker compose up --build -d: the engine, NATS JetStream and Phoenix
 make logs     # follow the engine's log
-make down     # stop both; queued traces and dead letters stay in a volume
+make down     # stop all three; queued traces, dead letters and Phoenix's data stay in volumes
 ```
 
-Compose starts two services:
+Compose starts three services:
 
 | Service | Host ports | Notes |
 | --- | --- | --- |
 | `observer` | 8080 (JSON API), 4318 (OTLP HTTP), **14317** (OTLP gRPC) | The engine: receivers, API and worker pool |
 | `nats` | 4222 (clients), 8222 (monitoring), both on loopback only | JetStream, stored in the `nats-data` volume; configured by `nats.conf` |
+| `phoenix` | 6006 (UI and OTLP HTTP), 4317 (OTLP gRPC) | Phoenix, stored in the `phoenix-data` volume. Open http://localhost:6006 |
 
 Inside the container the engine listens for OTLP gRPC on 4317. Compose
-publishes it on host port 14317 because Phoenix, which usually runs on the
-same host, already takes 4317 for its own OTLP gRPC receiver. Set
-`OBSERVER_OTLP_GRPC_PORT=4317` if that port is free on your host.
+publishes it on host port 14317 because Phoenix takes 4317 for its own OTLP
+gRPC receiver.
 
-Kev and Phoenix are not in the compose file. By default the engine container
-reaches them on the Docker host at ports 8010 and 6006. Override with
-environment variables when running compose:
+If a Phoenix is already running on the host (`phoenix serve`), it holds 6006
+and 4317 and `make up` fails with "port is already allocated". Either stop
+it, or move the compose one with `PHOENIX_PORT` and `PHOENIX_GRPC_PORT`, or
+keep using the host one:
+
+```sh
+OBSERVER_PHOENIX_ENDPOINT=http://host.docker.internal:6006/v1/traces \
+  docker compose up --build -d --no-deps nats observer
+```
+
+Kev is not in the compose file. By default the engine container reaches it
+on the Docker host at port 8010. Override with environment variables when
+running compose:
 
 | Variable | Default |
 | --- | --- |
 | `OBSERVER_SCORER_ENDPOINT` | `http://host.docker.internal:8010/v1/systemone` |
-| `OBSERVER_PHOENIX_ENDPOINT` | `http://host.docker.internal:6006/v1/traces` |
+| `OBSERVER_PHOENIX_ENDPOINT` | `http://phoenix:6006/v1/traces` |
+| `PHOENIX_PORT` | `6006` |
+| `PHOENIX_GRPC_PORT` | `4317` |
 | `OBSERVER_MANIFEST_FILE` | `../../finetune/notebooks/runs/observer-kev-0.8b-ft/manifest.json` (mounted into the container) |
 | `OBSERVER_PORT` | `8080` |
 | `OBSERVER_OTLP_GRPC_PORT` | `14317` |
 | `OBSERVER_OTLP_HTTP_PORT` | `4318` |
 
-On Linux, a Kev or Phoenix that listens only on `127.0.0.1` is not reachable
-from a container; bind it to `0.0.0.0` or point the variables elsewhere.
+On Linux, a Kev that listens only on `127.0.0.1` is not reachable from a
+container; bind it to `0.0.0.0` or point the variable elsewhere.
 Docker Desktop on macOS and Windows forwards to host loopback, so the
 defaults work there.
 
@@ -77,13 +89,14 @@ defaults work there.
 
 ```sh
 make nats     # start only NATS in Docker
+make phoenix  # start only Phoenix in Docker
 make run      # build and start the engine with observer.yaml
 make test     # go vet + go test -race, fully offline
 ```
 
-`make run` binds 8080, 4317 and 4318. If Phoenix is running on the same host
-it already holds 4317, and the engine exits with an "address already in use"
-error; start it with `OBSERVER_OTLP_GRPC_ADDR=:14317 make run` instead.
+`make run` binds 8080, 4317 and 4318. Phoenix, from `make phoenix` or on the
+host, already holds 4317, and the engine exits with an "address already in
+use" error; start it with `OBSERVER_OTLP_GRPC_ADDR=:14317 make run` instead.
 
 ### Try it
 
@@ -116,7 +129,7 @@ engine's endpoint instead of Phoenix's. For the test agent in
 `finetune/testagents`:
 
 ```sh
-python scripts/smoke.py --otel-endpoint http://localhost:4318/v1/traces
+python scripts/smoke.py --exporting
 ```
 
 Flags: `-config PATH` (default `observer.yaml`) and `-log-level debug|info|warn|error`.
@@ -124,7 +137,10 @@ Flags: `-config PATH` (default `observer.yaml`) and `-log-level debug|info|warn|
 ## Configuration
 
 `observer.yaml` documents every key with its default. Only `scorer.manifest`
-is required.
+is required. [observer.schema.yaml](observer.schema.yaml) is the full
+reference: a JSON Schema with each key's type, default, limits and the rules
+that tie keys together. [architecture.md](architecture.md) explains how the
+file is loaded.
 
 | Key | Default | Meaning |
 | --- | --- | --- |
@@ -318,10 +334,18 @@ from a `question`/`input`/`query`/`prompt` key (or `answer`/`output`/`result`
 for outputs) when there is one. A tool output shaped as a function response,
 `{"response": {"result": "..."}}`, is unwrapped.
 
+A message recorded by the Google ADK instrumentor,
+`{"new_message": {"parts": [{"text": "..."}]}}` on the way in and
+`{"content": {"parts": [{"text": "..."}]}}` on the way out, gives the text of
+its parts, so an ADK agent's own root span works without extra attributes.
+
 A trace is **not scorable**, and is discarded with a `spans discarded` log
 line, when its root span has no `input.value` or no `output.value`. That
-covers ordinary service spans sent to the engine by mistake, and agent runs
-that ended without an answer.
+covers ordinary service spans sent to the engine by mistake.
+
+An agent run that ended without an answer is scored like any other, as long
+as its root span sets `output.value`, even to an empty string. The model then
+sees an empty final answer.
 
 ### Matching what the model was trained on
 
@@ -361,7 +385,8 @@ the trace, so an accepted trace survives a restart of the engine.
 }
 ```
 
-- `question` and `final_answer` are required.
+- `question` and `final_answer` are required. `final_answer` may be an empty
+  string for a run that ended without an answer.
 - `trace_id` is optional; the engine generates 32 hex characters if it is missing.
 - `args` may be any JSON value. `status` defaults to `ok`.
 - This is the engine's own JSON API on port 8080. The OTLP receiver also
@@ -665,7 +690,10 @@ internal/server/   HTTP handlers, the pipeline, OpenAPI spec
 testdata/          trace fixtures, golden slices, fake Kev responses
 scripts/           send_samples.py: post dataset traces to a running engine
 Dockerfile         multi-stage build of the engine image
-docker-compose.yml the engine and NATS JetStream
+docker-compose.yml the engine, NATS JetStream and Phoenix
+observer.yaml      example config with every default
+observer.schema.yaml  JSON Schema for observer.yaml: every key, its type, default and limits
+architecture.md    stack, package structure, design patterns, how the config is loaded
 nats.conf          NATS server settings (JetStream, 8 MB message limit)
 ```
 

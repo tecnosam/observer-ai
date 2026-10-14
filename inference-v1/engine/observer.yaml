@@ -1,5 +1,7 @@
+# yaml-language-server: $schema=./observer.schema.yaml
 # Observer.ai inference engine configuration.
 # Every key is optional except scorer.manifest; the values below are the defaults.
+# observer.schema.yaml describes every key, its type, default and limits.
 
 server:
   addr: ":8080"

@@ -1,0 +1,348 @@
+# JSON Schema (draft 2020-12, written as YAML) for observer.yaml, the
+# inference engine's configuration file.
+#
+# Every key is optional except scorer.manifest; a key left out takes the
+# `default` shown here. Unknown keys are rejected at start-up, as they are by
+# this schema. `x-env` names an environment variable that overrides the key.
+#
+# The engine checks more than a schema can say: several keys must agree with
+# each other. Those rules are in the descriptions, marked "Rule:".
+#
+# internal/config/schema_test.go fails if this file and the Go config drift
+# apart (a key missing on either side, or a different default).
+$schema: https://json-schema.org/draft/2020-12/schema
+$id: https://observer.ai/schemas/observer.schema.yaml
+title: Observer.ai inference engine configuration
+type: object
+additionalProperties: false
+
+$defs:
+  duration:
+    type: string
+    description: >-
+      A Go duration: a number and a unit, optionally repeated, for example
+      500ms, 10s, 2m, 1h30m. Units are ns, us, ms, s, m and h. It must be a
+      string; a bare number is rejected.
+    pattern: '^([0-9]+(\.[0-9]+)?(ns|us|µs|ms|s|m|h))+$'
+  streamName:
+    type: string
+    description: A NATS JetStream stream or consumer name. No spaces, dots, slashes or wildcards.
+    minLength: 1
+    pattern: '^[^ .*>/\\]+$'
+  subject:
+    type: string
+    description: A NATS subject. No spaces or wildcards.
+    minLength: 1
+    pattern: '^[^ *>]+$'
+  httpURL:
+    type: string
+    description: An http:// or https:// URL including the path.
+    pattern: '^https?://[^/]+'
+  listenAddr:
+    type: string
+    description: A listen address as host:port. An empty host listens on every interface, for example ":8080".
+  unit:
+    type: number
+    minimum: 0
+    maximum: 1
+
+properties:
+  server:
+    type: object
+    description: The JSON API and the pool of workers that score queued traces.
+    additionalProperties: false
+    properties:
+      addr:
+        $ref: '#/$defs/listenAddr'
+        minLength: 1
+        default: ":8080"
+        description: >-
+          Listen address of the JSON API (POST /v1/traces, POST
+          /v1/traces:score, /healthz, /readyz, /docs, /openapi.yaml).
+      workers:
+        type: integer
+        minimum: 1
+        default: 8
+        description: >-
+          Goroutines pulling traces from the queue. Each scores one trace at a
+          time, so this is the number of concurrent Kev requests from this
+          process.
+      shutdown_timeout:
+        $ref: '#/$defs/duration'
+        default: 30s
+        description: >-
+          On SIGINT or SIGTERM, how long in-flight requests and traces get to
+          finish before the process stops. A trace still in progress after
+          that goes back to the queue. Must be positive.
+
+  queue:
+    type: object
+    description: >-
+      The NATS JetStream work queue between intake (the JSON API and the OTLP
+      assemblers) and the workers, and its dead-letter stream.
+    additionalProperties: false
+    properties:
+      url:
+        type: string
+        pattern: '^(nats|tls)://[^/]+'
+        default: nats://localhost:4222
+        x-env: OBSERVER_NATS_URL
+        description: NATS server URL, nats:// or tls://.
+      connect_timeout:
+        $ref: '#/$defs/duration'
+        default: 30s
+        description: >-
+          How long to keep trying to reach NATS at start-up before giving up.
+          After start-up the client reconnects on its own. Must be positive.
+      stream:
+        $ref: '#/$defs/streamName'
+        default: OBSERVER_TRACES
+        description: >-
+          Stream holding traces waiting to be scored. Created or updated at
+          start-up. Rule: must differ from every other stream name in this file.
+      subject:
+        $ref: '#/$defs/subject'
+        default: observer.traces
+        description: >-
+          Subject traces are published to. Rule: must differ from
+          queue.dlq_subject, and must not sit under otlp.span_subject or
+          otlp.pending_subject.
+      consumer:
+        $ref: '#/$defs/streamName'
+        default: observer-workers
+        description: >-
+          Durable consumer the workers pull from. Engine processes that use
+          the same name share the work; each trace goes to one of them.
+      max_messages:
+        type: integer
+        minimum: 1
+        default: 100000
+        description: >-
+          Most traces the stream holds. Beyond it, POST /v1/traces answers 503
+          with Retry-After.
+      ack_wait:
+        $ref: '#/$defs/duration'
+        default: 2m
+        description: >-
+          How long a worker may hold a trace before the queue gives it to
+          another worker. Rule: must exceed the longest possible scoring call,
+          which is (scorer.max_retries + 1) x scorer.timeout plus the
+          scorer.backoff delays (47.5s with the defaults); otherwise a slow
+          trace is scored twice.
+      max_deliver:
+        type: integer
+        minimum: 1
+        default: 5
+        description: >-
+          Delivery attempts for a trace that keeps hitting system errors (Kev
+          down, timing out, answering 5xx) before it is moved to the
+          dead-letter stream.
+      redelivery_backoff:
+        type: array
+        items:
+          $ref: '#/$defs/duration'
+        default: [5s, 30s, 2m, 5m]
+        description: >-
+          Delay before each redelivery after a system error. Entry i is the
+          wait before delivery i+2; the last entry repeats. Empty means
+          redeliver at once.
+      dlq_stream:
+        $ref: '#/$defs/streamName'
+        default: OBSERVER_TRACES_DLQ
+        description: >-
+          Dead-letter stream. A dead letter keeps the original payload, with
+          headers saying why and when it failed, so it can be replayed. Rule:
+          must differ from queue.stream.
+      dlq_subject:
+        $ref: '#/$defs/subject'
+        default: observer.traces.dlq
+        description: 'Subject dead letters are published to. Rule: must differ from queue.subject.'
+      dlq_max_age:
+        $ref: '#/$defs/duration'
+        default: 168h
+        description: How long dead letters are kept before NATS removes them. Must be positive.
+
+  otlp:
+    type: object
+    description: >-
+      The OpenTelemetry receivers, and how the spans they take in are
+      assembled into traces. Spans are stored in NATS under their trace ID; a
+      trace is assembled once it goes quiet and then joins the work queue.
+      With both addresses empty, OTLP ingestion is off and the rest of this
+      section is ignored.
+    additionalProperties: false
+    properties:
+      grpc_addr:
+        $ref: '#/$defs/listenAddr'
+        default: ":4317"
+        x-env: OBSERVER_OTLP_GRPC_ADDR
+        description: >-
+          Listen address of the OTLP gRPC receiver. "" turns gRPC off (in the
+          file only: an empty environment variable is ignored). Rule: must
+          differ from otlp.http_addr and server.addr.
+      http_addr:
+        $ref: '#/$defs/listenAddr'
+        default: ":4318"
+        x-env: OBSERVER_OTLP_HTTP_ADDR
+        description: >-
+          Listen address of the OTLP HTTP receiver (POST /v1/traces, protobuf
+          or JSON). "" turns it off. Rule: must differ from otlp.grpc_addr and
+          server.addr.
+      idle_timeout:
+        $ref: '#/$defs/duration'
+        default: 10s
+        description: >-
+          A trace that has received no span for this long is taken as complete
+          and assembled. Every decision on an OTLP trace is delayed by at
+          least this much. Set it above the longest gap between two spans of
+          one run, for example a slow model call. Must be positive.
+      max_wait:
+        $ref: '#/$defs/duration'
+        default: 2m
+        description: >-
+          Assemble a trace this long after its first span even if spans are
+          still arriving. Rule: at least otlp.idle_timeout.
+      assemblers:
+        type: integer
+        minimum: 1
+        default: 4
+        description: Goroutines assembling completed traces from their stored spans.
+      span_stream:
+        $ref: '#/$defs/streamName'
+        default: OBSERVER_SPANS
+        description: 'Stream holding received spans until their trace is assembled. Rule: a name no other stream here uses.'
+      span_subject:
+        $ref: '#/$defs/subject'
+        default: observer.spans
+        description: >-
+          Subject prefix for spans; each trace's spans go to
+          <span_subject>.<trace id>. Rule: must not equal, or be a prefix of,
+          any other subject in this file.
+      span_max_age:
+        $ref: '#/$defs/duration'
+        default: 1h
+        description: >-
+          Spans that were never assembled are removed after this long. Rule:
+          must exceed otlp.max_wait.
+      pending_stream:
+        $ref: '#/$defs/streamName'
+        default: OBSERVER_PENDING
+        description: >-
+          Stream holding one marker per trace that is waiting to be assembled.
+          Rule: a name no other stream here uses.
+      pending_subject:
+        $ref: '#/$defs/subject'
+        default: observer.pending
+        description: >-
+          Subject prefix for those markers, <pending_subject>.<trace id>.
+          Rule: must not equal, or be a prefix of, any other subject in this file.
+
+  scorer:
+    type: object
+    description: The Kev decision model that scores each trace, and the manifest of the fine-tuning run it serves.
+    additionalProperties: false
+    required: [manifest]
+    properties:
+      endpoint:
+        $ref: '#/$defs/httpURL'
+        default: http://localhost:8010/v1/systemone
+        x-env: OBSERVER_SCORER_ENDPOINT
+        description: >-
+          Kev's scoring URL. The readiness probe is a GET on /v1/models at the
+          same host.
+      model:
+        type: string
+        minLength: 1
+        default: kev-latest
+        description: Model name sent to Kev with every request.
+      manifest:
+        type: string
+        minLength: 1
+        x-env: OBSERVER_MANIFEST
+        description: >-
+          Path to manifest.json from the fine-tuning notebook. A relative path
+          resolves against this file's directory. The engine reads three
+          things from it: `questions`, sent to Kev unchanged with every
+          request; `temperatures`, where the decision question's value
+          calibrates the score (1.0 if absent); and `model`, which is only
+          logged. Required: it has no default.
+      decision_question:
+        type: string
+        minLength: 1
+        default: answer_wrong
+        description: >-
+          Name of the question whose answer decides keep or drop. It must
+          exist in the manifest's `questions` and have type `noul`; its
+          probability is read as the probability the trace is worth keeping.
+      timeout:
+        $ref: '#/$defs/duration'
+        default: 10s
+        description: Time limit for one request to Kev (one attempt, not the whole call). Must be positive.
+      max_retries:
+        type: integer
+        minimum: 0
+        default: 3
+        description: >-
+          Retries after the first attempt, within one worker, for timeouts,
+          connection errors and 5xx answers. A 4xx or a malformed answer is
+          not retried.
+      backoff:
+        type: array
+        items:
+          $ref: '#/$defs/duration'
+        default: [500ms, 2s, 5s]
+        description: >-
+          Base delay before each retry; the last entry repeats. The actual
+          delay is random, between half the base and the base. Empty means
+          500ms doubling per retry, capped at 30s.
+
+  policy:
+    type: object
+    description: How a keep probability becomes a keep or drop decision.
+    additionalProperties: false
+    properties:
+      keep_threshold:
+        $ref: '#/$defs/unit'
+        default: 0.5
+        description: >-
+          Keep a trace when its calibrated probability is at least this.
+          Lower keeps more traces.
+      random_floor:
+        $ref: '#/$defs/unit'
+        default: 0.02
+        description: >-
+          Share of the remaining traces kept at random: those scored below
+          the threshold, and those Kev could not score at all. It gives an
+          unbiased sample for checking the model. 0 turns it off.
+
+  alert:
+    type: object
+    description: Severity recorded on kept traces.
+    additionalProperties: false
+    properties:
+      severity_high:
+        $ref: '#/$defs/unit'
+        default: 0.8
+        description: >-
+          A kept trace with a calibrated probability at or above this gets
+          severity `high`; other kept traces get `normal`.
+
+  export:
+    type: object
+    description: Where kept traces go. Dropped traces are sent nowhere.
+    additionalProperties: false
+    properties:
+      phoenix_endpoint:
+        $ref: '#/$defs/httpURL'
+        default: http://localhost:6006/v1/traces
+        x-env: OBSERVER_PHOENIX_ENDPOINT
+        description: >-
+          Phoenix's OTLP/HTTP URL, including the /v1/traces path. Phoenix may
+          be down at start-up; a failed export is logged and not retried
+          later. For a Phoenix that needs an API key, set
+          OTEL_EXPORTER_OTLP_HEADERS.
+      project:
+        type: string
+        minLength: 1
+        default: observer-ai
+        description: Phoenix project kept traces are filed under.

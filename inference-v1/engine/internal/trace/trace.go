@@ -14,11 +14,13 @@ import (
 
 // Trace is one agent run submitted for a keep/drop decision.
 type Trace struct {
-	TraceID     string     `json:"trace_id,omitempty"`
-	Question    string     `json:"question"`
-	ToolCalls   []ToolCall `json:"tool_calls,omitempty"`
-	Evidence    []string   `json:"evidence,omitempty"`
-	FinalAnswer string     `json:"final_answer"`
+	TraceID   string     `json:"trace_id,omitempty"`
+	Question  string     `json:"question"`
+	ToolCalls []ToolCall `json:"tool_calls,omitempty"`
+	Evidence  []string   `json:"evidence,omitempty"`
+	// FinalAnswer is "" for a run that ended without an answer. Such a run
+	// is still scored, so the field must be present but may be empty.
+	FinalAnswer string `json:"final_answer"`
 
 	// OTLP holds the trace's original spans (a serialized OTLP TracesData)
 	// when the trace arrived through the OTLP receivers. A kept trace is
@@ -49,29 +51,40 @@ func (c ToolCall) StatusText() string {
 	return s
 }
 
-// Decode parses and validates a trace from JSON.
+// Decode parses and validates a trace from JSON. final_answer must be
+// present; an empty string means the agent gave no answer.
 func Decode(r io.Reader) (Trace, error) {
-	var t Trace
+	// The outer final_answer shadows Trace's, so a missing key can be told
+	// from an empty answer.
+	var in struct {
+		Trace
+		FinalAnswer *string `json:"final_answer"`
+	}
 	dec := json.NewDecoder(r)
-	if err := dec.Decode(&t); err != nil {
+	if err := dec.Decode(&in); err != nil {
 		return Trace{}, fmt.Errorf("invalid JSON: %w", err)
 	}
 	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
 		return Trace{}, errors.New("invalid JSON: unexpected data after the trace object")
 	}
+	t := in.Trace
+	if in.FinalAnswer != nil {
+		t.FinalAnswer = *in.FinalAnswer
+	}
 	if err := t.Validate(); err != nil {
 		return Trace{}, err
+	}
+	if in.FinalAnswer == nil {
+		return Trace{}, errors.New("final_answer is required")
 	}
 	return t, nil
 }
 
-// Validate checks the required fields and that every tool call can be sliced.
+// Validate checks the question and that every tool call can be sliced. An
+// empty FinalAnswer is valid: the run ended without an answer.
 func (t Trace) Validate() error {
 	if t.Question == "" {
 		return errors.New("question is required")
-	}
-	if t.FinalAnswer == "" {
-		return errors.New("final_answer is required")
 	}
 	for i, c := range t.ToolCalls {
 		if c.Name == "" {

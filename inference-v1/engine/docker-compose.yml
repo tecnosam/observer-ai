@@ -1,10 +1,11 @@
-# Runs the inference engine and its NATS JetStream queue.
+# Runs the inference engine, its NATS JetStream queue and Phoenix.
 #
 #   docker compose up --build        # or: make up
 #
-# Kev and Phoenix are not part of this file. By default the engine reaches
-# them on the Docker host (ports 8010 and 6006); override the variables below
-# to point elsewhere.
+# Kev is not part of this file. By default the engine reaches it on the
+# Docker host (port 8010); override OBSERVER_SCORER_ENDPOINT to point
+# elsewhere. To use a Phoenix outside compose instead of the one here, set
+# OBSERVER_PHOENIX_ENDPOINT and start only `nats` and `observer`.
 
 name: observer
 
@@ -27,16 +28,29 @@ services:
       start_period: 5s
     restart: unless-stopped
 
+  phoenix:
+    image: arizephoenix/phoenix:version-20.21.0
+    environment:
+      PHOENIX_WORKING_DIR: /mnt/data
+    ports:
+      - "${PHOENIX_PORT:-6006}:6006"        # UI (http://localhost:6006) and OTLP HTTP
+      - "${PHOENIX_GRPC_PORT:-4317}:4317"   # OTLP gRPC, for agents that send straight to Phoenix
+    volumes:
+      - phoenix-data:/mnt/data   # projects and traces survive restarts
+    restart: unless-stopped
+
   observer:
     build: .
     image: observer-engine:local
     depends_on:
       nats:
         condition: service_healthy
+      phoenix:
+        condition: service_started
     environment:
       OBSERVER_NATS_URL: nats://nats:4222
       OBSERVER_SCORER_ENDPOINT: ${OBSERVER_SCORER_ENDPOINT:-http://host.docker.internal:8010/v1/systemone}
-      OBSERVER_PHOENIX_ENDPOINT: ${OBSERVER_PHOENIX_ENDPOINT:-http://host.docker.internal:6006/v1/traces}
+      OBSERVER_PHOENIX_ENDPOINT: ${OBSERVER_PHOENIX_ENDPOINT:-http://phoenix:6006/v1/traces}
     volumes:
       # The model manifest from the fine-tuning run. The image reads it from
       # /etc/observer/manifest.json (OBSERVER_MANIFEST).
@@ -47,8 +61,8 @@ services:
     ports:
       - "${OBSERVER_PORT:-8080}:8080"             # JSON API and Swagger UI
       # OTLP gRPC. The container listens on 4317; the host port defaults to
-      # 14317 because Phoenix, which usually runs on the same host, takes
-      # 4317 for its own OTLP gRPC receiver.
+      # 14317 because the phoenix service above takes 4317 for its own OTLP
+      # gRPC receiver.
       - "${OBSERVER_OTLP_GRPC_PORT:-14317}:4317"
       - "${OBSERVER_OTLP_HTTP_PORT:-4318}:4318"   # OTLP HTTP: POST /v1/traces
     # Enough time for in-flight traces (server.shutdown_timeout) and the
@@ -58,3 +72,4 @@ services:
 
 volumes:
   nats-data:
+  phoenix-data:

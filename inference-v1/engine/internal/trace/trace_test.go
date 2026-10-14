@@ -27,12 +27,27 @@ func TestDecode(t *testing.T) {
 	}
 }
 
+// A run that ended without an answer is a valid trace.
+func TestDecodeEmptyFinalAnswer(t *testing.T) {
+	tr, err := Decode(strings.NewReader(`{"question": "q", "final_answer": ""}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tr.Question != "q" || tr.FinalAnswer != "" {
+		t.Errorf("got %q / %q", tr.Question, tr.FinalAnswer)
+	}
+	if got := BuildState(tr); !strings.HasSuffix(got, "FINAL ANSWER:\n") {
+		t.Errorf("state ends %q, want an empty final answer", got[len(got)-20:])
+	}
+}
+
 func TestDecodeErrors(t *testing.T) {
 	tests := []struct{ name, in, wantErr string }{
 		{"not JSON", `{"question": `, "invalid JSON"},
 		{"missing question", `{"final_answer": "a"}`, "question is required"},
 		{"empty question", `{"question": "", "final_answer": "a"}`, "question is required"},
 		{"missing final answer", `{"question": "q"}`, "final_answer is required"},
+		{"null final answer", `{"question": "q", "final_answer": null}`, "final_answer is required"},
 		{"wrong type", `{"question": 5, "final_answer": "a"}`, "invalid JSON"},
 		{"evidence not strings", `{"question": "q", "final_answer": "a", "evidence": [1]}`, "invalid JSON"},
 		{"tool call without name", `{"question": "q", "final_answer": "a", "tool_calls": [{"args": "x"}]}`, "tool_calls[0].name is required"},
