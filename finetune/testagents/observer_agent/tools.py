@@ -15,6 +15,8 @@ from typing import Any, Callable
 
 from google.adk.tools.tool_context import ToolContext
 
+from . import tracing
+
 STATUS_OK = "ok"
 STATUS_NOT_FOUND = "not_found"
 STATUS_BAD_ARGS = "bad_args"
@@ -214,46 +216,65 @@ class Toolbox:
         return "; ".join(self.store.titles) or "(none)"
 
     def adk_tools(self) -> list[Callable[..., str]]:
-        """`search` and `lookup` as plain functions bound to this run.
+        """`search` and `lookup` as plain functions bound to this run."""
+        return adk_tools(lambda tool_context: self)
 
-        ADK turns the signatures and docstrings into the tool declarations the
-        model sees, and injects `tool_context` itself (it is hidden from the model).
+    def evidence(self) -> list[str]:
+        """Every paragraph returned so far, deduplicated, in first-seen order."""
+        with self._lock:
+            seen: dict[str, None] = {}
+            for record in self.calls:
+                for text in record.paragraphs:
+                    seen.setdefault(text)
+            return list(seen)
+
+
+def adk_tools(toolbox_for: Callable[[ToolContext], Toolbox]) -> list[Callable[..., str]]:
+    """`search` and `lookup` as plain functions for an ADK agent.
+
+    `toolbox_for` picks the toolbox a call belongs to: always the same one for a
+    single run, or one per invocation for a long-lived agent. ADK turns the
+    signatures and docstrings into the tool declarations the model sees, and
+    injects `tool_context` itself (it is hidden from the model).
+    """
+
+    def search(query: str, tool_context: ToolContext) -> str:
+        """Search the reference paragraphs by keyword and return the 3 most relevant ones.
+
+        Use this first to find facts. Each call is a fresh keyword search, so
+        include the specific names, places or terms you need. For multi-hop
+        questions, search once per hop, using what the previous result told you.
+
+        Args:
+            query: Keywords to search for, for example "Marie Curie birthplace". Must not be empty.
+
+        Returns:
+            Up to 3 paragraphs, each formatted as "[Title] text" and separated by blank lines.
         """
-        toolbox = self
+        record = toolbox_for(tool_context).call(
+            "search", {"query": query}, tool_context.function_call_id
+        )
+        tracing.set_tool_status(record.status)
+        return record.result
 
-        def search(query: str, tool_context: ToolContext) -> str:
-            """Search the reference paragraphs by keyword and return the 3 most relevant ones.
+    def lookup(title: str, tool_context: ToolContext) -> str:
+        """Fetch one reference paragraph by its title.
 
-            Use this first to find facts. Each call is a fresh keyword search, so
-            include the specific names, places or terms you need. For multi-hop
-            questions, search once per hop, using what the previous result told you.
+        Use this when you already know the title, for example a "[Title]" seen in
+        a search result or an entity named in the question. Matching ignores case
+        and tolerates small typos.
 
-            Args:
-                query: Keywords to search for, for example "Marie Curie birthplace". Must not be empty.
+        Args:
+            title: The title of the paragraph to fetch, for example "Marie Curie".
 
-            Returns:
-                Up to 3 paragraphs, each formatted as "[Title] text" and separated by blank lines.
-            """
-            return toolbox.call(
-                "search", {"query": query}, tool_context.function_call_id
-            ).result
+        Returns:
+            The paragraph formatted as "[Title] text". If no title matches, a
+            message listing the available titles.
+        """
+        record = toolbox_for(tool_context).call(
+            "lookup", {"title": title}, tool_context.function_call_id
+        )
+        tracing.set_tool_status(record.status)
+        return record.result
 
-        def lookup(title: str, tool_context: ToolContext) -> str:
-            """Fetch one reference paragraph by its title.
-
-            Use this when you already know the title, for example a "[Title]" seen in
-            a search result or an entity named in the question. Matching ignores case
-            and tolerates small typos.
-
-            Args:
-                title: The title of the paragraph to fetch, for example "Marie Curie".
-
-            Returns:
-                The paragraph formatted as "[Title] text". If no title matches, a
-                message listing the available titles.
-            """
-            return toolbox.call(
-                "lookup", {"title": title}, tool_context.function_call_id
-            ).result
-
-        return [search, lookup]
+    return [search, lookup]

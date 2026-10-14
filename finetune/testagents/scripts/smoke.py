@@ -1,6 +1,10 @@
 """Run one two-hop example against a local Ollama and print the result as JSON.
 
-    uv run python scripts/smoke.py [--model qwen2.5:7b] [--base-url URL] [--otel-endpoint URL]
+    uv run python scripts/smoke.py [--model qwen2.5:7b] [--base-url URL] [--exporting] [--otel-endpoint URL]
+
+`--exporting` sends the run's trace to the Observer engine's OTLP endpoint
+(http://localhost:4318/v1/traces); `--otel-endpoint` sends it somewhere else
+and turns exporting on by itself.
 
 Exit codes: 0 answered "Seine" with at least one ok tool call, 1 Ollama
 unreachable or the run failed, 2 the run completed but the answer looks wrong.
@@ -11,50 +15,27 @@ import json
 import sys
 
 from observer_agent import AgentConfig, run_agent
-
-QUESTION = "Which river flows through the capital of the country where the Eiffel Tower is?"
-
-PARAGRAPHS = [
-    {
-        "title": "Eiffel Tower",
-        "text": "The Eiffel Tower is a wrought-iron lattice tower on the Champ de Mars in Paris, France. "
-        "It was completed in 1889 and is named after the engineer Gustave Eiffel.",
-    },
-    {
-        "title": "Paris",
-        "text": "Paris is the capital and most populous city of France. The city is built on the "
-        "banks of the Seine, which flows through its centre.",
-    },
-    {
-        "title": "Mount Kilimanjaro",
-        "text": "Mount Kilimanjaro is a dormant volcano in Tanzania and the highest mountain in Africa.",
-    },
-    {
-        "title": "Photosynthesis",
-        "text": "Photosynthesis is the process by which plants and algae convert light energy into "
-        "chemical energy stored in sugars.",
-    },
-    {
-        "title": "Great Barrier Reef",
-        "text": "The Great Barrier Reef is the world's largest coral reef system, located in the Coral "
-        "Sea off the coast of Queensland, Australia.",
-    },
-    {
-        "title": "Johann Sebastian Bach",
-        "text": "Johann Sebastian Bach was a German composer of the Baroque period, known for the "
-        "Brandenburg Concertos and the Mass in B minor.",
-    },
-]
-
+from observer_agent.samples import SMOKE_PARAGRAPHS as PARAGRAPHS
+from observer_agent.samples import SMOKE_QUESTION as QUESTION
 
 def main() -> int:
     defaults = AgentConfig()
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--model", default=defaults.model)
     parser.add_argument("--base-url", default=defaults.base_url)
-    parser.add_argument("--otel-endpoint", default=None)
+    parser.add_argument("--exporting", action="store_true", help="export the trace over OTLP (off by default)")
+    parser.add_argument(
+        "--otel-endpoint",
+        default=None,
+        help=f"OTLP HTTP traces URL; implies --exporting (default {defaults.otel_endpoint})",
+    )
     args = parser.parse_args()
-    cfg = AgentConfig(model=args.model, base_url=args.base_url, otel_endpoint=args.otel_endpoint)
+    cfg = AgentConfig(
+        model=args.model,
+        base_url=args.base_url,
+        exporting=args.exporting or args.otel_endpoint is not None,
+        otel_endpoint=args.otel_endpoint or defaults.otel_endpoint,
+    )
 
     try:
         result = run_agent(QUESTION, PARAGRAPHS, cfg)
@@ -68,6 +49,8 @@ def main() -> int:
         return 1
 
     print(json.dumps(result, indent=2, ensure_ascii=False))
+    if cfg.exporting:
+        print(f"smoke: exporting trace {result['trace_id']} to {cfg.otel_endpoint}", file=sys.stderr)
 
     ok_calls = sum(call["status"] == "ok" for call in result["tool_calls"])
     if "seine" not in result["final_answer"].lower() or ok_calls == 0:

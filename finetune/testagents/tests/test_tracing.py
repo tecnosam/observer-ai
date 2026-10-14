@@ -1,3 +1,4 @@
+import json
 import socket
 import threading
 import time
@@ -9,10 +10,12 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanE
 import observer_agent.agent as agent_module
 from observer_agent import AgentConfig, run_agent, tracing
 
-from .fakes import ScriptedLlm, search_lookup_answer
+from observer_agent.tools import STATUS_BAD_ARGS
+
+from .fakes import ScriptedLlm, call, search_lookup_answer, text
 
 QUESTION = "Which river flows through Paris?"
-ENDPOINT = "http://phoenix.invalid/v1/traces"
+ENDPOINT = "http://collector.invalid/v1/traces"
 
 
 @pytest.fixture
@@ -63,8 +66,70 @@ def test_tracing_is_off_by_default(fresh_tracing, paragraphs):
     assert len(result["trace_id"]) == 32
 
 
-def test_trace_id_is_the_root_spans_trace_id(exporter, paragraphs):
+def test_an_endpoint_alone_does_not_turn_exporting_on(fresh_tracing, paragraphs):
     result = run_agent(QUESTION, paragraphs, AgentConfig(otel_endpoint=ENDPOINT))
+    assert tracing._state is None
+    assert len(result["trace_id"]) == 32
+
+
+def test_exporting_defaults_to_the_observer_engine(exporter, paragraphs):
+    assert AgentConfig().exporting is False
+    assert AgentConfig().otel_endpoint == "http://localhost:4318/v1/traces"
+    run_agent(QUESTION, paragraphs, AgentConfig(exporting=True))
+    assert tracing._state.endpoint == "http://localhost:4318/v1/traces"
+
+
+def test_exporting_without_an_endpoint_is_an_error(fresh_tracing, paragraphs):
+    with pytest.raises(ValueError, match="otel_endpoint"):
+        run_agent(QUESTION, paragraphs, AgentConfig(exporting=True, otel_endpoint=None))
+
+
+def test_spans_carry_what_the_observer_engine_reads(exporter, paragraphs, monkeypatch):
+    script = [
+        lambda q, obs: [call("search", query=q)],
+        lambda q, obs: [call("lookup", title="Nowhere At All")],
+        lambda q, obs: [text("Seine")],
+    ]
+    monkeypatch.setattr(agent_module, "build_model", lambda cfg: ScriptedLlm(script=script))
+    result = run_agent(QUESTION, paragraphs, AgentConfig(exporting=True, otel_endpoint=ENDPOINT))
+    spans = finished_spans(exporter)
+
+    # Tool statuses match the returned record, in call order.
+    tools = sorted((s for s in spans if kind(s) == "TOOL"), key=lambda s: s.start_time)
+    assert [s.attributes[tracing.TOOL_STATUS] for s in tools] == ["ok", "not_found"]
+    assert [s.attributes[tracing.TOOL_STATUS] for s in tools] == [c["status"] for c in result["tool_calls"]]
+    for span in tools:
+        json.loads(span.attributes[tracing.INPUT_VALUE])  # the engine takes JSON arguments as they are
+
+    # The root span lists the evidence exactly as the record does.
+    root = next(s for s in spans if s.parent is None)
+    assert result["evidence"]
+    assert [
+        root.attributes[tracing.EVIDENCE_FMT.format(i)] for i in range(len(result["evidence"]))
+    ] == result["evidence"]
+    assert tracing.EVIDENCE_FMT.format(len(result["evidence"])) not in root.attributes
+    assert root.attributes[tracing.STOP_REASON] == "answered"
+
+
+def test_a_rejected_tool_call_is_exported_as_bad_args(exporter, paragraphs, monkeypatch):
+    # ADK answers these two calls itself; our tool code never runs for them.
+    script = [
+        lambda q, obs: [call("search")],  # missing required argument
+        lambda q, obs: [call("nosuchtool", x=1)],
+        lambda q, obs: [call("search", query=q)],
+        lambda q, obs: [text("Seine")],
+    ]
+    monkeypatch.setattr(agent_module, "build_model", lambda cfg: ScriptedLlm(script=script))
+    result = run_agent(QUESTION, paragraphs, AgentConfig(exporting=True, otel_endpoint=ENDPOINT))
+    assert tracing.REJECTED_TOOL_STATUS == STATUS_BAD_ARGS
+
+    tools = sorted((s for s in finished_spans(exporter) if kind(s) == "TOOL"), key=lambda s: s.start_time)
+    assert [s.attributes[tracing.TOOL_STATUS] for s in tools] == ["bad_args", "bad_args", "ok"]
+    assert [c["status"] for c in result["tool_calls"]] == ["bad_args", "bad_args", "ok"]
+
+
+def test_trace_id_is_the_root_spans_trace_id(exporter, paragraphs):
+    result = run_agent(QUESTION, paragraphs, AgentConfig(exporting=True, otel_endpoint=ENDPOINT))
     spans = finished_spans(exporter)
 
     roots = [s for s in spans if s.parent is None]
@@ -87,7 +152,7 @@ def test_trace_id_is_the_root_spans_trace_id(exporter, paragraphs):
 
 def test_manual_tool_spans_when_the_instrumentor_is_unavailable(exporter, paragraphs, monkeypatch):
     monkeypatch.setattr(tracing, "_instrument_adk", lambda provider: False)
-    result = run_agent(QUESTION, paragraphs, AgentConfig(otel_endpoint=ENDPOINT))
+    result = run_agent(QUESTION, paragraphs, AgentConfig(exporting=True, otel_endpoint=ENDPOINT))
     spans = finished_spans(exporter)
 
     roots = [s for s in spans if s.parent is None]
@@ -97,6 +162,8 @@ def test_manual_tool_spans_when_the_instrumentor_is_unavailable(exporter, paragr
     assert sorted(s.attributes[tracing.TOOL_NAME] for s in tools) == ["lookup", "search"]
     for span in tools:
         assert span.parent.span_id == roots[0].context.span_id
+        assert span.attributes[tracing.TOOL_STATUS] == "ok"
+        json.loads(span.attributes[tracing.INPUT_VALUE])
         assert span.attributes[tracing.OUTPUT_VALUE].startswith("[")
         assert span.start_time <= span.end_time
 
@@ -111,7 +178,7 @@ def test_provider_is_set_up_once_across_threads(exporter, paragraphs, monkeypatc
         return real_setup(endpoint)
 
     monkeypatch.setattr(tracing, "_setup", counting_setup)
-    cfg = AgentConfig(otel_endpoint=ENDPOINT)
+    cfg = AgentConfig(exporting=True, otel_endpoint=ENDPOINT)
     with ThreadPoolExecutor(4) as pool:
         results = list(pool.map(lambda i: run_agent(QUESTION, paragraphs, cfg), range(8)))
 
@@ -130,7 +197,7 @@ def test_run_inside_event_loop_keeps_one_trace(exporter, paragraphs):
     import asyncio
 
     async def main():
-        return run_agent(QUESTION, paragraphs, AgentConfig(otel_endpoint=ENDPOINT))
+        return run_agent(QUESTION, paragraphs, AgentConfig(exporting=True, otel_endpoint=ENDPOINT))
 
     result = asyncio.run(main())
     spans = finished_spans(exporter)
@@ -142,18 +209,18 @@ def test_failed_run_still_raises_and_closes_the_root_span(exporter, paragraphs, 
         agent_module, "build_model", lambda cfg: ScriptedLlm(script=[ConnectionError("down")])
     )
     with pytest.raises(ConnectionError):
-        run_agent(QUESTION, paragraphs, AgentConfig(otel_endpoint=ENDPOINT))
+        run_agent(QUESTION, paragraphs, AgentConfig(exporting=True, otel_endpoint=ENDPOINT))
     roots = [s for s in finished_spans(exporter) if s.parent is None]
     assert len(roots) == 1
     assert not roots[0].status.is_ok
 
 
-def test_run_succeeds_when_phoenix_is_not_running(fresh_tracing, paragraphs):
+def test_run_succeeds_when_the_endpoint_is_not_running(fresh_tracing, paragraphs):
     # A local port with nothing listening: the real OTLP exporter gets connection refused.
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
         port = sock.getsockname()[1]
-    cfg = AgentConfig(otel_endpoint=f"http://127.0.0.1:{port}/v1/traces")
+    cfg = AgentConfig(exporting=True, otel_endpoint=f"http://127.0.0.1:{port}/v1/traces")
 
     started = time.perf_counter()
     result = run_agent(QUESTION, paragraphs, cfg)

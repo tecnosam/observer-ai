@@ -1,1 +1,4 @@
 .pytest_cache/
+chat/corpus.json
+chat/questions.json
+session.db

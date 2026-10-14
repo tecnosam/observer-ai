@@ -192,8 +192,9 @@ class _RunState:
             attributes={
                 tracing.SPAN_KIND: tracing.KIND_TOOL,
                 tracing.TOOL_NAME: step["tool"],
-                tracing.INPUT_VALUE: str(step["args"]),
+                tracing.INPUT_VALUE: json.dumps(step["args"], ensure_ascii=False, default=str),
                 tracing.OUTPUT_VALUE: record.result,
+                tracing.TOOL_STATUS: record.status,
             },
         )
         span.end()
@@ -296,9 +297,11 @@ async def arun_agent(question: str, paragraphs: list[dict], cfg: AgentConfig) ->
         raise ValueError("max_steps must be at least 1")
     if cfg.max_tool_calls < 0:
         raise ValueError("max_tool_calls must not be negative")
+    if cfg.exporting and not cfg.otel_endpoint:
+        raise ValueError("exporting is on but otel_endpoint is empty")
 
     started = time.perf_counter()
-    tracer_state = tracing.get_tracing(cfg.otel_endpoint)
+    tracer_state = tracing.get_tracing(cfg.otel_endpoint if cfg.exporting else None)
     if tracer_state is None:
         trace_id = uuid.uuid4().hex
         outcome = await _run(question, paragraphs, cfg, None)
@@ -311,7 +314,8 @@ async def arun_agent(question: str, paragraphs: list[dict], cfg: AgentConfig) ->
             trace_id = tracing.format_trace_id(span.get_span_context().trace_id)
             outcome = await _run(question, paragraphs, cfg, tracer_state)
             span.set_attribute(tracing.OUTPUT_VALUE, outcome["final_answer"])
-            span.set_attribute("observer.stop_reason", outcome["stop_reason"])
+            span.set_attribute(tracing.STOP_REASON, outcome["stop_reason"])
+            span.set_attributes(tracing.evidence_attributes(outcome["evidence"]))
             span.set_attribute("llm.model_name", cfg.model)
 
     return {
