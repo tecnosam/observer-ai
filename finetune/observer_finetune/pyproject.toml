@@ -1,0 +1,30 @@
+[project]
+name = "observer-finetune"
+version = "0.1.0"
+description = "Fine-tune Kev on labeled agent traces and get a run directory the Observer.ai engine can serve"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "numpy",
+    "requests",
+    "scikit-learn",
+    "scipy",
+]
+
+[project.scripts]
+observer-finetune = "observer_finetune.cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["observer_finetune"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
