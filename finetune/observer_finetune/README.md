@@ -53,6 +53,16 @@ uv run observer-finetune check --data traces.jsonl                  # validate a
 uv run observer-finetune train --data traces.jsonl --out runs/my-run
 ```
 
+The Makefile wraps the same commands:
+
+```sh
+make install
+make check DATA=traces.jsonl
+make train DATA=traces.jsonl OUT=runs/my-run
+make test                     # offline tests
+make example-train            # fine-tune on the bundled example
+```
+
 From Python:
 
 ```python
