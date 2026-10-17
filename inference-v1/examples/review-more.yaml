@@ -1,0 +1,16 @@
+# yaml-language-server: $schema=../engine/observer.schema.yaml
+#
+# Keep more traces for review: a lower threshold and a larger random sample.
+# For a new agent, while you are still learning what its mistakes look like and
+# have reviewers to spare. Compare with the defaults: keep_threshold 0.5,
+# random_floor 0.02, severity_high 0.8.
+
+scorer:
+  manifest: ../../finetune/notebooks/runs/observer-kev-0.8b-ft/manifest.json
+
+policy:
+  keep_threshold: 0.35       # keep a trace once its calibrated p(wrong) reaches 0.35
+  random_floor: 0.05         # and 5% of the rest at random, an unbiased sample to check the model against
+
+alert:
+  severity_high: 0.7         # kept traces at or above this are marked severity "high"

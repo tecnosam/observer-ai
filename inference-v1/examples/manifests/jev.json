@@ -1,0 +1,22 @@
+{
+  "model": "jev-latest",
+  "note": "Jev is hosted and not fine-tuned, so this manifest only carries what the engine needs: the questions it asks (the same ones Kev is trained on) and a temperature per question. The temperatures are 1.0, i.e. Jev's raw probabilities. Fit them on calibration traces from your own agent and replace these values.",
+  "questions": {
+    "answer_wrong": {
+      "type": "noul",
+      "instructions": "Is the final answer wrong or only partially correct for the user's question?"
+    },
+    "keep_or_drop": {
+      "type": "choice",
+      "instructions": "Should this agent trace be kept for human review?",
+      "criteria": {
+        "keep": "The final answer is wrong, only partly correct or unsupported by the evidence, or the agent misused or skipped its tools.",
+        "drop": "The final answer is correct, complete and supported by the evidence, and the agent used its tools appropriately."
+      }
+    }
+  },
+  "temperatures": {
+    "answer_wrong": 1.0,
+    "keep_or_drop": 1.0
+  }
+}

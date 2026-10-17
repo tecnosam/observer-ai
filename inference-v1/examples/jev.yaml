@@ -1,0 +1,33 @@
+# yaml-language-server: $schema=../engine/observer.schema.yaml
+#
+# Score traces with TypeSafe's hosted Jev instead of a Kev server.
+#
+#   export JEV_API_KEY=...                     # or: envchain observer-ai make run CONFIG=../examples/jev.yaml
+#   cd ../engine && make run CONFIG=../examples/jev.yaml
+#
+# Every trace slice the engine scores is sent to api.typesafe.ai and billed to
+# the key. Only use it for traces you are allowed to send to a third party.
+# Keys not listed here keep the defaults in ../engine/observer.yaml.
+
+server:
+  workers: 4                 # concurrent calls to Jev; lower it if Jev answers 429
+
+queue:
+  # A worker must finish every attempt at Jev before the queue hands the trace
+  # to another worker: (max_retries + 1) x timeout + backoff = 141s here.
+  ack_wait: 5m
+
+scorer:
+  kind: jev
+  api_key_env: JEV_API_KEY   # the environment variable holding the key (JEV_API_KEY is also the default)
+  endpoint: https://api.typesafe.ai/v1/systemone
+  model: jev-latest
+  # Jev is not fine-tuned, so its manifest holds only the questions (the same
+  # ones Kev answers) and a temperature per question, 1.0 until you fit them
+  # on your own agent's calibration traces.
+  manifest: manifests/jev.json
+  decision_question: answer_wrong
+  timeout: 30s               # a network round trip, not a local server
+  max_retries: 3
+  backoff: [1s, 5s, 15s]     # Jev answers 429 / 529 when busy; 5xx and timeouts are retried here,
+                             # a 429 goes back to the queue and is redelivered later

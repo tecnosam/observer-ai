@@ -1,0 +1,29 @@
+# yaml-language-server: $schema=../engine/observer.schema.yaml
+#
+# The engine on one machine, its dependencies elsewhere: Kev on a GPU host,
+# NATS over TLS, and Phoenix as a hosted service. The hostnames are
+# placeholders. The same three URLs can also come from the environment
+# (OBSERVER_SCORER_ENDPOINT, OBSERVER_NATS_URL, OBSERVER_PHOENIX_ENDPOINT),
+# which is how docker-compose.yml sets them.
+#
+# A hosted Phoenix that needs a key reads it from OTEL_EXPORTER_OTLP_HEADERS,
+# for example: export OTEL_EXPORTER_OTLP_HEADERS="api_key=..."
+
+server:
+  workers: 16                # more concurrent calls to a bigger Kev server
+  shutdown_timeout: 60s
+
+queue:
+  url: tls://nats.internal.example.com:4222
+  connect_timeout: 60s
+
+scorer:
+  kind: kev
+  endpoint: http://kev-gpu.internal.example.com:8010/v1/systemone
+  # api_key_env: KEV_API_KEY # if the Kev server sits behind a proxy that wants a bearer token
+  manifest: ../../finetune/notebooks/runs/observer-kev-0.8b-ft/manifest.json
+  timeout: 20s               # a network hop away instead of on the same machine
+
+export:
+  phoenix_endpoint: https://app.phoenix.arize.com/v1/traces
+  project: observer-ai-production

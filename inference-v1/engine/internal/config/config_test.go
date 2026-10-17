@@ -214,6 +214,45 @@ func TestLoadErrors(t *testing.T) {
 	}
 }
 
+func TestJevScorerReadsItsKeyFromTheEnvironment(t *testing.T) {
+	jev := "scorer:\n  kind: jev\n  manifest: manifest.json\n"
+
+	t.Setenv(DefaultJevAPIKeyEnv, "")
+	if _, err := Load(write(t, jev, testManifest)); err == nil || !strings.Contains(err.Error(), "$JEV_API_KEY is not set") {
+		t.Fatalf("error = %v, want the missing JEV_API_KEY named", err)
+	}
+
+	t.Setenv(DefaultJevAPIKeyEnv, "secret")
+	cfg, err := Load(write(t, jev, testManifest))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Scorer.APIKeyEnv != DefaultJevAPIKeyEnv || cfg.Scorer.APIKey != "secret" {
+		t.Errorf("api key env %q, key %q", cfg.Scorer.APIKeyEnv, cfg.Scorer.APIKey)
+	}
+
+	t.Setenv("MY_JEV_KEY", "other-secret")
+	cfg, err = Load(write(t, "scorer:\n  kind: jev\n  api_key_env: MY_JEV_KEY\n  manifest: manifest.json\n", testManifest))
+	if err != nil || cfg.Scorer.APIKey != "other-secret" {
+		t.Errorf("custom variable: error %v", err)
+	}
+}
+
+func TestKevScorerNeedsNoKey(t *testing.T) {
+	t.Setenv(DefaultJevAPIKeyEnv, "set-but-not-for-kev")
+	cfg, err := Load(write(t, "scorer:\n  manifest: manifest.json\n", testManifest))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Scorer.Kind != ScorerKev || cfg.Scorer.APIKey != "" {
+		t.Errorf("kind %q, key %q: a Kev scorer must not pick up a key it was not given", cfg.Scorer.Kind, cfg.Scorer.APIKey)
+	}
+	if _, err := Load(write(t, "scorer:\n  kind: gpt\n  manifest: manifest.json\n", testManifest)); err == nil ||
+		!strings.Contains(err.Error(), "scorer.kind") {
+		t.Errorf("unknown kind: error = %v", err)
+	}
+}
+
 func TestMissingConfigFile(t *testing.T) {
 	if _, err := Load(filepath.Join(t.TempDir(), "nope.yaml")); err == nil {
 		t.Fatal("expected an error")

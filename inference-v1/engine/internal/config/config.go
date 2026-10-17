@@ -25,6 +25,14 @@ const (
 	EnvOTLPHTTPAddr    = "OBSERVER_OTLP_HTTP_ADDR"
 
 	questionTypeNoul = "noul"
+
+	// Scorer kinds. Both speak the /v1/systemone protocol; jev is TypeSafe's
+	// hosted model and needs an API key.
+	ScorerKev = "kev"
+	ScorerJev = "jev"
+
+	// DefaultJevAPIKeyEnv holds Jev's API key when scorer.api_key_env is unset.
+	DefaultJevAPIKeyEnv = "JEV_API_KEY"
 )
 
 // Duration is a time.Duration that parses from YAML strings like "500ms".
@@ -117,8 +125,18 @@ type Queue struct {
 }
 
 type Scorer struct {
-	Endpoint         string     `yaml:"endpoint"`
-	Model            string     `yaml:"model"`
+	// Kind is kev (a Kev server, no key by default) or jev (TypeSafe's
+	// hosted Jev, which needs an API key).
+	Kind     string `yaml:"kind"`
+	Endpoint string `yaml:"endpoint"`
+	Model    string `yaml:"model"`
+	// APIKeyEnv names the environment variable holding the scorer's API key,
+	// sent as a bearer token. Defaults to JEV_API_KEY for jev; unset means no
+	// key for kev. The key itself never goes in the file.
+	APIKeyEnv string `yaml:"api_key_env"`
+	// APIKey is read from APIKeyEnv at load time; it is not part of the YAML.
+	APIKey string `yaml:"-"`
+
 	Manifest         string     `yaml:"manifest"`
 	DecisionQuestion string     `yaml:"decision_question"`
 	Timeout          Duration   `yaml:"timeout"`
@@ -195,6 +213,7 @@ func Default() Config {
 			PendingSubject: "observer.pending",
 		},
 		Scorer: Scorer{
+			Kind:             ScorerKev,
 			Endpoint:         "http://localhost:8010/v1/systemone",
 			Model:            "kev-latest",
 			DecisionQuestion: "answer_wrong",
@@ -250,6 +269,13 @@ func Load(path string) (*Config, error) {
 		cfg.OTLP.HTTPAddr = v
 	}
 
+	if cfg.Scorer.Kind == ScorerJev && cfg.Scorer.APIKeyEnv == "" {
+		cfg.Scorer.APIKeyEnv = DefaultJevAPIKeyEnv
+	}
+	if cfg.Scorer.APIKeyEnv != "" {
+		cfg.Scorer.APIKey = os.Getenv(cfg.Scorer.APIKeyEnv)
+	}
+
 	if err := cfg.validate(); err != nil {
 		return nil, fmt.Errorf("config %s: %w", path, err)
 	}
@@ -280,6 +306,12 @@ func (c *Config) validate() error {
 		add("server.shutdown_timeout must be positive, got %s", c.Server.ShutdownTimeout.Std())
 	}
 
+	if c.Scorer.Kind != ScorerKev && c.Scorer.Kind != ScorerJev {
+		add("scorer.kind must be %q or %q, got %q", ScorerKev, ScorerJev, c.Scorer.Kind)
+	}
+	if c.Scorer.APIKeyEnv != "" && c.Scorer.APIKey == "" {
+		add("scorer.api_key_env: $%s is not set; it must hold the scorer's API key", c.Scorer.APIKeyEnv)
+	}
 	if err := checkURL(c.Scorer.Endpoint); err != nil {
 		add("scorer.endpoint: %w", err)
 	}

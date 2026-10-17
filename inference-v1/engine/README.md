@@ -137,7 +137,8 @@ Flags: `-config PATH` (default `observer.yaml`) and `-log-level debug|info|warn|
 ## Configuration
 
 `observer.yaml` documents every key with its default. Only `scorer.manifest`
-is required. [observer.schema.yaml](observer.schema.yaml) is the full
+is required. [`../examples/`](../examples/) has ready-to-run variations,
+including scoring with TypeSafe's hosted Jev instead of Kev. [observer.schema.yaml](observer.schema.yaml) is the full
 reference: a JSON Schema with each key's type, default, limits and the rules
 that tie keys together. [architecture.md](architecture.md) explains how the
 file is loaded.
@@ -167,6 +168,8 @@ file is loaded.
 | `queue.dlq_stream` | `OBSERVER_TRACES_DLQ` | Dead-letter stream |
 | `queue.dlq_subject` | `observer.traces.dlq` | Dead-letter subject |
 | `queue.dlq_max_age` | `168h` | How long dead letters are kept |
+| `scorer.kind` | `kev` | `kev` for a Kev server, `jev` for TypeSafe's hosted Jev |
+| `scorer.api_key_env` | `JEV_API_KEY` for `jev`, unset for `kev` | Environment variable holding the scorer's API key, sent as a bearer token. Start-up fails if it names an unset variable |
 | `scorer.endpoint` | `http://localhost:8010/v1/systemone` | Kev endpoint |
 | `scorer.model` | `kev-latest` | Model name sent to Kev |
 | `scorer.manifest` | (required) | Path to the fine-tuning `manifest.json` |

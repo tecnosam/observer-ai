@@ -47,6 +47,9 @@ func TestSchemaMatchesConfig(t *testing.T) {
 		var keys []string
 		for j := 0; j < value.NumField(); j++ {
 			key := value.Type().Field(j).Tag.Get("yaml")
+			if key == "-" {
+				continue // filled in at load time, not read from the file
+			}
 			keys = append(keys, key)
 			prop, ok := props[key]
 			if !ok {

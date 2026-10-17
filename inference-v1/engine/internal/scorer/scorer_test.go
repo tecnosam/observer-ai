@@ -132,6 +132,32 @@ func TestScoreJevCompatibleLatency(t *testing.T) {
 	}
 }
 
+// A hosted scorer such as Jev needs its key on every request, the probe included;
+// a local Kev gets no Authorization header at all.
+func TestAPIKeyIsSentAsBearerToken(t *testing.T) {
+	var auth []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		auth = append(auth, r.Header.Get("Authorization"))
+		w.Write(fixture(t, "success_jev.json"))
+	}))
+	defer srv.Close()
+
+	c, _ := newClient(t, srv.URL+"/v1/systemone", func(cfg *Config) { cfg.APIKey = "secret" })
+	if _, err := c.Score(context.Background(), "s"); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Ready(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	plain, _ := newClient(t, srv.URL+"/v1/systemone", nil)
+	if _, err := plain.Score(context.Background(), "s"); err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"Bearer secret", "Bearer secret", ""}; strings.Join(auth, "|") != strings.Join(want, "|") {
+		t.Errorf("Authorization headers = %q, want %q", auth, want)
+	}
+}
+
 func TestScoreMeasuresLatencyWhenServerReportsNone(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(`{"answers":{"answer_wrong":{"type":"noul","noul":0.4}}}`))

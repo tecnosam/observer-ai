@@ -40,6 +40,7 @@ on that agent's own mistakes.
 
 | Path | What it is |
 |---|---|
+| [`inference-v1/examples/`](inference-v1/examples/) | Example engine configs: scoring with the hosted Jev, serving an SDK run, JSON API only, a larger review budget, remote services |
 | [`inference-v1/engine/`](inference-v1/engine/) | The engine, in Go: OTLP receivers, a JSON API, a NATS JetStream queue, the Kev client, the keep/drop policy and the Phoenix exporter. Runs with Docker Compose together with NATS and Phoenix. See its [README](inference-v1/engine/README.md) and [architecture notes](inference-v1/engine/architecture.md) |
 | [`finetune/observer_finetune/`](finetune/observer_finetune/) | The fine-tuning SDK: labeled traces in, a fine-tuned Kev and its evaluation out. Reads JSONL, OTLP span files or a Phoenix project. See its [README](finetune/observer_finetune/README.md) |
 | [`finetune/testagents/`](finetune/testagents/) | A small ReAct agent (Google ADK, a local model through Ollama) that answers HotpotQA-style questions with search tools. It generated the eval dataset, and can export its traces to the engine or be used from a chat UI. See its [README](finetune/testagents/README.md) |
@@ -118,21 +119,3 @@ run's `manifest.json`.
 | 8009, 8011, 8012 | Extra model servers the notebooks use: zero-shot Kev, zero-shot Laya, fine-tuned Laya |
 | 11434 | Ollama, for the test agent |
 | 8000 | The test agent's chat UI |
-
-## Where things stand
-
-From the notebook runs on the labeled HotpotQA dataset (456 held-out test
-traces), at a 5% review budget with 10% of traces wrong:
-
-| | AUROC | Normalized recall |
-|---|---|---|
-| Kev, released (zero-shot) | 0.567 | 0.01 |
-| Kev, fine-tuned | 0.735 | 0.44 |
-| Laya, fine-tuned | 0.723 | 0.52 |
-| No-model heuristic | 0.701 | 0.59 |
-
-Normalized recall is 0 for random sampling and 1 for catching every wrong
-trace the budget allows. Fine-tuning helps a lot over the released model, but
-on this dataset neither fine-tuned model yet beats simple rules (answer
-length, number of evidence items, failed tool calls) at a 5% budget. Kev and
-Laya catch different traces, so combining them is an open direction.

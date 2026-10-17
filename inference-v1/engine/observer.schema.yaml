@@ -243,6 +243,23 @@ properties:
     additionalProperties: false
     required: [manifest]
     properties:
+      kind:
+        type: string
+        enum: [kev, jev]
+        default: kev
+        description: >-
+          Which decision model the endpoint serves. kev is a Kev server, which
+          needs no key unless api_key_env is set. jev is TypeSafe's hosted Jev,
+          which needs an API key (see api_key_env). Both speak the same
+          /v1/systemone protocol.
+      api_key_env:
+        type: string
+        description: >-
+          Name of the environment variable that holds the scorer's API key,
+          sent as "Authorization: Bearer <key>" with every request. Defaults to
+          JEV_API_KEY when scorer.kind is jev; unset means no key for kev. The
+          key itself never goes in this file. Rule: when set (or defaulted),
+          the variable must be set and non-empty at start-up.
       endpoint:
         $ref: '#/$defs/httpURL'
         default: http://localhost:8010/v1/systemone

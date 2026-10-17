@@ -29,6 +29,8 @@ type Config struct {
 	// Questions is the JSON object of questions sent with every request.
 	Questions        json.RawMessage
 	DecisionQuestion string
+	// APIKey, when set, is sent as a bearer token with every request.
+	APIKey string
 	// Timeout applies to each attempt, not to the whole call.
 	Timeout time.Duration
 	// MaxRetries is the number of retries after the first attempt.
@@ -168,6 +170,7 @@ func (c *Client) attempt(ctx context.Context, body []byte) (Result, error) {
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
+	c.authorize(req)
 
 	start := time.Now()
 	resp, err := c.cfg.HTTPClient.Do(req)
@@ -225,6 +228,7 @@ func (c *Client) Ready(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	c.authorize(req)
 	resp, err := c.cfg.HTTPClient.Do(req)
 	if err != nil {
 		return err
@@ -235,6 +239,12 @@ func (c *Client) Ready(ctx context.Context) error {
 		return &StatusError{Code: resp.StatusCode, Body: "probe " + c.probeURL}
 	}
 	return nil
+}
+
+func (c *Client) authorize(req *http.Request) {
+	if c.cfg.APIKey != "" {
+		req.Header.Set("Authorization", "Bearer "+c.cfg.APIKey)
+	}
 }
 
 // backoff returns the jittered delay before retry number retry (0-based):

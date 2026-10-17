@@ -40,6 +40,8 @@ otlp:
   pending_subject: observer.pending
 
 scorer:
+  kind: kev                                      # kev | jev (TypeSafe's hosted Jev; see ../examples/jev.yaml)
+  # api_key_env: JEV_API_KEY                     # env var holding a bearer key; defaults to JEV_API_KEY for jev
   endpoint: http://localhost:8010/v1/systemone   # env: OBSERVER_SCORER_ENDPOINT
   model: kev-latest                              # model name sent to Kev
   # Relative paths resolve against this file's directory. env: OBSERVER_MANIFEST

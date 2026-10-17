@@ -1,0 +1,18 @@
+# yaml-language-server: $schema=../engine/observer.schema.yaml
+#
+# Take traces over the JSON API only (POST /v1/traces and /v1/traces:score),
+# with the OTLP receivers switched off. For agents that are not instrumented
+# with OpenTelemetry, or when ports 4317 and 4318 are taken.
+#
+#   cd ../engine && make run CONFIG=../examples/json-api-only.yaml
+#   curl -X POST localhost:8080/v1/traces:score -d @testdata/traces/wrong_river.json
+
+server:
+  addr: ":8080"
+
+otlp:
+  grpc_addr: ""              # "" switches the gRPC receiver off
+  http_addr: ""              # both off: no span streams are created in NATS either
+
+scorer:
+  manifest: ../../finetune/notebooks/runs/observer-kev-0.8b-ft/manifest.json

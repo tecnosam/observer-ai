@@ -1,0 +1,19 @@
+# yaml-language-server: $schema=../engine/observer.schema.yaml
+#
+# Serve a Kev run made by the fine-tuning SDK (finetune/observer_finetune).
+#
+#   # serve the run's checkpoint (report.md in the run directory has this command)
+#   cd ~/.cache/observer-finetune/kev-5e42a7a03f28
+#   uv run --extra serve python -m kev.serve --run /path/to/runs/my-run/checkpoint --port 8010
+#
+#   cd ../engine && make run CONFIG=../examples/kev-sdk-run.yaml
+#
+# The engine only needs the run's manifest: the questions it was trained on and
+# the temperature fitted for it. Point scorer.manifest at it (relative paths
+# resolve against this file), or set OBSERVER_MANIFEST instead of editing.
+
+scorer:
+  kind: kev
+  endpoint: http://localhost:8010/v1/systemone
+  model: kev-latest
+  manifest: ../../finetune/observer_finetune/runs/my-run/manifest.json
