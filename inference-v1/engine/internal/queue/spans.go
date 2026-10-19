@@ -12,6 +12,7 @@ import (
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 
+	"github.com/observer-ai/engine/internal/fault"
 	"github.com/observer-ai/engine/internal/trace"
 )
 
@@ -108,19 +109,19 @@ func (q *Queue) PublishSpans(ctx context.Context, byTrace map[string][]byte) err
 	ctx, cancel := context.WithTimeout(ctx, publishTimeout)
 	defer cancel()
 
-	maxPayload := int(q.nc.MaxPayload())
+	maxPayload := q.conn.MaxPayload()
 	var stored []string
 	var acks []jetstream.PubAckFuture
 	for traceID, data := range byTrace {
 		if maxPayload > 0 && len(data) > maxPayload {
 			// Retrying cannot help, so do not make the exporter retry.
-			q.logger.Error("span batch exceeds the NATS payload limit and was dropped",
-				"trace_id", traceID, "bytes", len(data), "max_payload", maxPayload)
+			q.report(fault.Invalid(fault.Queue, "store spans", fault.Msg("span batch exceeds the NATS payload limit and was dropped")).
+				AsSevere().WithTrace(traceID).With("bytes", len(data)).With("max_payload", maxPayload))
 			continue
 		}
 		ack, err := q.js.PublishMsgAsync(&nats.Msg{Subject: sc.Subject + "." + traceID, Data: data})
 		if err != nil {
-			return fmt.Errorf("%w: %v", ErrUnavailable, err)
+			return fault.Unavailable(fault.Queue, "store spans", err)
 		}
 		stored = append(stored, traceID)
 		acks = append(acks, ack)
@@ -135,7 +136,7 @@ func (q *Queue) PublishSpans(ctx context.Context, byTrace map[string][]byte) err
 	for _, traceID := range stored {
 		ack, err := q.js.PublishMsgAsync(&nats.Msg{Subject: sc.PendingSubject + "." + traceID})
 		if err != nil {
-			return fmt.Errorf("%w: %v", ErrUnavailable, err)
+			return fault.Unavailable(fault.Queue, "store spans", err)
 		}
 		acks = append(acks, ack)
 	}
@@ -152,9 +153,9 @@ func waitAcks(ctx context.Context, acks []jetstream.PubAckFuture, markers bool) 
 			if markers && isMarkerPresent(err) {
 				continue
 			}
-			return fmt.Errorf("%w: %v", ErrUnavailable, err)
+			return fault.Unavailable(fault.Queue, "store spans", err)
 		case <-ctx.Done():
-			return fmt.Errorf("%w: %v", ErrUnavailable, ctx.Err())
+			return fault.Timeout(fault.Queue, "store spans", ctx.Err())
 		}
 	}
 	return nil
@@ -183,7 +184,7 @@ type Assemblers struct {
 // StartAssemblers starts n assemblers. Each takes a pending-trace marker,
 // waits until the trace has been quiet for IdleTimeout (or MaxWait has
 // passed), assembles its spans and publishes the trace to the work queue.
-func (q *Queue) StartAssemblers(n int, assemble AssembleFunc) *Assemblers {
+func (q *Queue) StartAssemblers(n int, assemble AssembleFunc) Stopper {
 	a := &Assemblers{q: q, assemble: assemble, stop: make(chan struct{})}
 	for range n {
 		a.wg.Add(1)
@@ -229,7 +230,7 @@ func (a *Assemblers) run() {
 				continue
 			}
 			if !a.stopping() {
-				a.q.logger.Warn("assembler pull failed", "error", err.Error())
+				a.q.report(fault.Unavailable(fault.Queue, "pull pending trace", err))
 				select {
 				case <-a.stop:
 				case <-time.After(pullErrorPause):
@@ -244,13 +245,16 @@ func (a *Assemblers) run() {
 func (a *Assemblers) handle(marker jetstream.Msg) {
 	q, sc, logger := a.q, a.q.cfg.Spans, a.q.logger
 	traceID := marker.Subject()[strings.LastIndexByte(marker.Subject(), '.')+1:]
+	report := func(op fault.Op, err error) {
+		q.report(fault.Unavailable(fault.Queue, op, err).WithTrace(traceID))
+	}
 	spanSubject := sc.Subject + "." + traceID
 	ctx, cancel := context.WithTimeout(context.Background(), assemblerOpTimeout)
 	defer cancel()
 
 	retry := func(delay time.Duration) {
 		if err := marker.NakWithDelay(delay); err != nil {
-			logger.Error("assembler nak failed", "trace_id", traceID, "error", err.Error())
+			report("reschedule assembly", err)
 		}
 	}
 
@@ -261,7 +265,7 @@ func (a *Assemblers) handle(marker jetstream.Msg) {
 		return
 	}
 	if err != nil {
-		logger.Warn("assembler could not read spans", "trace_id", traceID, "error", err.Error())
+		report("read spans", err)
 		retry(assemblerRetryDelay)
 		return
 	}
@@ -281,7 +285,7 @@ func (a *Assemblers) handle(marker jetstream.Msg) {
 
 	batches, err := a.readSpans(ctx, spanSubject, last.Sequence)
 	if err != nil {
-		logger.Warn("assembler could not read spans", "trace_id", traceID, "error", err.Error())
+		report("read spans", err)
 		retry(assemblerRetryDelay)
 		return
 	}
@@ -291,7 +295,7 @@ func (a *Assemblers) handle(marker jetstream.Msg) {
 		logger.Info("spans discarded", "trace_id", traceID, "batches", len(batches), "reason", err.Error())
 	} else if err := a.publish(ctx, t, last.Sequence); err != nil {
 		// The spans stay put; the marker brings us back.
-		logger.Warn("assembled trace could not be queued, will retry", "trace_id", traceID, "error", err.Error())
+		report("queue assembled trace, will retry", err)
 		retry(assemblerRetryDelay)
 		return
 	} else {
@@ -301,7 +305,7 @@ func (a *Assemblers) handle(marker jetstream.Msg) {
 
 	// Remove exactly the spans that were read; later arrivals stay.
 	if err := q.spans.Purge(ctx, jetstream.WithPurgeSubject(spanSubject), jetstream.WithPurgeSequence(last.Sequence+1)); err != nil {
-		logger.Warn("assembler could not purge spans", "trace_id", traceID, "error", err.Error())
+		report("purge spans", err)
 		retry(assemblerRetryDelay)
 		return
 	}
@@ -311,7 +315,7 @@ func (a *Assemblers) handle(marker jetstream.Msg) {
 	// and could not leave its own. Leave one for it now.
 	if _, err := q.spans.GetLastMsgForSubject(ctx, spanSubject); err == nil {
 		if _, err := q.js.Publish(ctx, sc.PendingSubject+"."+traceID, nil); err != nil && !isMarkerPresent(err) {
-			logger.Warn("assembler could not re-mark trace", "trace_id", traceID, "error", err.Error())
+			report("re-mark trace", err)
 		}
 	}
 }
@@ -343,11 +347,11 @@ func (a *Assemblers) publish(ctx context.Context, t trace.Trace, lastSeq uint64)
 	if err != nil {
 		return err
 	}
-	if limit := int(a.q.nc.MaxPayload()); limit > 0 && len(data) > limit && len(t.OTLP) > 0 {
+	if limit := a.q.conn.MaxPayload(); limit > 0 && len(data) > limit && len(t.OTLP) > 0 {
 		// Too big to queue with its spans. Score it anyway; if kept it is
 		// exported as rebuilt spans instead of the originals.
-		a.q.logger.Warn("trace exceeds the NATS payload limit, queued without its original spans",
-			"trace_id", t.TraceID, "bytes", len(data), "max_payload", limit)
+		a.q.report(fault.Invalid(fault.Queue, "queue assembled trace", fault.Msg("trace exceeds the NATS payload limit, queued without its original spans")).
+			WithTrace(t.TraceID).With("bytes", len(data)).With("max_payload", limit))
 		t.OTLP = nil
 		if data, err = json.Marshal(t); err != nil {
 			return err
@@ -360,6 +364,6 @@ func (a *Assemblers) ack(marker jetstream.Msg, traceID string) {
 	ctx, cancel := context.WithTimeout(context.Background(), ackTimeout)
 	defer cancel()
 	if err := marker.DoubleAck(ctx); err != nil {
-		a.q.logger.Error("assembler ack failed", "trace_id", traceID, "error", err.Error())
+		a.q.report(fault.Unavailable(fault.Queue, "ack pending marker", err).AsSevere().WithTrace(traceID))
 	}
 }

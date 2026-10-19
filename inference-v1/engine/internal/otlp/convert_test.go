@@ -130,7 +130,7 @@ func TestAssembleADKShapedTrace(t *testing.T) {
 		"TOOL CALLS:\n1. search({'query': 'capital of France river'}) -> ok\n2. lookup({'title': 'Paris'}) -> ok\n\n" +
 		"EVIDENCE:\n[1] [Paris] Paris is the capital of France.\n[2] [Seine] The Seine flows through Paris.\n\n" +
 		"FINAL ANSWER:\nSeine"
-	if state := trace.BuildState(got); state != want {
+	if state := string(trace.BuildState(got)); state != want {
 		t.Errorf("state =\n%s\nwant\n%s", state, want)
 	}
 	if err := got.Validate(); err != nil {
@@ -166,7 +166,7 @@ func TestAssembleWithOverridesMatchesGolden(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Assemble: %v", err)
 			}
-			if state := trace.BuildState(got); state != string(golden) {
+			if state := string(trace.BuildState(got)); state != string(golden) {
 				t.Errorf("state via OTLP differs from the golden slice\n got %q\nwant %q", state, golden)
 			}
 		})
@@ -240,7 +240,7 @@ func TestAssembleToolCallDetails(t *testing.T) {
 		"4. fetch({'url': 'u'}) -> ok\n" +
 		"5. now('') -> ok\n\n" +
 		"EVIDENCE:\n(none)\n\nFINAL ANSWER:\na"
-	if state := trace.BuildState(got); state != want {
+	if state := string(trace.BuildState(got)); state != want {
 		t.Errorf("state =\n%s\nwant\n%s", state, want)
 	}
 }
@@ -420,10 +420,13 @@ func TestAnnotate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	rs, err := Annotate(assembled.OTLP, "observer-ai", []*commonpb.KeyValue{
-		StringAttr("eval.decision", "keep"),
-		FloatAttr("eval.p_keep", 0.91),
-		StringAttr("observer.stop_reason", "overwritten"),
+	rs, err := Annotate(assembled.OTLP, Annotation{
+		Resource: []*commonpb.KeyValue{StringAttr(attrProjectName, "observer-ai")},
+		Root: []*commonpb.KeyValue{
+			StringAttr("eval.decision", "keep"),
+			FloatAttr("eval.p_keep", 0.91),
+			StringAttr("observer.stop_reason", "overwritten"),
+		},
 	})
 	if err != nil {
 		t.Fatal(err)

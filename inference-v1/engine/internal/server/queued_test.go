@@ -13,6 +13,8 @@ import (
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 
+	"github.com/observer-ai/engine/internal/fault"
+	"github.com/observer-ai/engine/internal/pipeline"
 	"github.com/observer-ai/engine/internal/queue"
 	"github.com/observer-ai/engine/internal/queue/queuetest"
 	"github.com/observer-ai/engine/internal/scorer"
@@ -22,14 +24,15 @@ import (
 func TestProcessQueued(t *testing.T) {
 	tr := trace.Trace{TraceID: "t1", Question: "q", FinalAnswer: "a"}
 	failWith := func(err error) *fakeScorer {
-		return &fakeScorer{score: func(context.Context, string) (scorer.Result, error) {
-			return scorer.Result{Attempts: 4}, err
+		return &fakeScorer{score: func(context.Context, trace.State) (pipeline.Score, error) {
+			return pipeline.Score{Attempts: 4}, err
 		}}
 	}
 
 	t.Run("scored", func(t *testing.T) {
 		h := newHarness(t, harnessOpts{scorer: &fakeScorer{score: fixedScore(0.9)}})
-		res, err := h.engine.ProcessQueued(context.Background(), tr)
+		out, err := h.engine.ProcessQueued(context.Background(), tr)
+		res := resultOf(out)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -41,10 +44,10 @@ func TestProcessQueued(t *testing.T) {
 	// System errors come back as errors: no decision, no export, no
 	// "decision" log line. The queue decides what happens next.
 	systemErrors := map[string]error{
-		"503":                &scorer.StatusError{Code: 503, Body: "model loading"},
-		"connection refused": errors.New("dial tcp 127.0.0.1:8010: connect: connection refused"),
-		"timeout":            context.DeadlineExceeded,
-		"404":                &scorer.StatusError{Code: 404},
+		"503":                fault.Unavailable(fault.Scorer, "score trace", &scorer.StatusError{Code: 503, Body: "model loading"}),
+		"connection refused": fault.Unavailable(fault.Scorer, "score trace", errors.New("dial tcp 127.0.0.1:8010: connect: connection refused")),
+		"timeout":            fault.Timeout(fault.Scorer, "score trace", context.DeadlineExceeded),
+		"404":                fault.Unavailable(fault.Scorer, "score trace", &scorer.StatusError{Code: 404}),
 	}
 	for name, scoreErr := range systemErrors {
 		t.Run("system error "+name, func(t *testing.T) {
@@ -54,12 +57,12 @@ func TestProcessQueued(t *testing.T) {
 				rand:   func() float64 { return 0 }, // a fallback would keep
 				logger: jsonLogger(&logs),
 			})
-			res, err := h.engine.ProcessQueued(context.Background(), tr)
+			out, err := h.engine.ProcessQueued(context.Background(), tr)
 			if !errors.Is(err, scoreErr) {
 				t.Fatalf("error = %v, want the scorer's error", err)
 			}
-			if res != (Result{}) {
-				t.Errorf("result = %+v, want none", res)
+			if out.Record.Trace.TraceID != "" || out.Exported || out.Record.Decision != (pipeline.Decision{}) {
+				t.Errorf("outcome = %+v, want none", out)
 			}
 			if n := len(h.recorder.Started()); n != 0 {
 				t.Errorf("%d spans exported for an undecided trace", n)
@@ -74,10 +77,11 @@ func TestProcessQueued(t *testing.T) {
 	// cannot help, so the trace gets the fallback decision as before.
 	t.Run("rejected by kev", func(t *testing.T) {
 		h := newHarness(t, harnessOpts{
-			scorer: failWith(&scorer.StatusError{Code: 422, Body: "state too long"}),
+			scorer: failWith(fault.Rejected(fault.Scorer, "score trace", &scorer.StatusError{Code: 422, Body: "state too long"})),
 			rand:   func() float64 { return 0 },
 		})
-		res, err := h.engine.ProcessQueued(context.Background(), tr)
+		out, err := h.engine.ProcessQueued(context.Background(), tr)
+		res := resultOf(out)
 		if err != nil {
 			t.Fatalf("error = %v, want a fallback decision", err)
 		}
@@ -89,22 +93,22 @@ func TestProcessQueued(t *testing.T) {
 	// The sync path still always decides, system error or not.
 	t.Run("sync path falls back on system errors", func(t *testing.T) {
 		h := newHarness(t, harnessOpts{scorer: failWith(systemErrors["503"])})
-		if res := h.engine.Process(context.Background(), tr); res.Decision != "drop" || res.Reason != "fallback" {
+		if res := resultOf(h.engine.Process(context.Background(), tr)); res.Decision != "drop" || res.Reason != "fallback" {
 			t.Errorf("result = %+v", res)
 		}
 	})
 }
 
-// pipeline wires the real pieces together the way main does: HTTP handler,
+// system wires the real pieces together the way main does: HTTP handler,
 // JetStream queue on an in-process NATS server, worker pool, Kev client
 // against a fake Kev, and the exporter into a span recorder.
-type pipeline struct {
+type system struct {
 	*harness
 	js  jetstream.JetStream
 	cfg queue.Config
 }
 
-func newPipeline(t *testing.T, kev *fakeKev, maxDeliver int) *pipeline {
+func newSystem(t *testing.T, kev *fakeKev, maxDeliver int) *system {
 	t.Helper()
 	srv := queuetest.StartServer(t)
 	cfg := queue.Config{
@@ -149,10 +153,10 @@ func newPipeline(t *testing.T, kev *fakeKev, maxDeliver int) *pipeline {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return &pipeline{harness: h, js: js, cfg: cfg}
+	return &system{harness: h, js: js, cfg: cfg}
 }
 
-func (p *pipeline) messages(t *testing.T, stream string) uint64 {
+func (p *system) messages(t *testing.T, stream string) uint64 {
 	t.Helper()
 	s, err := p.js.Stream(context.Background(), stream)
 	if err != nil {
@@ -185,7 +189,7 @@ func TestQueuedPipelineKeepAndDrop(t *testing.T) {
 		}
 		w.Write(readFile(t, "kev", "success_low.json")) // 0.12: drop
 	})
-	p := newPipeline(t, kev, 3)
+	p := newSystem(t, kev, 3)
 
 	for _, name := range []string{"wrong_river.json", "correct_river.json"} {
 		if w := p.do("POST", "/v1/traces", string(readFile(t, "traces", name))); w.Code != http.StatusAccepted {
@@ -202,7 +206,7 @@ func TestQueuedPipelineKeepAndDrop(t *testing.T) {
 	if a["observer.source_trace_id"].AsString() != "wrong-river-001" || a["eval.reason"].AsString() != "kev" {
 		t.Errorf("exported root span = %v", a)
 	}
-	if a["eval.p_keep"].AsFloat64() != scorer.Calibrate(0.93, 0.86) {
+	if a["eval.p_keep"].AsFloat64() != float64(pipeline.Calibrate(0.93, 0.86)) {
 		t.Errorf("eval.p_keep = %v", a["eval.p_keep"].Emit())
 	}
 
@@ -228,7 +232,7 @@ func TestQueuedPipelineDeadLettersWhenKevStaysDown(t *testing.T) {
 	kev := newFakeKev(t, func(w http.ResponseWriter, _ string) {
 		http.Error(w, "model not available", http.StatusServiceUnavailable)
 	})
-	p := newPipeline(t, kev, 3)
+	p := newSystem(t, kev, 3)
 
 	body := string(readFile(t, "traces", "wrong_river.json"))
 	if w := p.do("POST", "/v1/traces", body); w.Code != http.StatusAccepted {
@@ -268,7 +272,7 @@ func TestQueuedPipelineDeadLettersWhenKevStaysDown(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dead letter body: %v", err)
 	}
-	if got, want := trace.BuildState(replay), string(readFile(t, "golden", "wrong_river.txt")); got != want {
+	if got, want := string(trace.BuildState(replay)), string(readFile(t, "golden", "wrong_river.txt")); got != want {
 		t.Errorf("replayed dead letter builds a different slice:\n%q\nwant\n%q", got, want)
 	}
 }
@@ -289,7 +293,7 @@ func TestQueuedPipelineRecoversWhenKevComesBack(t *testing.T) {
 		}
 		w.Write(readFile(t, "kev", "success.json"))
 	})
-	p := newPipeline(t, kev, 3)
+	p := newSystem(t, kev, 3)
 
 	if w := p.do("POST", "/v1/traces", `{"trace_id": "t1", "question": "q", "final_answer": "a"}`); w.Code != http.StatusAccepted {
 		t.Fatalf("status = %d, want 202", w.Code)
@@ -313,7 +317,7 @@ func TestQueuedPipelineFallsBackOnKevRejection(t *testing.T) {
 		w.WriteHeader(http.StatusUnprocessableEntity)
 		w.Write(readFile(t, "kev", "error_422.json"))
 	})
-	p := newPipeline(t, kev, 3)
+	p := newSystem(t, kev, 3)
 
 	if w := p.do("POST", "/v1/traces", `{"trace_id": "t1", "question": "q", "final_answer": "a"}`); w.Code != http.StatusAccepted {
 		t.Fatalf("status = %d, want 202", w.Code)

@@ -48,11 +48,9 @@ func (c *Compiler) Compile() (*Config, error) {
 	if c.getenv != nil {
 		applyEnv(&cfg, c.getenv)
 	}
-	if cfg.Scorer.Kind == ScorerJev && cfg.Scorer.APIKeyEnv == "" {
-		cfg.Scorer.APIKeyEnv = DefaultJevAPIKeyEnv
-	}
-	if cfg.Scorer.APIKeyEnv != "" && c.getenv != nil {
-		cfg.Scorer.APIKey = c.getenv(cfg.Scorer.APIKeyEnv)
+	c.resolveAPIKey(&cfg)
+	if err := c.resolveExportHeaders(&cfg); err != nil {
+		return nil, fmt.Errorf("config %s: %w", c.factory.Describe(), err)
 	}
 
 	if err := cfg.validate(); err != nil {
@@ -70,16 +68,66 @@ func (c *Compiler) Compile() (*Config, error) {
 // applyEnv replaces the keys that differ between a laptop and a container
 // with their OBSERVER_* variables, when set.
 func applyEnv(cfg *Config, getenv func(string) string) {
-	for env, field := range map[string]*string{
-		EnvScorerEndpoint:  &cfg.Scorer.Endpoint,
-		EnvPhoenixEndpoint: &cfg.Export.PhoenixEndpoint,
-		EnvNATSURL:         &cfg.Queue.URL,
-		EnvManifest:        &cfg.Scorer.Manifest,
-		EnvOTLPGRPCAddr:    &cfg.OTLP.GRPCAddr,
-		EnvOTLPHTTPAddr:    &cfg.OTLP.HTTPAddr,
-	} {
+	fields := map[string]*string{
+		EnvScorerEndpoint: &cfg.Scorer.Endpoint,
+		EnvNATSURL:        &cfg.Queue.URL,
+		EnvManifest:       &cfg.Scorer.Manifest,
+		EnvOTLPGRPCAddr:   &cfg.OTLP.GRPCAddr,
+		EnvOTLPHTTPAddr:   &cfg.OTLP.HTTPAddr,
+	}
+	if len(cfg.Exporters) > 0 {
+		fields[EnvExportEndpoint] = &cfg.Exporters[0].Endpoint
+	}
+	for env, field := range fields {
 		if v := getenv(env); v != "" {
 			*field = v
 		}
 	}
+}
+
+// resolveAPIKey reads the scorer's API key from the variable it names
+// (JEV_API_KEY by default for Jev).
+func (c *Compiler) resolveAPIKey(cfg *Config) {
+	if cfg.Scorer.Kind == ScorerJev && cfg.Scorer.APIKeyEnv == "" {
+		cfg.Scorer.APIKeyEnv = DefaultJevAPIKeyEnv
+	}
+	if cfg.Scorer.APIKeyEnv != "" && c.getenv != nil {
+		cfg.Scorer.APIKey = c.getenv(cfg.Scorer.APIKeyEnv)
+	}
+}
+
+// resolveExportHeaders gives every exporter its final headers: the ones
+// written in the file, plus those in the variable headers_env names.
+func (c *Compiler) resolveExportHeaders(cfg *Config) error {
+	for i := range cfg.Exporters {
+		e := &cfg.Exporters[i]
+		resolved, err := c.exportHeaders(*e)
+		if err != nil {
+			return fmt.Errorf("exporters[%d] (%s): %w", i, e.Name, err)
+		}
+		e.ResolvedHeaders = resolved
+	}
+	return nil
+}
+
+func (c *Compiler) exportHeaders(e Exporter) (map[string]string, error) {
+	out := make(map[string]string, len(e.Headers))
+	for k, v := range e.Headers {
+		out[k] = v
+	}
+	if e.HeadersEnv == "" || c.getenv == nil {
+		return out, nil
+	}
+	raw := c.getenv(e.HeadersEnv)
+	if raw == "" {
+		return nil, fmt.Errorf("headers_env: $%s is not set", e.HeadersEnv)
+	}
+	fromEnv, err := parseHeaders(raw)
+	if err != nil {
+		return nil, fmt.Errorf("headers_env: $%s: %w", e.HeadersEnv, err)
+	}
+	for k, v := range fromEnv {
+		out[k] = v
+	}
+	return out, nil
 }

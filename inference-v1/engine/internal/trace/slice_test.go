@@ -46,7 +46,7 @@ func TestBuildStateGolden(t *testing.T) {
 			if err != nil {
 				t.Fatalf("%v; run `make golden`", err)
 			}
-			if got := BuildState(tr); got != string(want) {
+			if got := string(BuildState(tr)); got != string(want) {
 				t.Errorf("BuildState differs from Python at byte %d\n--- got\n%s\n--- want\n%s",
 					firstDiff(got, string(want)), got, want)
 			}
@@ -84,7 +84,7 @@ func TestBuildStateFuzzGolden(t *testing.T) {
 		if err != nil {
 			t.Fatalf("line %d: decode: %v", n, err)
 		}
-		if got := BuildState(tr); got != row.State {
+		if got := string(BuildState(tr)); got != row.State {
 			failed++
 			if failed <= 5 {
 				d := firstDiff(got, row.State)

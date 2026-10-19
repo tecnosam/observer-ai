@@ -16,12 +16,13 @@ test:
 	go vet ./...
 	go test -race ./...
 
-# Needs NATS on localhost:4222 (`make nats`) and Phoenix on localhost:6006
-# (`make phoenix`), plus Kev.
+# Queues in memory by default. For NATS: `make nats` and
+# OBSERVER_NATS_URL=nats://localhost:4222 make run. Needs Phoenix on
+# localhost:6006 (`make phoenix`) and Kev.
 run: build
 	$(BIN) -config $(CONFIG)
 
-# Start only NATS JetStream, for running the engine on the host with `make run`.
+# Start only NATS JetStream, for `OBSERVER_NATS_URL=nats://localhost:4222 make run`.
 nats:
 	docker compose up -d nats
 

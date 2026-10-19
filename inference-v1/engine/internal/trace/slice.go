@@ -12,10 +12,13 @@ const (
 	MaxEvidenceChars = 1500
 )
 
+// State is the text of a trace the decision model reads.
+type State string
+
 // BuildState renders the trace into the state string the decision model was
 // trained on. It must stay byte-for-byte identical to the Python build_state
 // (see testdata/gen_golden.py); the golden tests enforce that.
-func BuildState(t Trace) string {
+func BuildState(t Trace) State {
 	var b strings.Builder
 
 	b.WriteString("USER QUESTION:\n")
@@ -58,7 +61,7 @@ func BuildState(t Trace) string {
 
 	b.WriteString("\n\nFINAL ANSWER:\n")
 	b.WriteString(t.FinalAnswer)
-	return b.String()
+	return State(b.String())
 }
 
 // argsRepr is the Python repr of the args, or of the empty string when the

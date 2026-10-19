@@ -5,19 +5,20 @@ import (
 	"encoding/hex"
 	"errors"
 	"io"
-	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	coltracepb "go.opentelemetry.io/proto/otlp/collector/trace/v1"
 	commonpb "go.opentelemetry.io/proto/otlp/common/v1"
 	tracepb "go.opentelemetry.io/proto/otlp/trace/v1"
 	"google.golang.org/protobuf/proto"
 
+	"github.com/observer-ai/engine/internal/fault"
 	"github.com/observer-ai/engine/internal/otlp"
-	"github.com/observer-ai/engine/internal/policy"
+	"github.com/observer-ai/engine/internal/pipeline"
 	"github.com/observer-ai/engine/internal/trace"
 )
 
@@ -62,16 +63,15 @@ func attrsOf(kvs []*commonpb.KeyValue) map[string]*commonpb.AnyValue {
 	return m
 }
 
-var keepHigh = policy.Decision{Keep: true, Scored: true, PKeep: 0.95, PKeepRaw: 0.93, Reason: policy.ReasonKev, Severity: policy.SeverityHigh}
+var keepHigh = pipeline.Decision{Keep: true, Scored: true, PKeep: 0.95, PKeepRaw: 0.93, Reason: pipeline.ReasonModel, Severity: pipeline.SeverityHigh}
 
 func TestForwardKeptOTLPTrace(t *testing.T) {
 	up := &fakeUploader{}
 	exp, rec := newRecorded(t)
-	WithForwarder(up, "observer-ai")(exp)
+	WithForwarder(up, map[string]string{"openinference.project.name": "observer-ai"})(exp)
 
-	ok := exp.Export(context.Background(), Record{Trace: otlpTrace(t), Decision: keepHigh, Model: "kev-latest", LatencyMS: 93})
-	if !ok {
-		t.Fatal("Export returned false")
+	if err := exp.Send(context.Background(), pipeline.Record{Trace: otlpTrace(t), Decision: keepHigh, Model: "kev-latest", Latency: 93 * time.Millisecond}); err != nil {
+		t.Fatal(err)
 	}
 	// The original spans are forwarded; nothing is rebuilt.
 	if n := len(rec.Started()); n != 0 {
@@ -131,22 +131,14 @@ func TestForwardKeptOTLPTrace(t *testing.T) {
 	}
 }
 
-func TestForwardSkipsDroppedAndOmitsProbabilitiesOnFallback(t *testing.T) {
+func TestForwardOmitsProbabilitiesOnFallback(t *testing.T) {
 	up := &fakeUploader{}
 	exp, _ := newRecorded(t)
-	WithForwarder(up, "observer-ai")(exp)
+	WithForwarder(up, map[string]string{"openinference.project.name": "observer-ai"})(exp)
 
-	drop := policy.Decision{Scored: true, PKeep: 0.1, PKeepRaw: 0.1, Reason: policy.ReasonBelowThreshold, Severity: policy.SeverityNone}
-	if exp.Export(context.Background(), Record{Trace: otlpTrace(t), Decision: drop}) {
-		t.Error("Export returned true for a dropped trace")
-	}
-	if len(up.uploads) != 0 {
-		t.Fatal("a dropped trace was forwarded")
-	}
-
-	fallback := policy.Decision{Keep: true, Reason: policy.ReasonFallback, Severity: policy.SeverityNormal}
-	if !exp.Export(context.Background(), Record{Trace: otlpTrace(t), Decision: fallback, Model: "kev-latest"}) {
-		t.Fatal("Export returned false for a fallback keep")
+	fallback := pipeline.Decision{Keep: true, Reason: pipeline.ReasonFallback, Severity: pipeline.SeverityNormal}
+	if err := exp.Send(context.Background(), pipeline.Record{Trace: otlpTrace(t), Decision: fallback, Model: "kev-latest"}); err != nil {
+		t.Fatal(err)
 	}
 	for _, rs := range up.uploads[0] {
 		for _, ss := range rs.ScopeSpans {
@@ -160,42 +152,38 @@ func TestForwardSkipsDroppedAndOmitsProbabilitiesOnFallback(t *testing.T) {
 	}
 }
 
-func TestForwardFailureIsReportedAndLogged(t *testing.T) {
-	var logs strings.Builder
-	up := &fakeUploader{err: errors.New("phoenix unreachable")}
+func TestForwardFailureIsReturned(t *testing.T) {
+	up := &fakeUploader{err: errors.New("backend unreachable")}
 	exp, _ := newRecorded(t)
-	WithForwarder(up, "observer-ai")(exp)
-	WithLogger(slog.New(slog.NewTextHandler(&logs, nil)))(exp)
+	WithForwarder(up, nil)(exp)
 
-	if exp.Export(context.Background(), Record{Trace: otlpTrace(t), Decision: keepHigh}) {
-		t.Error("Export returned true although the upload failed")
-	}
-	if !strings.Contains(logs.String(), "trace export failed") || !strings.Contains(logs.String(), "phoenix unreachable") {
-		t.Errorf("failure not logged: %s", logs.String())
+	err := exp.Send(context.Background(), pipeline.Record{Trace: otlpTrace(t), Decision: keepHigh})
+	if fault.KindOf(err) != fault.KindUnavailable || !strings.Contains(err.Error(), "backend unreachable") {
+		t.Errorf("error = %v, want an unavailable fault", err)
 	}
 
-	// Corrupt stored spans fail the same way rather than panicking.
+	// Corrupt stored spans fail rather than panicking.
 	bad := otlpTrace(t)
 	bad.OTLP = []byte{0xff, 0xff}
 	up.err = nil
-	if exp.Export(context.Background(), Record{Trace: bad, Decision: keepHigh}) {
-		t.Error("Export returned true for corrupt stored spans")
+	if err := exp.Send(context.Background(), pipeline.Record{Trace: bad, Decision: keepHigh}); fault.KindOf(err) != fault.KindInvalid {
+		t.Errorf("error = %v for corrupt stored spans, want an invalid fault", err)
 	}
 }
 
 // Without a forwarder (or without original spans) the trace is rebuilt.
 func TestOTLPTraceIsRebuiltWithoutForwarder(t *testing.T) {
 	exp, rec := newRecorded(t)
-	if !exp.Export(context.Background(), Record{Trace: otlpTrace(t), Decision: keepHigh}) {
-		t.Fatal("Export returned false")
+	if err := exp.Send(context.Background(), pipeline.Record{Trace: otlpTrace(t), Decision: keepHigh}); err != nil {
+		t.Fatal(err)
 	}
 	if n := len(rec.Ended()); n != 4 {
 		t.Errorf("%d spans rebuilt, want 4", n)
 	}
 }
 
-// The real exporter posts forwarded spans to the Phoenix endpoint as OTLP.
-func TestPhoenixReceivesForwardedSpans(t *testing.T) {
+// The real exporter posts forwarded spans to the back end as OTLP.
+func TestBackendReceivesForwardedSpans(t *testing.T) {
 	var got coltracepb.ExportTraceServiceRequest
 	var path string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -208,16 +196,16 @@ func TestPhoenixReceivesForwardedSpans(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	exp, err := NewPhoenix(context.Background(), srv.URL+"/v1/traces", "observer-ai", slog.Default())
+	exp, err := NewOTLPBackend(context.Background(), BackendConfig{Name: "phoenix", Endpoint: srv.URL + "/v1/traces"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer exp.Shutdown(context.Background())
 
-	if !exp.Export(context.Background(), Record{Trace: otlpTrace(t), Decision: keepHigh, Model: "kev-latest"}) {
-		t.Fatal("Export returned false")
+	if err := exp.Send(context.Background(), pipeline.Record{Trace: otlpTrace(t), Decision: keepHigh, Model: "kev-latest"}); err != nil {
+		t.Fatal(err)
 	}
-	// Forwarding is synchronous: Phoenix has the spans before Export returns.
+	// Forwarding is synchronous: the back end has the spans before Send returns.
 	if path != "/v1/traces" {
 		t.Errorf("path = %q", path)
 	}
@@ -228,6 +216,6 @@ func TestPhoenixReceivesForwardedSpans(t *testing.T) {
 		}
 	}
 	if n != 4 {
-		t.Errorf("Phoenix received %d spans, want 4", n)
+		t.Errorf("the back end received %d spans, want 4", n)
 	}
 }

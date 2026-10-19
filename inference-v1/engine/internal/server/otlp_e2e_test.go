@@ -23,9 +23,9 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	"github.com/observer-ai/engine/internal/otlp"
+	"github.com/observer-ai/engine/internal/pipeline"
 	"github.com/observer-ai/engine/internal/queue"
 	"github.com/observer-ai/engine/internal/queue/queuetest"
-	"github.com/observer-ai/engine/internal/scorer"
 	"github.com/observer-ai/engine/internal/trace"
 )
 
@@ -81,6 +81,20 @@ func newOTLPPipeline(t *testing.T, kev *fakeKev) *otlpPipeline {
 	}
 	t.Cleanup(q.Close)
 
+	nc, err := nats.Connect(srv.ClientURL())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(nc.Close)
+	js, _ := jetstream.New(nc)
+	p := newOTLPPipelineOn(t, kev, q)
+	p.js = js
+	return p
+}
+
+// newOTLPPipelineOn wires the OTLP path on any broker.
+func newOTLPPipelineOn(t *testing.T, kev *fakeKev, q queue.AbstractBroker) *otlpPipeline {
+	t.Helper()
 	phoenix := &capture{}
 	h := newHarness(t, harnessOpts{scorer: kev.client(t, 0), queue: q, temp: 0.86, uploader: phoenix})
 
@@ -93,7 +107,7 @@ func newOTLPPipeline(t *testing.T, kev *fakeKev) *otlpPipeline {
 		return lis.Addr().String()
 	}
 	grpcAddr, httpAddr := free(), free()
-	receiver := otlp.NewReceiver(q, quiet)
+	receiver := otlp.NewReceiver(otlp.ReceiverConfig{Sink: q})
 	if err := receiver.Start(grpcAddr, httpAddr); err != nil {
 		t.Fatal(err)
 	}
@@ -110,13 +124,7 @@ func newOTLPPipeline(t *testing.T, kev *fakeKev) *otlpPipeline {
 		workers.Stop(ctx)
 	})
 
-	nc, err := nats.Connect(srv.ClientURL())
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(nc.Close)
-	js, _ := jetstream.New(nc)
-	return &otlpPipeline{harness: h, js: js, phoenix: phoenix, grpcAddr: grpcAddr, httpAddr: httpAddr}
+	return &otlpPipeline{harness: h, phoenix: phoenix, grpcAddr: grpcAddr, httpAddr: httpAddr}
 }
 
 func (p *otlpPipeline) messages(t *testing.T, stream string) uint64 {
@@ -258,7 +266,7 @@ func TestOTLPPipelineKeepForwardsOriginalSpans(t *testing.T) {
 		attrs["eval.severity"].GetStringValue() != "high" {
 		t.Errorf("eval attributes on the root = %v", attrs)
 	}
-	if got := attrs["eval.p_keep"].GetDoubleValue(); got != scorer.Calibrate(0.93, 0.86) {
+	if got := attrs["eval.p_keep"].GetDoubleValue(); got != float64(pipeline.Calibrate(0.93, 0.86)) {
 		t.Errorf("eval.p_keep = %v", got)
 	}
 	// Nothing was rebuilt through the SDK exporter.
@@ -322,7 +330,7 @@ func TestOTLPPipelineDeadLetterKeepsSpans(t *testing.T) {
 	if err := proto.Unmarshal(replay.OTLP, &td); err != nil {
 		t.Fatalf("dead letter spans do not decode: %v", err)
 	}
-	if got, want := trace.BuildState(replay), string(readFile(t, "golden", "wrong_river.txt")); got != want {
+	if got, want := string(trace.BuildState(replay)), string(readFile(t, "golden", "wrong_river.txt")); got != want {
 		t.Errorf("replayed dead letter builds a different slice")
 	}
 }

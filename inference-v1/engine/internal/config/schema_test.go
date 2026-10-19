@@ -4,6 +4,7 @@ import (
 	"os"
 	"reflect"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -21,9 +22,7 @@ func TestSchemaMatchesConfig(t *testing.T) {
 		t.Fatal(err)
 	}
 	var schema struct {
-		Properties map[string]struct {
-			Properties map[string]map[string]any `yaml:"properties"`
-		} `yaml:"properties"`
+		Properties map[string]schemaSection `yaml:"properties"`
 	}
 	if err := yaml.Unmarshal(raw, &schema); err != nil {
 		t.Fatal(err)
@@ -37,6 +36,10 @@ func TestSchemaMatchesConfig(t *testing.T) {
 			continue
 		}
 		sections = append(sections, section)
+		if defaults.Field(i).Kind() == reflect.Slice {
+			envs = append(envs, checkListSection(t, section, schema.Properties[section], defaults.Field(i))...)
+			continue
+		}
 		props := schema.Properties[section].Properties
 		if props == nil {
 			t.Errorf("section %q is missing from the schema", section)
@@ -83,11 +86,55 @@ func TestSchemaMatchesConfig(t *testing.T) {
 		}
 	}
 
-	wantEnvs := []string{EnvManifest, EnvNATSURL, EnvOTLPGRPCAddr, EnvOTLPHTTPAddr, EnvPhoenixEndpoint, EnvScorerEndpoint}
+	wantEnvs := []string{EnvExportEndpoint, EnvManifest, EnvNATSURL, EnvOTLPGRPCAddr, EnvOTLPHTTPAddr, EnvScorerEndpoint}
 	sort.Strings(envs)
 	if !reflect.DeepEqual(envs, wantEnvs) {
 		t.Errorf("x-env in the schema = %v, want %v", envs, wantEnvs)
 	}
+}
+
+type schemaSection struct {
+	Properties map[string]map[string]any `yaml:"properties"`
+	Default    any                       `yaml:"default"`
+	Env        string                    `yaml:"x-env"`
+	Items      struct {
+		Properties map[string]map[string]any `yaml:"properties"`
+	} `yaml:"items"`
+}
+
+// checkListSection compares a section that is a list (exporters): the keys
+// of its items, and the default list as a whole. It returns its x-env.
+func checkListSection(t *testing.T, section string, schema schemaSection, value reflect.Value) []string {
+	t.Helper()
+	props := schema.Items.Properties
+	if props == nil {
+		t.Errorf("section %q is missing its items from the schema", section)
+		return nil
+	}
+	item := value.Type().Elem()
+	var keys []string
+	for j := 0; j < item.NumField(); j++ {
+		key := strings.Split(item.Field(j).Tag.Get("yaml"), ",")[0]
+		if key == "-" {
+			continue
+		}
+		keys = append(keys, key)
+		if _, ok := props[key]; !ok {
+			t.Errorf("%s[].%s is missing from the schema", section, key)
+		}
+	}
+	for key := range props {
+		if !contains(keys, key) {
+			t.Errorf("%s[].%s is in the schema but the engine does not read it", section, key)
+		}
+	}
+	if !sameDefault(t, schema.Default, value.Interface()) {
+		t.Errorf("%s: schema default %v, engine default %v", section, schema.Default, value.Interface())
+	}
+	if schema.Env == "" {
+		return nil
+	}
+	return []string{schema.Env}
 }
 
 // sameDefault compares a default read from the schema with the engine's.
@@ -132,7 +179,16 @@ func sameDefault(t *testing.T, got, want any) bool {
 		}
 		return false
 	default:
-		return reflect.DeepEqual(got, want)
+		// Anything else (lists of structs, ...) compares in its YAML form.
+		raw, err := yaml.Marshal(want)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var asYAML any
+		if err := yaml.Unmarshal(raw, &asYAML); err != nil {
+			t.Fatal(err)
+		}
+		return reflect.DeepEqual(got, asYAML)
 	}
 }
 

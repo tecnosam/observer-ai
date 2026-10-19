@@ -421,10 +421,16 @@ func anyString(v *commonpb.AnyValue) string {
 	return ""
 }
 
+// Annotation is what Annotate adds to a forwarded trace.
+type Annotation struct {
+	Resource []*commonpb.KeyValue // set on every resource, e.g. a Phoenix project
+	Root     []*commonpb.KeyValue // set on the root span, e.g. the eval.* decision
+}
+
 // Annotate prepares a kept trace for forwarding: it decodes the spans stored
-// by Assemble, files them under project, and sets attrs on the root span,
-// replacing any attribute of the same name.
-func Annotate(stored []byte, project string, attrs []*commonpb.KeyValue) ([]*tracepb.ResourceSpans, error) {
+// by Assemble and sets the annotation's attributes, replacing any attribute
+// of the same name.
+func Annotate(stored []byte, a Annotation) ([]*tracepb.ResourceSpans, error) {
 	var td tracepb.TracesData
 	if err := proto.Unmarshal(stored, &td); err != nil {
 		return nil, fmt.Errorf("otlp: decode stored spans: %w", err)
@@ -434,7 +440,9 @@ func Annotate(stored []byte, project string, attrs []*commonpb.KeyValue) ([]*tra
 		if rs.Resource == nil {
 			rs.Resource = &resourcepb.Resource{}
 		}
-		rs.Resource.Attributes = setAttr(rs.Resource.Attributes, StringAttr(attrProjectName, project))
+		for _, kv := range a.Resource {
+			rs.Resource.Attributes = setAttr(rs.Resource.Attributes, kv)
+		}
 		for _, ss := range rs.GetScopeSpans() {
 			spans = append(spans, ss.GetSpans()...)
 		}
@@ -443,7 +451,7 @@ func Annotate(stored []byte, project string, attrs []*commonpb.KeyValue) ([]*tra
 	if root == nil {
 		return nil, fmt.Errorf("%w: no spans", ErrNotScorable)
 	}
-	for _, kv := range attrs {
+	for _, kv := range a.Root {
 		root.Attributes = setAttr(root.Attributes, kv)
 	}
 	return td.GetResourceSpans(), nil

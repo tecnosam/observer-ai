@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -52,6 +53,7 @@ func (c *Config) validate() error {
 
 	c.validateQueue(add)
 	c.validateOTLP(add)
+	c.validateObservability(add)
 
 	checkUnit := func(name string, v float64) {
 		if !(v >= 0 && v <= 1) { // also rejects NaN
@@ -62,31 +64,30 @@ func (c *Config) validate() error {
 	checkUnit("policy.random_floor", c.Policy.RandomFloor)
 	checkUnit("alert.severity_high", c.Alert.SeverityHigh)
 
-	if err := checkURL(c.Export.PhoenixEndpoint); err != nil {
-		add("export.phoenix_endpoint: %w", err)
-	}
-	if c.Export.Project == "" {
-		add("export.project must not be empty")
-	}
+	c.validateExporters(add)
 	return errors.Join(errs...)
 }
 
 func (c *Config) validateQueue(add func(format string, args ...any)) {
 	q := c.Queue
-	if u, err := url.Parse(q.URL); err != nil || u.Host == "" || (u.Scheme != "nats" && u.Scheme != "tls") {
-		add("queue.url: %q is not a nats:// or tls:// URL", q.URL)
+	if u, err := url.Parse(q.URL); q.NATS() && (err != nil || u.Host == "" || (u.Scheme != "nats" && u.Scheme != "tls")) {
+		add("queue.url: %q is not a nats:// or tls:// URL (leave it empty to queue in process)", q.URL)
 	}
 	if q.ConnectTimeout <= 0 {
 		add("queue.connect_timeout must be positive, got %s", q.ConnectTimeout.Std())
 	}
 	for name, v := range map[string]string{
 		"queue.stream": q.Stream, "queue.consumer": q.Consumer, "queue.dlq_stream": q.DLQStream,
+		"queue.export_stream": q.ExportStream, "queue.export_dlq_stream": q.ExportDLQStream,
 	} {
 		if v == "" || strings.ContainsAny(v, " .*>/\\") {
 			add("%s must be a non-empty name without spaces, dots or wildcards, got %q", name, v)
 		}
 	}
-	for name, v := range map[string]string{"queue.subject": q.Subject, "queue.dlq_subject": q.DLQSubject} {
+	for name, v := range map[string]string{
+		"queue.subject": q.Subject, "queue.dlq_subject": q.DLQSubject,
+		"queue.export_subject": q.ExportSubject, "queue.export_dlq_subject": q.ExportDLQSubject,
+	} {
 		if v == "" || strings.ContainsAny(v, " *>") {
 			add("%s must be a non-empty subject without spaces or wildcards, got %q", name, v)
 		}
@@ -96,6 +97,9 @@ func (c *Config) validateQueue(add func(format string, args ...any)) {
 	}
 	if q.Subject == q.DLQSubject {
 		add("queue.dlq_subject must differ from queue.subject")
+	}
+	if strings.HasPrefix(q.ExportDLQSubject, q.ExportSubject+".") {
+		add("queue.export_dlq_subject must not be under queue.export_subject, where each exporter has its own subject")
 	}
 	if q.MaxMessages < 1 {
 		add("queue.max_messages must be at least 1, got %d", q.MaxMessages)
@@ -194,4 +198,56 @@ func (s Scorer) WorstCase() time.Duration {
 		}
 	}
 	return total
+}
+
+func (c *Config) validateObservability(add func(format string, args ...any)) {
+	for i, sink := range c.Observability.ErrorSinks {
+		switch sink.Kind {
+		case SinkStdout:
+		case SinkFile:
+			if sink.Path == "" {
+				add("observability.error_sinks[%d]: a file sink needs a path", i)
+			}
+		default:
+			add("observability.error_sinks[%d].kind must be %q or %q, got %q", i, SinkStdout, SinkFile, sink.Kind)
+		}
+	}
+}
+
+// exporterName keeps a name safe as a NATS subject token and stream suffix.
+var exporterName = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
+
+// exporterStreamName is the part of the export stream name an exporter adds.
+func exporterStreamName(name string) string {
+	return strings.ToUpper(strings.ReplaceAll(name, "-", "_"))
+}
+
+func (c *Config) validateExporters(add func(format string, args ...any)) {
+	seen := map[string]bool{}
+	for i, e := range c.Exporters {
+		stream := exporterStreamName(e.Name)
+		switch {
+		case !exporterName.MatchString(e.Name):
+			add("exporters[%d].name %q must be letters, digits, '-' and '_' only", i, e.Name)
+		case seen[stream]:
+			add("exporters[%d].name %q is used twice (names differing only in case or '-'/'_' count as the same)", i, e.Name)
+		}
+		seen[stream] = true
+		if err := checkURL(e.Endpoint); err != nil {
+			add("exporters[%d].endpoint: %w", i, err)
+		}
+		if e.QueueSize < 0 || e.Concurrency < 0 || e.MaxDeliver < 0 {
+			add("exporters[%d]: queue_size, concurrency and max_deliver must not be negative", i)
+		}
+		for j, d := range e.Backoff {
+			if d < 0 {
+				add("exporters[%d].backoff[%d] must not be negative", i, j)
+			}
+		}
+		for k := range e.ResolvedHeaders {
+			if strings.TrimSpace(k) == "" {
+				add("exporters[%d].headers: a header name must not be empty", i)
+			}
+		}
+	}
 }

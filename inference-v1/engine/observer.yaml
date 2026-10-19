@@ -8,9 +8,12 @@ server:
   workers: 8             # concurrent workers pulling traces from the queue
   shutdown_timeout: 30s  # time allowed for in-flight traces on shutdown
 
-# NATS JetStream work queue between the API and the workers.
+# The work queue between the receivers and the workers, the span store and
+# the export queues. With url empty they live in the engine's memory: nothing
+# else to run, but queued work is lost on restart and engines cannot share
+# it. Set url to keep them all in NATS JetStream.
 queue:
-  url: nats://localhost:4222        # env: OBSERVER_NATS_URL
+  url: ""                           # env: OBSERVER_NATS_URL, e.g. nats://localhost:4222
   connect_timeout: 30s              # how long to wait for NATS at start-up
   stream: OBSERVER_TRACES
   subject: observer.traces
@@ -24,8 +27,14 @@ queue:
   dlq_stream: OBSERVER_TRACES_DLQ
   dlq_subject: observer.traces.dlq
   dlq_max_age: 168h                 # how long dead letters are kept
+  # Each exporter's queue on NATS: stream OBSERVER_EXPORTS_<NAME> on subject
+  # observer.exports.<name>; traces an exporter gave up on go to the DLQ.
+  export_stream: OBSERVER_EXPORTS
+  export_subject: observer.exports
+  export_dlq_stream: OBSERVER_EXPORTS_DLQ
+  export_dlq_subject: observer.exports_dlq
 
-# OpenTelemetry receivers. Spans are stored in NATS by trace ID, assembled
+# OpenTelemetry receivers. Spans are stored by trace ID, assembled
 # into a trace once it goes quiet, then scored like any other trace.
 otlp:
   grpc_addr: ":4317"                # env: OBSERVER_OTLP_GRPC_ADDR; "" turns gRPC off
@@ -58,6 +67,25 @@ policy:
 alert:
   severity_high: 0.8
 
-export:
-  phoenix_endpoint: http://localhost:6006/v1/traces   # env: OBSERVER_PHOENIX_ENDPOINT
-  project: observer-ai
+# Where the engine's own errors are written: stdout and/or a file, one JSON object per line.
+observability:
+  error_sinks:
+    - kind: stdout
+    # - kind: file
+    #   path: /var/log/observer/errors.jsonl
+
+# Where kept traces go: any number of OTLP/HTTP back ends, each sent every
+# kept trace asynchronously from its own queue (in NATS when queue.url is
+# set). OBSERVER_EXPORT_ENDPOINT replaces the first endpoint.
+# ../examples/langfuse.yaml adds Langfuse.
+exporters:
+  - name: phoenix
+    endpoint: http://localhost:6006/v1/traces
+    resource_attributes:
+      openinference.project.name: observer-ai     # the Phoenix project
+    # headers: {x-team: observability}            # sent as written
+    # headers_env: PHOENIX_OTLP_HEADERS           # "key=value,key2=value2" from the environment, for secrets
+    # queue_size: 1024
+    # concurrency: 4
+    # max_deliver: 3                              # tries before giving up (dead-lettered on NATS)
+    # backoff: [1s, 5s, 30s]                      # wait before each retry

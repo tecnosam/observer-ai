@@ -5,7 +5,7 @@
 # Kev is not part of this file. By default the engine reaches it on the
 # Docker host (port 8010); override OBSERVER_SCORER_ENDPOINT to point
 # elsewhere. To use a Phoenix outside compose instead of the one here, set
-# OBSERVER_PHOENIX_ENDPOINT and start only `nats` and `observer`.
+# OBSERVER_EXPORT_ENDPOINT and start only `nats` and `observer`.
 
 name: observer
 
@@ -50,7 +50,7 @@ services:
     environment:
       OBSERVER_NATS_URL: nats://nats:4222
       OBSERVER_SCORER_ENDPOINT: ${OBSERVER_SCORER_ENDPOINT:-http://host.docker.internal:8010/v1/systemone}
-      OBSERVER_PHOENIX_ENDPOINT: ${OBSERVER_PHOENIX_ENDPOINT:-http://phoenix:6006/v1/traces}
+      OBSERVER_EXPORT_ENDPOINT: ${OBSERVER_EXPORT_ENDPOINT:-http://phoenix:6006/v1/traces}   # the first exporter
     volumes:
       # The model manifest from the fine-tuning run. The image reads it from
       # /etc/observer/manifest.json (OBSERVER_MANIFEST).

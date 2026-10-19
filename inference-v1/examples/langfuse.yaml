@@ -1,0 +1,30 @@
+# langfuse.yaml
+#
+# Send kept traces to Langfuse as well as to the local Phoenix. Each kept
+# trace goes to both, asynchronously and independently: a slow or failing
+# Langfuse never holds up scoring or Phoenix.
+#
+# Langfuse takes OTLP/HTTP with Basic auth: the public key and secret key,
+# joined by a colon, base64-encoded. Put the header in the variable
+# headers_env names, never in this file:
+#
+#   export LANGFUSE_OTLP_HEADERS="Authorization=Basic%20$(printf '%s' "pk-lf-...:sk-lf-..." | base64)"
+#   cd ../engine && make run CONFIG=../examples/langfuse.yaml
+#
+# For the US region use https://us.cloud.langfuse.com, and for a
+# self-hosted Langfuse your own host, with the same /api/public/otel/v1/traces
+# path. Any other OTLP back end works the same way: a name, its OTLP/HTTP
+# traces URL, and its auth header.
+# Keys not listed here keep the defaults in ../engine/observer.yaml.
+
+exporters:
+  - name: phoenix
+    endpoint: http://localhost:6006/v1/traces
+    resource_attributes:
+      openinference.project.name: observer-ai
+
+  - name: langfuse
+    endpoint: https://cloud.langfuse.com/api/public/otel/v1/traces
+    headers_env: LANGFUSE_OTLP_HEADERS
+    resource_attributes:
+      deployment.environment: development

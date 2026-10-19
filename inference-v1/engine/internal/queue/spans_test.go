@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/observer-ai/engine/internal/fault"
 	"github.com/observer-ai/engine/internal/queue"
 	"github.com/observer-ai/engine/internal/trace"
 )
@@ -305,7 +306,7 @@ func TestPublishSpansFailures(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
 	defer cancel()
 	err := f.q.PublishSpans(ctx, map[string][]byte{traceA: []byte("x")})
-	if !errors.Is(err, queue.ErrUnavailable) {
-		t.Errorf("PublishSpans with NATS down = %v, want ErrUnavailable", err)
+	if !fault.Retryable(err) {
+		t.Errorf("PublishSpans with NATS down = %v, want an unavailable fault", err)
 	}
 }

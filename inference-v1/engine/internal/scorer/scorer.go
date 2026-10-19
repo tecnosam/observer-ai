@@ -8,12 +8,16 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log/slog"
 	"math"
 	"math/rand/v2"
 	"net/http"
 	"net/url"
 	"time"
+
+	"github.com/observer-ai/engine/internal/fault"
+	"github.com/observer-ai/engine/internal/observe"
+	"github.com/observer-ai/engine/internal/pipeline"
+	"github.com/observer-ai/engine/internal/trace"
 )
 
 const (
@@ -38,26 +42,13 @@ type Config struct {
 	// Backoff[i] is the base delay before retry i+1; the last entry repeats.
 	Backoff []time.Duration
 
-	HTTPClient *http.Client // defaults to a new client
-	Logger     *slog.Logger // defaults to slog.Default()
+	HTTPClient *http.Client     // defaults to a new client
+	Reporter   observe.Reporter // receives each failed attempt that is retried; defaults to observe.Discard
 
 	// Sleep and Jitter exist so tests can run without waiting. Jitter
 	// returns a value in [0, 1).
 	Sleep  func(ctx context.Context, d time.Duration) error
 	Jitter func() float64
-}
-
-// Result is the model's answer to the decision question.
-type Result struct {
-	// PRaw is the uncalibrated probability from the noul answer.
-	PRaw float64
-	// Model is the model name the server reported.
-	Model string
-	// LatencyMS is the server-reported evaluation time, or the measured
-	// round trip when the server reports none.
-	LatencyMS float64
-	// Attempts is how many requests were made.
-	Attempts int
 }
 
 // StatusError is a non-2xx response from Kev.
@@ -90,8 +81,8 @@ func New(cfg Config) (*Client, error) {
 	if cfg.HTTPClient == nil {
 		cfg.HTTPClient = &http.Client{}
 	}
-	if cfg.Logger == nil {
-		cfg.Logger = slog.Default()
+	if cfg.Reporter == nil {
+		cfg.Reporter = observe.Discard
 	}
 	if cfg.Sleep == nil {
 		cfg.Sleep = sleep
@@ -122,51 +113,48 @@ type noulAnswer struct {
 	Noul *float64 `json:"noul"`
 }
 
-// Score asks Kev the configured questions about state and returns the answer
-// to the decision question. Timeouts, connection errors and 5xx responses
-// are retried with jittered backoff; 4xx and malformed responses are not.
-// The returned error describes the last attempt.
-func (c *Client) Score(ctx context.Context, state string) (Result, error) {
-	body, err := json.Marshal(request{Model: c.cfg.Model, State: state, Questions: c.cfg.Questions})
-	if err != nil {
-		return Result{}, fmt.Errorf("scorer: encode request: %w", err)
-	}
+const opScore fault.Op = "score trace"
 
+// Score asks the model the configured questions about state and returns its
+// answer to the decision question. Timeouts, connection errors and 5xx
+// responses are retried with jittered backoff; 4xx and malformed responses
+// are not. The returned error describes the last attempt (see classify).
+func (c *Client) Score(ctx context.Context, state trace.State) (pipeline.Score, error) {
+	body, err := json.Marshal(request{Model: c.cfg.Model, State: string(state), Questions: c.cfg.Questions})
+	if err != nil {
+		return pipeline.Score{}, fault.Internal(fault.Scorer, "encode request", err)
+	}
 	attempts := c.cfg.MaxRetries + 1
-	var lastErr error
-	for attempt := 1; attempt <= attempts; attempt++ {
-		res, err := c.attempt(ctx, body)
+	for attempt := 1; ; attempt++ {
+		score, err := c.attempt(ctx, body)
 		if err == nil {
-			res.Attempts = attempt
-			return res, nil
+			score.Attempts = attempt
+			return score, nil
 		}
-		lastErr = err
-		if ctx.Err() != nil {
-			return Result{Attempts: attempt}, fmt.Errorf("scorer: %w", ctx.Err())
+		if attempt == attempts || ctx.Err() != nil || !retryable(err) {
+			return pipeline.Score{Attempts: attempt}, classify(err).With("attempts", attempt)
 		}
-		if !retryable(err) {
-			return Result{Attempts: attempt}, fmt.Errorf("scorer: %w", err)
-		}
-		if attempt == attempts {
-			break
-		}
-		delay := c.backoff(attempt - 1)
-		c.cfg.Logger.Warn("kev request failed, retrying",
-			"attempt", attempt, "max_attempts", attempts, "retry_in", delay.String(), "error", err.Error())
-		if err := c.cfg.Sleep(ctx, delay); err != nil {
-			return Result{Attempts: attempt}, fmt.Errorf("scorer: %w", err)
+		if err := c.waitBeforeRetry(ctx, attempt, attempts, err); err != nil {
+			return pipeline.Score{Attempts: attempt}, classify(err).With("attempts", attempt)
 		}
 	}
-	return Result{Attempts: attempts}, fmt.Errorf("scorer: giving up after %d attempts: %w", attempts, lastErr)
 }
 
-func (c *Client) attempt(ctx context.Context, body []byte) (Result, error) {
+// waitBeforeRetry reports the failed attempt and sleeps out its backoff.
+func (c *Client) waitBeforeRetry(ctx context.Context, attempt, attempts int, cause error) error {
+	delay := c.backoff(attempt - 1)
+	c.cfg.Reporter.Report(ctx, classify(cause).With("attempt", attempt).With("max_attempts", attempts).
+		With("retry_in", delay.String()))
+	return c.cfg.Sleep(ctx, delay)
+}
+
+func (c *Client) attempt(ctx context.Context, body []byte) (pipeline.Score, error) {
 	ctx, cancel := context.WithTimeout(ctx, c.cfg.Timeout)
 	defer cancel()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.cfg.Endpoint, bytes.NewReader(body))
 	if err != nil {
-		return Result{}, permanent(err)
+		return pipeline.Score{}, permanent(err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
@@ -175,50 +163,60 @@ func (c *Client) attempt(ctx context.Context, body []byte) (Result, error) {
 	start := time.Now()
 	resp, err := c.cfg.HTTPClient.Do(req)
 	if err != nil {
-		return Result{}, err // timeout or connection error
+		return pipeline.Score{}, err // timeout or connection error
 	}
 	defer resp.Body.Close()
 
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
 	if err != nil {
-		return Result{}, err
+		return pipeline.Score{}, err
 	}
 	elapsed := time.Since(start)
 
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return Result{}, &StatusError{Code: resp.StatusCode, Body: truncate(string(raw), maxErrorBody)}
+		return pipeline.Score{}, &StatusError{Code: resp.StatusCode, Body: truncate(string(raw), maxErrorBody)}
 	}
 
 	var out response
 	if err := json.Unmarshal(raw, &out); err != nil {
-		return Result{}, permanent(fmt.Errorf("decode kev response: %w", err))
+		return pipeline.Score{}, permanent(fmt.Errorf("decode kev response: %w", err))
 	}
 	rawAnswer, ok := out.Answers[c.cfg.DecisionQuestion]
 	if !ok {
-		return Result{}, permanent(fmt.Errorf("kev response has no answer for %q", c.cfg.DecisionQuestion))
+		return pipeline.Score{}, permanent(fmt.Errorf("kev response has no answer for %q", c.cfg.DecisionQuestion))
 	}
 	var ans noulAnswer
 	if err := json.Unmarshal(rawAnswer, &ans); err != nil {
-		return Result{}, permanent(fmt.Errorf("decode answer %q: %w", c.cfg.DecisionQuestion, err))
+		return pipeline.Score{}, permanent(fmt.Errorf("decode answer %q: %w", c.cfg.DecisionQuestion, err))
 	}
 	if ans.Noul == nil {
-		return Result{}, permanent(fmt.Errorf("answer %q has no noul value", c.cfg.DecisionQuestion))
+		return pipeline.Score{}, permanent(fmt.Errorf("answer %q has no noul value", c.cfg.DecisionQuestion))
 	}
 	if p := *ans.Noul; math.IsNaN(p) || p < 0 || p > 1 {
-		return Result{}, permanent(fmt.Errorf("answer %q has noul %v outside [0, 1]", c.cfg.DecisionQuestion, p))
+		return pipeline.Score{}, permanent(fmt.Errorf("answer %q has noul %v outside [0, 1]", c.cfg.DecisionQuestion, p))
 	}
 
-	res := Result{PRaw: *ans.Noul, Model: out.Model, LatencyMS: float64(elapsed.Microseconds()) / 1000}
-	if res.Model == "" {
-		res.Model = c.cfg.Model
+	return pipeline.Score{Raw: pipeline.Probability(*ans.Noul), Model: c.modelName(out), Latency: reportedLatency(out, elapsed)}, nil
+}
+
+// modelName is the model the server says answered, else the one asked for.
+func (c *Client) modelName(out response) pipeline.ModelName {
+	if out.Model != "" {
+		return pipeline.ModelName(out.Model)
 	}
-	switch {
-	case out.LatencyMS != nil:
-		res.LatencyMS = *out.LatencyMS
-	case out.EvaluationTimeMS != nil:
-		res.LatencyMS = *out.EvaluationTimeMS
+	return pipeline.ModelName(c.cfg.Model)
+}
+
+// reportedLatency is the server's own evaluation time when it reports one
+// (Kev: latency_ms, Jev-compatible servers: evaluation_time_ms), else the
+// measured round trip.
+func reportedLatency(out response, measured time.Duration) time.Duration {
+	for _, ms := range []*float64{out.LatencyMS, out.EvaluationTimeMS} {
+		if ms != nil {
+			return time.Duration(*ms * float64(time.Millisecond))
+		}
 	}
-	return res, nil
+	return measured
 }
 
 // Ready reports whether the Kev server answers a cheap GET on /v1/models.
@@ -279,24 +277,28 @@ func retryable(err error) bool {
 	return true // timeout or connection error
 }
 
-// IsSystemError reports whether a Score failure is the scoring system's
-// fault rather than the trace's: Kev unreachable, timing out, answering 5xx,
-// refusing the caller (401, 404, 429, ...) or returning something
-// unparseable. Only a 400, 413 or 422, where Kev rejects this particular
-// request, is not a system error. Trying such a trace again later cannot
-// help; trying a system error again can.
-func IsSystemError(err error) bool {
-	if err == nil {
-		return false
-	}
+// classify turns a failed attempt into the engine's error kinds. Only a
+// 400, 413 or 422, where the model refuses this particular request, is
+// rejected; everything else (unreachable, timing out, 5xx, refusing the
+// caller with 401, 404 or 429, an unparseable answer) is the scoring
+// system's fault and worth retrying later.
+func classify(err error) *fault.Error {
 	var status *StatusError
-	if errors.As(err, &status) {
-		switch status.Code {
-		case http.StatusBadRequest, http.StatusRequestEntityTooLarge, http.StatusUnprocessableEntity:
-			return false
-		}
+	switch {
+	case errors.As(err, &status) && rejectedStatus(status.Code):
+		return fault.Rejected(fault.Scorer, opScore, err)
+	case errors.Is(err, context.DeadlineExceeded):
+		return fault.Timeout(fault.Scorer, opScore, err)
 	}
-	return true
+	return fault.Unavailable(fault.Scorer, opScore, err)
+}
+
+func rejectedStatus(code int) bool {
+	switch code {
+	case http.StatusBadRequest, http.StatusRequestEntityTooLarge, http.StatusUnprocessableEntity:
+		return true
+	}
+	return false
 }
 
 func sleep(ctx context.Context, d time.Duration) error {

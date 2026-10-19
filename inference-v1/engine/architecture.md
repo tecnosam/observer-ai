@@ -13,11 +13,11 @@ file is about the code.
 | --- | --- |
 | Web framework? | None. The standard library's `net/http` and its `ServeMux`. No Gin, Echo, Fiber or chi. |
 | Dependency injection? | Yes, by hand: constructors take what they need, and `main` builds everything once. No DI framework or container. |
-| Factory pattern? | An abstract factory for where settings come from (`config.AbstractLoaderFactory`: a YAML file, or values built in code). Elsewhere, constructor functions (`scorer.New`, `queue.Connect`, `export.NewPhoenix`). |
+| Factory pattern? | Abstract factories where there is a choice: where settings come from (`config.AbstractLoaderFactory`: a YAML file, or values built in code), which error sinks to build (`observe.AbstractSinkFactory`), which trace back ends to export to (`export.AbstractBackendFactory`), and where the queues live (`broker.AbstractFactory`: NATS JetStream or in process, building the trace queue and the export queues as a matching pair). Elsewhere, constructor functions (`scorer.New`, `policy.New`). |
 | How are dependencies swapped in tests? | Small interfaces declared by the package that uses them, plus a few function-typed fields. |
 | Config? | A `Compiler` with an injected loader factory. For the YAML file: `gopkg.in/yaml.v3`, decoded strictly over a struct of defaults, then six environment overrides, then validation. Read once at start-up. |
-| Database? | None. NATS JetStream is the only state: the queues and the spans waiting to be assembled. |
-| Logging? | `log/slog`, JSON to stdout. |
+| Database? | None. The only state is the queues and the spans waiting to be assembled: in NATS JetStream when `queue.url` is set, otherwise in memory. |
+| Logging? | `log/slog`, JSON to stdout, for events (start-up, decisions, shutdown). Errors go through their own pipeline: typed `fault.Error`s reported to `observe`, which writes them to the configured sinks. |
 
 ## Stack
 
@@ -28,9 +28,9 @@ file is about the code.
 | OTLP over HTTP | A second `net/http` server on its own port |
 | OTLP over gRPC | `google.golang.org/grpc`, serving the standard OTLP `TraceService` |
 | Wire formats | `google.golang.org/protobuf` and the generated OTLP types in `go.opentelemetry.io/proto/otlp` |
-| Queue and storage | NATS JetStream through `github.com/nats-io/nats.go` (the `jetstream` package) |
+| Queue and storage | NATS JetStream through `github.com/nats-io/nats.go` (the `jetstream` package), or in-process channels and maps when no NATS URL is set |
 | Calling Kev | `net/http` client, JSON |
-| Sending to Phoenix | The OpenTelemetry Go SDK with the `otlptracehttp` exporter |
+| Sending to trace back ends | The OpenTelemetry Go SDK with the `otlptracehttp` exporter, one per configured back end (Phoenix, Langfuse, any OTLP/HTTP endpoint) |
 | Config | `gopkg.in/yaml.v3` for `observer.yaml`, `encoding/json` for the model manifest |
 | API docs | A hand-written OpenAPI file embedded with `go:embed`; Swagger UI loaded from a CDN |
 | Tests | The standard `testing` package, `net/http/httptest`, and a real NATS server started in-process (`github.com/nats-io/nats-server/v2`, test-only) |
@@ -43,15 +43,21 @@ There is no ORM, no router library, no validation library, no CLI library
 ```
 cmd/observer/main.go     the only executable: flags, config, wiring, shutdown
 internal/
+  pipeline/              the core: domain types, the interfaces the engine needs, calibration, and Engine
+  fault/                 the error type: kind, component, operation, trace; constructors and classifiers
+  observe/               where errors go: Reporter, the error pipeline, sinks (stdout, file) and their factory
+  metrics/               metrics recorders (a no-op for now)
   config/                settings and manifest: loaders, compiler, validation, per-component settings
   trace/                 the Trace record, its JSON decoding, and BuildState (the text Kev reads)
-  scorer/                HTTP client for Kev: retries, error classes, temperature calibration
+  scorer/                model adapter: /v1/systemone client with retries and error classification
   policy/                keep or drop from a probability: threshold, random floor, severity
   otlp/                  OTLP gRPC and HTTP receivers; turning spans into a Trace
-  queue/                 JetStream: streams, publishing, the worker pool, span assembly, dead letters
+  broker/                chooses where the queues live: the NATS or in-process family of queues
+  natsconn/              the one NATS connection the queues share
+  queue/                 the trace work queue and span store: AbstractBroker, on JetStream (Queue) or in memory (MemoryBroker)
     queuetest/           starts an in-process NATS server for tests
-  export/                sends kept traces to Phoenix
-  server/                JSON API handlers, and Engine: the scoring pipeline
+  export/                sends kept traces to every configured back end over OTLP, from a queue per back end (JetStream or memory)
+  server/                JSON API handlers: HTTP in, pipeline calls, HTTP out
 testdata/                trace fixtures, golden state strings, canned Kev responses
 scripts/                 send_samples.py
 observer.yaml            example config, also baked into the Docker image
@@ -64,16 +70,27 @@ module. Each directory is one package with one job.
 ### Which package imports which
 
 ```
-scorer   (nothing)          policy  (nothing)          trace   (nothing)
-otlp     -> trace
-queue    -> trace
-config   -> policy, queue, scorer
-export   -> otlp, policy, trace
-server   -> export, policy, queue, scorer, trace
+fault    (nothing)          trace   (nothing)
+observe  -> fault
+pipeline -> fault, observe, trace                  the core
+policy   -> pipeline                               adapters implement the core's interfaces
+scorer   -> fault, observe, pipeline, trace
+export   -> fault, observe, otlp, pipeline
+server   -> fault, observe, pipeline, trace
+metrics  -> fault, pipeline
+otlp     -> fault, observe, trace
+queue    -> fault, observe, trace
+config   -> observe, pipeline, policy, queue, scorer
 main     -> all of them
 ```
 
-Two things are worth noticing:
+Three things are worth noticing:
+
+- **The core imports no adapter.** `pipeline` defines what it needs
+  (`Scorer`, `Policy`, `Exporter`, `Publisher`, `Metrics`) and the types they
+  exchange (`Score`, `Decision`, `Record`). The scorer, policy and exporter
+  import it to implement those, never the other way round, and `server`
+  depends on the core alone, not on the queue, scorer or exporter.
 
 - **Only `main` imports `config`.** No other package knows the YAML exists.
   Each package that needs settings declares its own `Config` struct
@@ -94,15 +111,16 @@ OTLP  gRPC / HTTP            otlp.Receiver -> queue.PublishSpans                
                                                                                          v
                                                        JetStream work queue (OBSERVER_TRACES)
                                                                                          │
-                             queue.Workers -> server.Engine.ProcessQueued <──────────────┘
-                                                 trace.BuildState -> scorer.Score
-                                                 -> scorer.Calibrate -> policy.Decide
-                                                 -> export.Export (kept traces only)
+                             queue.Workers -> pipeline.Engine.ProcessQueued <────────────┘
+                                                 trace.BuildState -> Scorer.Score
+                                                 -> pipeline.Calibrate -> Policy.Decide
+                                                 -> Exporter.Export (kept traces only: queued per back end,
+                                                    sent by that back end's workers)
 
-JSON  POST /v1/traces:score  server.handleScore -> server.Engine.Process   (same pipeline, no queue)
+JSON  POST /v1/traces:score  server.handleScore -> pipeline.Engine.Process   (same pipeline, no queue)
 ```
 
-`server.Engine` is the pipeline. Both the synchronous endpoint and the queue
+`pipeline.Engine` is the pipeline. Both the synchronous endpoint and the queue
 workers call it; the only difference is what happens when Kev fails (see
 [Error handling](#error-handling)).
 
@@ -144,14 +162,17 @@ cfg, err := config.NewCompiler(f, config.WithEnv(nil)).Compile()          // any
    line number instead of being silently ignored.
 2. **Apply environment overrides.** Six variables replace their keys when
    set and non-empty: `OBSERVER_NATS_URL`, `OBSERVER_SCORER_ENDPOINT`,
-   `OBSERVER_PHOENIX_ENDPOINT`, `OBSERVER_MANIFEST`,
+   `OBSERVER_EXPORT_ENDPOINT` (the first exporter's endpoint), `OBSERVER_MANIFEST`,
    `OBSERVER_OTLP_GRPC_ADDR` and `OBSERVER_OTLP_HTTP_ADDR`. These are the
    values that differ between a laptop and a container. Nothing else can be
    set from the environment. The environment itself is injected
    (`WithEnv`, `os.Getenv` by default), so tests and embedding programs
    control it.
-3. **Read the scorer's API key** from the variable `scorer.api_key_env` names
-   (`JEV_API_KEY` by default for `scorer.kind: jev`).
+3. **Read the secrets from the environment.** The scorer's API key from the
+   variable `scorer.api_key_env` names (`JEV_API_KEY` by default for
+   `scorer.kind: jev`), and each exporter's headers from the variable its
+   `headers_env` names, parsed in the OpenTelemetry `key=value,...` format
+   and merged over its inline `headers`.
 4. **Validate.** `validate` checks every value and collects all the
    problems before reporting (`errors.Join`), so one run shows every mistake.
    It includes rules that span keys, for example `queue.ack_wait` must be
@@ -169,8 +190,10 @@ The result is one immutable `*config.Config`. `run` in `cmd/observer/main.go`
 then hands each component only the part it needs, in the shape it takes:
 
 ```go
-kev, err := scorer.New(cfg.ScorerConfig(logger))
-q, err := queue.Connect(ctx, cfg.QueueConfig(logger))
+kev, err := scorer.New(cfg.ScorerConfig(reporter))
+b, err := broker.New(cfg.BrokerConfig(logger))          // NATS if queue.url is set, else memory
+q, err := b.Ingest(ctx, cfg.QueueConfig(logger))
+exp, err := export.NewDispatcher(ctx, export.DispatcherConfig{Queues: b.ExportQueues(cfg.ExportStreams()), ...})
 policy.New(cfg.PolicyConfig(), nil)
 ```
 
@@ -205,13 +228,15 @@ global. `run` in `main.go` is the one place where concrete types are chosen
 and connected:
 
 ```go
-engine := &server.Engine{Scorer: kev, Policy: policy.New(...), Exporter: exporter, ...}
-srv := server.New(server.Options{Engine: engine, Queue: q, Logger: logger})
-workers := q.StartWorkers(cfg.Server.Workers, func(ctx context.Context, t trace.Trace) error {
-    _, err := engine.ProcessQueued(ctx, t)
-    return err
-})
+a.engine = pipeline.NewEngine(pipeline.Deps{
+    Scorer: kev, Policy: policy.New(...), Exporter: a.exporter, Reporter: a.reporter, Metrics: metrics.Noop{},
+}, pipeline.Settings{Temperature: ..., Model: ...})
+srv := server.New(server.Options{Engine: a.engine, Queue: a.queue, Reporter: a.reporter})
 ```
+
+`main` builds them in small steps on an `app` struct (`startReporter`,
+`startExporter`, `startQueue`, `startEngine`, ...), so a failure part-way
+stops exactly what was started.
 
 There is no DI framework (no Wire, Fx or Dig). With about ten objects, wiring
 by hand is shorter than configuring a container, and the start-up order is
@@ -224,15 +249,25 @@ uses it, and the concrete type lives elsewhere. All of them are small:
 
 | Interface | Declared in | Methods | Real implementation |
 | --- | --- | --- | --- |
-| `server.Scorer` | `server/engine.go` | `Score`, `Ready` | `*scorer.Client` |
-| `server.Exporter` | `server/engine.go` | `Export`, `Flush` | `*export.Exporter` |
-| `server.Publisher` | `server/server.go` | `Publish`, `Ready` | `*queue.Queue` |
-| `otlp.Sink` | `otlp/receiver.go` | `PublishSpans` | `*queue.Queue` |
-| `export.Uploader` | `export/export.go` | `UploadTraces` | the OTLP/HTTP client |
+| `pipeline.Scorer` | `pipeline/interfaces.go` | `Score`, `Ready` | `*scorer.Client` |
+| `pipeline.Policy` | `pipeline/interfaces.go` | `Decide`, `Fallback` | `*policy.Policy` |
+| `pipeline.Exporter` | `pipeline/interfaces.go` | `Export`, `Flush` | `*export.Dispatcher` |
+| `export.AbstractBackend` | `export/backend.go` | `Send`, `Flush`, `Shutdown` | `*export.OTLPBackend` |
+| `export.AbstractBackendFactory` | `export/backend.go` | `Build` | `export.OTLPBackendFactory` |
+| `pipeline.Publisher` | `pipeline/interfaces.go` | `Publish`, `Ready` | `queue.AbstractBroker` |
+| `queue.AbstractBroker` | `queue/broker.go` | `Publish`, `PublishSpans`, `StartWorkers`, `StartAssemblers`, `Ready`, `Close` | `*queue.Queue` (JetStream), `*queue.MemoryBroker` |
+| `export.AbstractQueue` | `export/queue.go` | `Enqueue`, `Flush`, `Shutdown` | JetStream and in-memory queues |
+| `export.AbstractQueueFactory` | `export/queue.go` | `Queue` | `export.NATSQueueFactory`, `export.MemoryQueueFactory` |
+| `broker.AbstractFactory` | `broker/broker.go` | `Ingest`, `ExportQueues`, `Kind`, `Close` | `*broker.NATS`, `broker.Memory` |
+| `pipeline.Metrics` | `pipeline/interfaces.go` | `TraceScored`, `TraceDecided` | `metrics.Noop` |
+| `observe.Reporter` | `observe/reporter.go` | `Report` | `*observe.Pipeline` |
+| `observe.AbstractSink` | `observe/sink.go` | `Write`, `Close` | stdout and file sinks |
+| `otlp.Sink` | `otlp/receiver.go` | `PublishSpans` | `queue.AbstractBroker` |
+| `export.Uploader` | `export/otlp_backend.go` | `UploadTraces` | the OTLP/HTTP client |
 
 This is what lets `otlp` store spans in the queue without importing the
-`queue` package, and lets the tests replace Kev or Phoenix with a few lines
-of fake.
+`queue` package, and lets the tests replace Kev or a trace back end with a
+few lines of fake.
 
 ### Functions as injection points
 
@@ -252,9 +287,8 @@ instead:
 Each component has a `New`-style function that validates its input, fills in
 defaults for optional fields (a nil logger becomes `slog.Default()`, a nil
 HTTP client a new one) and returns a ready value: `scorer.New`,
-`policy.New`, `server.New`, `otlp.NewReceiver`, `queue.Connect`,
-`export.NewPhoenix`. These are plain constructors: each component has one
-implementation, so there is nothing to choose between yet.
+`policy.New`, `server.New`, `otlp.NewReceiver`, `export.NewDispatcher`. These are plain constructors: each of these
+components has one implementation, so there is nothing to choose between yet.
 
 ### Abstract factory for configuration
 
@@ -267,17 +301,47 @@ is given a factory and an environment lookup and never knows which source it
 has. A new source (flags, a database, a remote store) is a new factory, with
 no change to the compiler or to validation.
 
+### Abstract factory for trace back ends
+
+`export.Dispatcher` is the engine's `pipeline.Exporter`. It is given a list
+of `export.BackendConfig`s and an `export.AbstractBackendFactory`, builds one
+`export.AbstractBackend` per entry, and gives each its own bounded queue and
+workers. `Export` only enqueues, so a slow back end never holds up scoring
+or the others; a full queue skips the trace for that back end and reports
+it. `export.OTLPBackendFactory` builds an `OTLPBackend` for any OTLP/HTTP
+endpoint, which is why Phoenix and Langfuse need no code of their own. A back
+end that does not speak OTLP is a new `AbstractBackend` and factory, with no
+change to the dispatcher or the pipeline. Tests pass a factory that hands
+out an in-memory back end.
+
+### Abstract factory for the queues
+
+`broker.AbstractFactory` builds a family of related objects that must agree:
+the trace work queue and span store (`queue.AbstractBroker`) and the export
+queues (`export.AbstractQueueFactory`). `broker.New` picks the family from
+`queue.url`: `broker.NATS` opens one connection (`natsconn`) and builds
+`queue.Queue` and `export.NATSQueueFactory` on it; `broker.Memory` builds
+`queue.MemoryBroker` and `export.MemoryQueueFactory`. Nothing downstream
+knows which it has: the server publishes to a `pipeline.Publisher`, the OTLP
+receiver stores spans in an `otlp.Sink`, the dispatcher enqueues to an
+`export.AbstractQueue`. Both families keep the same rules (bounded queues,
+redelivery with backoff, a delivery limit, then a dead letter), and the
+retry decision for exports (`export.settle`) is shared code. A new broker
+(Kafka, Redis Streams) is a new family: one more factory and its two
+implementations.
+
 ### Config structs, and functional options in one place
 
 Components take a `Config` or `Options` struct rather than a long argument
 list. The exporter is the one place that uses functional options
-(`export.New(tp, export.WithForwarder(...), export.WithLogger(...))`),
+(`export.New(tp, export.WithForwarder(...))`),
 because its extras are optional and tests construct it without them.
 
 ### Pipeline
 
-`server.Engine.process` is a fixed sequence: build the state string, score
-it, calibrate, decide, export, log. Each step is a call into a package that
+`pipeline.Engine` runs a fixed sequence, each step its own small method
+(`decide`, `scored`, `fallback`, `logDecision`): build the state string,
+score it, calibrate, decide, export, log. Each step is a call into a package that
 knows nothing about the others. The steps are not pluggable; the order is
 the product.
 
@@ -287,15 +351,17 @@ the product.
 time from a single durable JetStream consumer. Several engine processes
 using the same consumer name share the work, and each trace goes to exactly
 one of them. `queue.Assemblers` is a second pool of the same shape for
-span assembly.
+span assembly, and each exporter's queue has a third. In memory the pools
+read from a bounded channel instead, and only one process takes part.
 
 ### Store first, then acknowledge
 
-Intake answers only after NATS has confirmed the write: `202` on the JSON
-API, success on OTLP. A worker acknowledges a trace only after it has a
+On NATS, intake answers only after NATS has confirmed the write: `202` on
+the JSON API, success on OTLP. A worker acknowledges a trace only after it has a
 decision. A crash at any point therefore leaves the trace in JetStream to be
 picked up again, never lost between two steps. The cost is that a trace can
-be processed twice; it is never processed zero times.
+be processed twice; it is never processed zero times. The in-memory broker
+gives up this guarantee for having nothing to run beside the engine.
 
 ### Trace assembly by marker
 
@@ -304,13 +370,31 @@ Spans of one run arrive in several batches. Each batch is stored under
 stream. An assembler picks up the marker, checks how long the trace has been
 quiet, and either puts the marker back with a delay or assembles the trace,
 queues it and removes the spans it read. The wait is held in NATS, not in
-memory, so it survives a restart.
+memory, so it survives a restart. In memory, a map of pending traces and one
+scanner goroutine play the same part.
 
 ### Error handling
 
-- **Errors are classified once, then acted on.** `scorer.IsSystemError`
-  separates "Kev is unwell" (timeouts, 5xx, connection errors) from "Kev
-  rejected this trace" (400, 413, 422).
+Every error a component returns is a `*fault.Error`: a **kind** (`invalid`,
+`rejected`, `unavailable`, `timeout`, `full`, `internal`), the **component**
+it came from, the **operation** it was doing, the **trace** it concerns, and
+the cause. Components build them with constructors
+(`fault.Unavailable(fault.Scorer, "score trace", err)`) and callers branch on
+`fault.KindOf` and `fault.Retryable`, never on another package's sentinel
+values or error strings.
+
+Errors that are handled rather than returned (a retry, a dead letter, a
+failed export) are **reported** to an `observe.Reporter`, which every
+component is given. The engine's reporter is an `observe.Pipeline`: it turns
+each error into an entry, counts it, and writes it to every sink configured
+under `observability.error_sinks` (stdout and files today; an OpenTelemetry
+sink is planned). Sinks are built by an `observe.AbstractSinkFactory`, and a
+failing sink is noted on stderr without stopping the engine.
+
+- **Errors are classified once, then acted on.** The scorer classifies each
+  failure (`classify`): a 400, 413 or 422 is `rejected`, anything else
+  (timeouts, 5xx, connection errors, garbage) is `unavailable` or `timeout`.
+  The pipeline defers anything but `rejected` and `invalid` to the queue.
 - **Two levels of retry.** Inside one worker, the scorer retries with
   jittered backoff. If that still fails with a system error, the worker
   returns the error and the queue redelivers the trace later, with its own
@@ -318,16 +402,17 @@ memory, so it survives a restart.
 - **Degrade rather than fail** where retrying cannot help: a rejected trace,
   or any failure on the synchronous endpoint, gets the policy's random
   fallback decision instead of an error.
-- **Sentinel and typed errors**, checked with `errors.Is` and `errors.As`:
-  `queue.ErrFull`, `queue.ErrUnavailable`, `otlp.ErrNotScorable`,
-  `*scorer.StatusError`.
+- **HTTP status from the kind, in one place.** `server.writeFault` maps
+  `full` and the retryable kinds to 503 with `Retry-After`, `invalid` to 400,
+  and anything else to 500.
 
 ### Graceful shutdown in dependency order
 
 `signal.NotifyContext` turns SIGINT and SIGTERM into a cancelled context.
 `run` then stops things in the order that loses nothing: the HTTP server,
-the OTLP receivers, the assemblers, the workers, and last the exporter's
-flush, which has its own time budget so a slow drain cannot starve it.
+the OTLP receivers, the assemblers, the workers, then the export queues,
+which have their own time budget so a slow drain cannot starve them, and
+last the queue and the broker's connection.
 
 ### Golden files for cross-language parity
 
@@ -357,11 +442,15 @@ same over a few thousand randomized traces.
 | OTLP HTTP and gRPC | one per request or call |
 | Queue workers | `server.workers`, each handling one trace at a time |
 | Assemblers | `otlp.assemblers` |
-| Phoenix export | the OpenTelemetry SDK's batch processor, in the background |
+| Export | per back end: `exporters[].concurrency` workers draining its queue (a JetStream consumer or a channel), and the OpenTelemetry SDK's batch processor for rebuilt spans |
+| In-memory broker | besides its workers and assemblers, one scanner for quiet traces and one timer per pending redelivery |
 
 Components shared across goroutines (`scorer.Client`, `policy.Policy`,
-`export.Exporter`, `queue.Queue`) hold no per-request state and are safe to
-call concurrently. There are no locks in the pipeline itself.
+`export.Dispatcher`, `export.OTLPBackend`, `queue.Queue`,
+`queue.MemoryBroker`) are safe to call concurrently. There are no locks in
+the pipeline itself; the in-memory export queue holds one, only to keep
+`Enqueue` and `Shutdown` from racing, and `MemoryBroker` one around its span
+map.
 
 ## Testing approach
 
@@ -371,8 +460,8 @@ call concurrently. There are no locks in the pipeline itself.
   NATS server on a loopback port, so redelivery, dead-lettering and stream
   limits are tested against JetStream itself.
 - **Fakes at the interfaces.** Kev is an `httptest.Server` returning the
-  canned responses in `testdata/kev/`; Phoenix is an in-memory span
-  recorder.
+  canned responses in `testdata/kev/`; a trace back end is an in-memory span
+  recorder or a fake `AbstractBackend`.
 - **Specs kept in step by tests.** `TestOpenAPICoversRoutes` fails if a route
   is missing from `openapi.yaml`, and `TestSchemaMatchesConfig` fails if
   `observer.schema.yaml` and the config structs drift apart.
@@ -387,6 +476,10 @@ call concurrently. There are no locks in the pipeline itself.
 | What Kev is shown | `internal/trace/slice.go`; it must stay identical to the Python `build_state` |
 | How spans map to a trace | `internal/otlp/convert.go` |
 | The keep or drop rule | `internal/policy/policy.go` |
-| Retry and dead-letter behaviour | `internal/scorer/scorer.go`, `internal/queue/worker.go` |
-| What Phoenix receives | `internal/export/export.go` |
+| Retry and dead-letter behaviour | `internal/scorer/scorer.go`, `internal/queue/worker.go` (NATS), `internal/queue/memory.go` (memory), `internal/export/queue.go` (exports) |
+| Where the queues live, or a new broker | `internal/broker/broker.go`: a new `AbstractFactory` with a `queue.AbstractBroker` and an `export.AbstractQueueFactory` |
+| The pipeline's steps or its interfaces | `internal/pipeline/engine.go`, `internal/pipeline/interfaces.go` |
+| Where errors are written | `observe.AbstractSinkFactory` in `internal/observe/sink.go`, and `observability.error_sinks` in the config |
+| What the trace back ends receive | `internal/export/otlp_backend.go` (attributes), `internal/otlp/convert.go` (`Annotate`, for forwarded spans) |
+| A new kind of trace back end | `internal/export/backend.go`: a new `AbstractBackend` and `AbstractBackendFactory` |
 | Start-up and shutdown order | `cmd/observer/main.go` |

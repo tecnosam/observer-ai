@@ -1,7 +1,11 @@
-// Package queue is the NATS JetStream work queue between the HTTP API and
-// the workers. Traces are published to a work-queue stream, pulled by a pool
-// of workers through one durable consumer, and moved to a dead-letter stream
-// when they keep failing with system errors.
+// Package queue is the work queue between the receivers (HTTP API, OTLP)
+// and the workers, and the store where OTLP spans wait to be assembled into
+// traces. AbstractBroker is what the engine uses; Queue implements it on
+// NATS JetStream and MemoryBroker in process.
+//
+// On JetStream, traces are published to a work-queue stream, pulled by a
+// pool of workers through one durable consumer, and moved to a dead-letter
+// stream when they keep failing with system errors.
 package queue
 
 import (
@@ -16,15 +20,16 @@ import (
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 
+	"github.com/observer-ai/engine/internal/fault"
+	"github.com/observer-ai/engine/internal/natsconn"
+	"github.com/observer-ai/engine/internal/observe"
 	"github.com/observer-ai/engine/internal/trace"
 )
 
 const (
-	connectionName = "observer-engine"
 	publishTimeout = 5 * time.Second
 	setupTimeout   = 5 * time.Second
 	setupRetryWait = 500 * time.Millisecond
-	reconnectWait  = time.Second
 
 	defaultPollWait = 2 * time.Second
 
@@ -32,14 +37,9 @@ const (
 	HeaderTraceID = "Observer-Trace-Id"
 )
 
-var (
-	// ErrFull means the stream is at queue.max_messages.
-	ErrFull = errors.New("queue full")
-	// ErrUnavailable means NATS did not accept the trace.
-	ErrUnavailable = errors.New("queue unavailable")
-)
-
-// Config configures a Queue.
+// Config configures a broker. URL is read only by Connect; the other
+// JetStream settings (streams, subjects, the consumer, ack_wait) only by the
+// NATS implementation.
 type Config struct {
 	URL string
 	// ConnectTimeout bounds the wait for NATS at start-up. After that the
@@ -68,71 +68,60 @@ type Config struct {
 	PollWait time.Duration
 
 	Logger *slog.Logger
+	// Reporter receives every error the queue meets while running. Defaults
+	// to observe.Discard.
+	Reporter observe.Reporter
 }
 
 // Queue publishes traces to JetStream and hands them to workers.
 type Queue struct {
-	cfg    Config
-	nc     *nats.Conn
-	js     jetstream.JetStream
-	cons   jetstream.Consumer
-	logger *slog.Logger
+	cfg      Config
+	conn     *natsconn.Conn
+	ownsConn bool // Close closes conn only when Connect opened it
+	js       jetstream.JetStream
+	cons     jetstream.Consumer
+	logger   *slog.Logger
 
 	// Set only when cfg.Spans is enabled.
 	spans       jetstream.Stream
 	pendingCons jetstream.Consumer
 }
 
-// Connect connects to NATS and creates or updates the trace stream, the
-// dead-letter stream and the workers' durable consumer. It keeps trying
-// until cfg.ConnectTimeout, so the engine can start alongside NATS.
+// Connect connects to cfg.URL and sets up the queue on its own connection,
+// which Close closes.
 func Connect(ctx context.Context, cfg Config) (*Queue, error) {
+	conn, err := natsconn.Dial(natsconn.Config{URL: cfg.URL, Logger: cfg.Logger, Reporter: cfg.Reporter})
+	if err != nil {
+		return nil, fmt.Errorf("queue: %w", err)
+	}
+	q, err := NewNATS(ctx, conn, cfg)
+	if err != nil {
+		conn.Close()
+		return nil, err
+	}
+	q.ownsConn = true
+	return q, nil
+}
+
+// NewNATS creates or updates the trace stream, the dead-letter stream and
+// the workers' durable consumer on a shared connection. It keeps trying
+// until cfg.ConnectTimeout, so the engine can start alongside NATS. Close
+// leaves the connection open.
+func NewNATS(ctx context.Context, conn *natsconn.Conn, cfg Config) (*Queue, error) {
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
+	}
+	if cfg.Reporter == nil {
+		cfg.Reporter = observe.Discard
 	}
 	if cfg.PollWait <= 0 {
 		cfg.PollWait = defaultPollWait
 	}
-	logger := cfg.Logger
-
-	nc, err := nats.Connect(cfg.URL,
-		nats.Name(connectionName),
-		nats.RetryOnFailedConnect(true),
-		nats.MaxReconnects(-1),
-		nats.ReconnectWait(reconnectWait),
-		nats.DisconnectErrHandler(func(_ *nats.Conn, err error) {
-			if err != nil {
-				logger.Warn("nats disconnected", "error", err.Error())
-			}
-		}),
-		nats.ReconnectHandler(func(nc *nats.Conn) {
-			logger.Info("nats reconnected", "url", nc.ConnectedUrlRedacted())
-		}),
-	)
-	if err != nil {
-		return nil, fmt.Errorf("queue: connect to %s: %w", cfg.URL, err)
+	q := &Queue{cfg: cfg, conn: conn, js: conn.JS, logger: cfg.Logger}
+	if err := natsconn.Retry(ctx, cfg.ConnectTimeout, setupRetryWait, q.setup); err != nil {
+		return nil, fmt.Errorf("queue: NATS JetStream not ready after %s: %w", cfg.ConnectTimeout, err)
 	}
-	js, err := jetstream.New(nc)
-	if err != nil {
-		nc.Close()
-		return nil, fmt.Errorf("queue: %w", err)
-	}
-	q := &Queue{cfg: cfg, nc: nc, js: js, logger: logger}
-
-	ctx, cancel := context.WithTimeout(ctx, cfg.ConnectTimeout)
-	defer cancel()
-	for {
-		err := q.setup(ctx)
-		if err == nil {
-			return q, nil
-		}
-		select {
-		case <-ctx.Done():
-			nc.Close()
-			return nil, fmt.Errorf("queue: NATS JetStream at %s not ready after %s: %w", cfg.URL, cfg.ConnectTimeout, err)
-		case <-time.After(setupRetryWait):
-		}
-	}
+	return q, nil
 }
 
 func (q *Queue) setup(ctx context.Context) error {
@@ -187,8 +176,8 @@ func (q *Queue) setup(ctx context.Context) error {
 }
 
 // Publish stores t in the trace stream and returns once NATS has confirmed
-// it. It returns ErrFull when the stream is at its limit and ErrUnavailable
-// for any other failure.
+// it. A full stream is fault.KindFull; any other failure is
+// fault.KindUnavailable.
 func (q *Queue) Publish(ctx context.Context, t trace.Trace) error {
 	data, err := json.Marshal(t)
 	if err != nil {
@@ -206,9 +195,9 @@ func (q *Queue) publishTrace(ctx context.Context, traceID string, data []byte, o
 	defer cancel()
 	if _, err := q.js.PublishMsg(ctx, msg, opts...); err != nil {
 		if isStreamFull(err) {
-			return ErrFull
+			return fault.Full(fault.Queue, "publish trace", err).WithTrace(traceID)
 		}
-		return fmt.Errorf("%w: %v", ErrUnavailable, err)
+		return fault.Unavailable(fault.Queue, "publish trace", err).WithTrace(traceID)
 	}
 	return nil
 }
@@ -223,13 +212,17 @@ func isStreamFull(err error) bool {
 
 // Ready reports whether the connection to NATS is up.
 func (q *Queue) Ready() error {
-	if !q.nc.IsConnected() {
-		return fmt.Errorf("nats is %s", strings.ToLower(q.nc.Status().String()))
-	}
-	return nil
+	return q.conn.Ready()
 }
 
-// Close closes the connection. Stop the workers first.
+// report sends an error the queue met to the configured Reporter.
+func (q *Queue) report(err *fault.Error) {
+	q.cfg.Reporter.Report(context.Background(), err)
+}
+
+// Close closes the connection if Connect opened it. Stop the workers first.
 func (q *Queue) Close() {
-	q.nc.Close()
+	if q.ownsConn {
+		q.conn.Close()
+	}
 }

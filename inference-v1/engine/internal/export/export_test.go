@@ -4,11 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"io"
-	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
-	"sync/atomic"
+	"sync"
 	"testing"
 	"time"
 
@@ -17,11 +16,11 @@ import (
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 
-	"github.com/observer-ai/engine/internal/policy"
+	"github.com/observer-ai/engine/internal/pipeline"
 	"github.com/observer-ai/engine/internal/trace"
 )
 
-func newRecorded(t *testing.T) (*Exporter, *tracetest.SpanRecorder) {
+func newRecorded(t *testing.T) (*OTLPBackend, *tracetest.SpanRecorder) {
 	t.Helper()
 	rec := tracetest.NewSpanRecorder()
 	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(rec))
@@ -77,17 +76,17 @@ func wantFloat(t *testing.T, attrs map[string]attribute.Value, key string, want 
 
 func TestExportKeptTrace(t *testing.T) {
 	exp, rec := newRecorded(t)
-	ok := exp.Export(context.Background(), Record{
+	err := exp.Send(context.Background(), pipeline.Record{
 		Trace: sampleTrace(),
-		Decision: policy.Decision{
+		Decision: pipeline.Decision{
 			Keep: true, Scored: true, PKeep: 0.95, PKeepRaw: 0.93,
-			Reason: policy.ReasonKev, Severity: policy.SeverityHigh,
+			Reason: pipeline.ReasonModel, Severity: pipeline.SeverityHigh,
 		},
-		Model:     "kev-latest",
-		LatencyMS: 93,
+		Model:   "kev-latest",
+		Latency: 93 * time.Millisecond,
 	})
-	if !ok {
-		t.Fatal("Export returned false for a kept trace")
+	if err != nil {
+		t.Fatal(err)
 	}
 
 	spans := rec.Ended()
@@ -151,29 +150,14 @@ func TestExportKeptTrace(t *testing.T) {
 	}
 }
 
-func TestExportDroppedTraceEmitsNothing(t *testing.T) {
-	exp, rec := newRecorded(t)
-	for _, d := range []policy.Decision{
-		{Scored: true, PKeep: 0.1, PKeepRaw: 0.12, Reason: policy.ReasonBelowThreshold, Severity: policy.SeverityNone},
-		{Reason: policy.ReasonFallback, Severity: policy.SeverityNone},
-	} {
-		if exp.Export(context.Background(), Record{Trace: sampleTrace(), Decision: d, Model: "kev-latest"}) {
-			t.Errorf("Export returned true for a dropped trace (%s)", d.Reason)
-		}
-	}
-	if n := len(rec.Started()); n != 0 {
-		t.Errorf("%d spans started for dropped traces, want 0", n)
-	}
-}
-
 func TestExportFallbackKeepOmitsProbabilities(t *testing.T) {
 	exp, rec := newRecorded(t)
 	tr := trace.Trace{TraceID: "abc", Question: "q", FinalAnswer: "a"}
-	exp.Export(context.Background(), Record{
-		Trace:     tr,
-		Decision:  policy.Decision{Keep: true, Reason: policy.ReasonFallback, Severity: policy.SeverityNormal},
-		Model:     "kev-latest",
-		LatencyMS: 12.5,
+	_ = exp.Send(context.Background(), pipeline.Record{
+		Trace:    tr,
+		Decision: pipeline.Decision{Keep: true, Reason: pipeline.ReasonFallback, Severity: pipeline.SeverityNormal},
+		Model:    "kev-latest",
+		Latency:  time.Duration(12.5 * float64(time.Millisecond)),
 	})
 
 	spans := rec.Ended()
@@ -192,10 +176,10 @@ func TestExportFallbackKeepOmitsProbabilities(t *testing.T) {
 
 func TestEachKeptTraceIsItsOwnTrace(t *testing.T) {
 	exp, rec := newRecorded(t)
-	keep := policy.Decision{Keep: true, Scored: true, PKeep: 0.9, PKeepRaw: 0.9, Reason: policy.ReasonKev, Severity: policy.SeverityHigh}
+	keep := pipeline.Decision{Keep: true, Scored: true, PKeep: 0.9, PKeepRaw: 0.9, Reason: pipeline.ReasonModel, Severity: pipeline.SeverityHigh}
 	tr := trace.Trace{TraceID: "a", Question: "q", FinalAnswer: "a"}
-	exp.Export(context.Background(), Record{Trace: tr, Decision: keep})
-	exp.Export(context.Background(), Record{Trace: tr, Decision: keep})
+	_ = exp.Send(context.Background(), pipeline.Record{Trace: tr, Decision: keep})
+	_ = exp.Send(context.Background(), pipeline.Record{Trace: tr, Decision: keep})
 
 	spans := rec.Ended()
 	if len(spans) != 2 {
@@ -206,59 +190,77 @@ func TestEachKeptTraceIsItsOwnTrace(t *testing.T) {
 	}
 }
 
-// With Phoenix unreachable the export must not panic or block the caller,
-// and the failure must reach the log through the OTel error handler.
-func TestPhoenixDownIsLoggedNotFatal(t *testing.T) {
+// With the back end unreachable the export must not panic or block the
+// caller, and the failure must be reported through the OTel error handler.
+func TestBackendDownIsReportedNotFatal(t *testing.T) {
 	srv := httptest.NewServer(http.NotFoundHandler())
 	url := srv.URL + "/v1/traces"
 	srv.Close()
 
-	var logged atomic.Int32
+	reported := &recordingReporter{}
 	prev := otel.GetErrorHandler()
 	t.Cleanup(func() { otel.SetErrorHandler(prev) })
-	LogErrors(slog.New(slog.NewTextHandler(countWriter{&logged}, nil)))
+	ReportErrors(reported)
 
-	exp, err := NewPhoenix(context.Background(), url, "observer-ai", slog.Default())
+	exp, err := NewOTLPBackend(context.Background(), BackendConfig{Name: "down", Endpoint: url})
 	if err != nil {
-		t.Fatalf("NewPhoenix with Phoenix down: %v", err)
+		t.Fatalf("NewOTLPBackend with the back end down: %v", err)
 	}
-	keep := policy.Decision{Keep: true, Scored: true, PKeep: 0.9, PKeepRaw: 0.9, Reason: policy.ReasonKev, Severity: policy.SeverityHigh}
-	if !exp.Export(context.Background(), Record{Trace: sampleTrace(), Decision: keep, Model: "kev-latest"}) {
-		t.Error("Export returned false for a kept trace")
+	keep := pipeline.Decision{Keep: true, Scored: true, PKeep: 0.9, PKeepRaw: 0.9, Reason: pipeline.ReasonModel, Severity: pipeline.SeverityHigh}
+	if err := exp.Send(context.Background(), pipeline.Record{Trace: sampleTrace(), Decision: keep, Model: "kev-latest"}); err != nil {
+		t.Errorf("Send of a rebuilt trace = %v, want it batched", err)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	_ = exp.Shutdown(ctx) // an error here is fine; a hang or panic is not
-	if logged.Load() == 0 {
-		t.Error("export failure was not logged")
+	if len(reported.all()) == 0 {
+		t.Error("export failure was not reported")
 	}
 }
 
-// The real exporter delivers OTLP to the configured URL path with the
-// resource attributes Phoenix uses to pick the project.
-func TestPhoenixReceivesOTLP(t *testing.T) {
+// The real exporter delivers OTLP to the configured URL path, with its own
+// headers and the configured resource attributes (Phoenix picks the project
+// from openinference.project.name). The global OTEL_EXPORTER_OTLP_HEADERS
+// is ignored, so one back end's credentials never reach another.
+func TestBackendReceivesOTLP(t *testing.T) {
+	t.Setenv("OTEL_EXPORTER_OTLP_HEADERS", "Authorization=leaked,x-global=1")
+	t.Setenv("OTEL_EXPORTER_OTLP_TRACES_HEADERS", "x-global-traces=1")
 	var path, contentType string
+	var header http.Header
 	var body []byte
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		path, contentType = r.URL.Path, r.Header.Get("Content-Type")
+		path, contentType, header = r.URL.Path, r.Header.Get("Content-Type"), r.Header.Clone()
 		body, _ = io.ReadAll(r.Body)
 		w.Header().Set("Content-Type", "application/x-protobuf")
 	}))
 	defer srv.Close()
 
-	exp, err := NewPhoenix(context.Background(), srv.URL+"/v1/traces", "my-project", slog.Default())
+	exp, err := NewOTLPBackend(context.Background(), BackendConfig{
+		Name:               "phoenix",
+		Endpoint:           srv.URL + "/v1/traces",
+		Headers:            map[string]string{"Authorization": "Basic abc"},
+		ResourceAttributes: map[string]string{"openinference.project.name": "my-project"},
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	keep := policy.Decision{Keep: true, Scored: true, PKeep: 0.9, PKeepRaw: 0.9, Reason: policy.ReasonKev, Severity: policy.SeverityHigh}
-	exp.Export(context.Background(), Record{Trace: sampleTrace(), Decision: keep, Model: "kev-latest"})
+	keep := pipeline.Decision{Keep: true, Scored: true, PKeep: 0.9, PKeepRaw: 0.9, Reason: pipeline.ReasonModel, Severity: pipeline.SeverityHigh}
+	if err := exp.Send(context.Background(), pipeline.Record{Trace: sampleTrace(), Decision: keep, Model: "kev-latest"}); err != nil {
+		t.Fatal(err)
+	}
 	if err := exp.Shutdown(context.Background()); err != nil {
 		t.Fatalf("Shutdown: %v", err)
 	}
 
 	if path != "/v1/traces" || contentType != "application/x-protobuf" {
 		t.Errorf("request = %s (%s), want /v1/traces (application/x-protobuf)", path, contentType)
+	}
+	if got := header.Get("Authorization"); got != "Basic abc" {
+		t.Errorf("Authorization = %q, want the back end's own", got)
+	}
+	if header.Get("x-global") != "" || header.Get("x-global-traces") != "" {
+		t.Error("headers from OTEL_EXPORTER_OTLP_*HEADERS were sent")
 	}
 	// Protobuf stores strings as plain bytes, so the attribute names and
 	// values can be checked without decoding the message.
@@ -269,9 +271,20 @@ func TestPhoenixReceivesOTLP(t *testing.T) {
 	}
 }
 
-type countWriter struct{ n *atomic.Int32 }
+// recordingReporter keeps every reported error, for assertions.
+type recordingReporter struct {
+	mu   sync.Mutex
+	errs []error
+}
 
-func (w countWriter) Write(p []byte) (int, error) {
-	w.n.Add(1)
-	return len(p), nil
+func (r *recordingReporter) Report(_ context.Context, err error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.errs = append(r.errs, err)
+}
+
+func (r *recordingReporter) all() []error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]error(nil), r.errs...)
 }

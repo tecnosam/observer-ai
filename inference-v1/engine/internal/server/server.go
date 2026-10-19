@@ -1,14 +1,19 @@
+// Package server exposes the engine over HTTP: an asynchronous intake that
+// publishes to the work queue, a synchronous scoring path, and health
+// checks. It only translates between HTTP and the pipeline; the pipeline
+// itself is in internal/pipeline.
 package server
 
 import (
 	"context"
 	"encoding/json"
 	"errors"
-	"log/slog"
 	"net/http"
 	"time"
 
-	"github.com/observer-ai/engine/internal/queue"
+	"github.com/observer-ai/engine/internal/fault"
+	"github.com/observer-ai/engine/internal/observe"
+	"github.com/observer-ai/engine/internal/pipeline"
 	"github.com/observer-ai/engine/internal/trace"
 )
 
@@ -19,47 +24,29 @@ const (
 	retryAfterSeconds   = "1"
 )
 
-// Publisher puts a validated trace on the work queue. *queue.Queue
-// implements it.
-type Publisher interface {
-	// Publish returns queue.ErrFull when the queue is at its limit.
-	Publish(ctx context.Context, t trace.Trace) error
-	// Ready reports whether the queue can currently be reached.
-	Ready() error
-}
-
 // Options configures a Server.
 type Options struct {
-	Engine *Engine
-	Queue  Publisher
+	Engine   *pipeline.Engine
+	Queue    pipeline.Publisher
+	Reporter observe.Reporter // defaults to observe.Discard
 	// MaxBodyBytes caps a request body; 0 means 8 MiB.
 	MaxBodyBytes int64
-	Logger       *slog.Logger
 }
 
 // Server holds the HTTP handlers.
 type Server struct {
-	engine       *Engine
-	queue        Publisher
-	mux          *http.ServeMux
-	logger       *slog.Logger
-	maxBodyBytes int64
+	opts Options
+	mux  *http.ServeMux
 }
 
 func New(opts Options) *Server {
-	if opts.Logger == nil {
-		opts.Logger = slog.Default()
+	if opts.Reporter == nil {
+		opts.Reporter = observe.Discard
 	}
 	if opts.MaxBodyBytes <= 0 {
 		opts.MaxBodyBytes = defaultMaxBodyBytes
 	}
-	s := &Server{
-		engine:       opts.Engine,
-		queue:        opts.Queue,
-		mux:          http.NewServeMux(),
-		logger:       opts.Logger,
-		maxBodyBytes: opts.MaxBodyBytes,
-	}
+	s := &Server{opts: opts, mux: http.NewServeMux()}
 	s.mux.HandleFunc("POST /v1/traces", s.handleEnqueue)
 	s.mux.HandleFunc("POST /v1/traces:score", s.handleScore)
 	s.mux.HandleFunc("GET /healthz", s.handleHealthz)
@@ -78,18 +65,12 @@ func (s *Server) handleEnqueue(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	switch err := s.queue.Publish(r.Context(), t); {
-	case err == nil:
-		writeJSON(w, http.StatusAccepted, map[string]string{"trace_id": t.TraceID})
-	case errors.Is(err, queue.ErrFull):
-		s.logger.Warn("queue full, rejecting trace", "trace_id", t.TraceID)
-		w.Header().Set("Retry-After", retryAfterSeconds)
-		writeError(w, http.StatusServiceUnavailable, "queue full, retry later")
-	default:
-		s.logger.Error("queue publish failed, rejecting trace", "trace_id", t.TraceID, "error", err.Error())
-		w.Header().Set("Retry-After", retryAfterSeconds)
-		writeError(w, http.StatusServiceUnavailable, "queue unavailable, retry later")
+	if err := s.opts.Queue.Publish(r.Context(), t); err != nil {
+		s.opts.Reporter.Report(r.Context(), fault.New(fault.KindOf(err), fault.Server, "enqueue trace, rejected it", err).WithTrace(t.TraceID))
+		writeFault(w, err)
+		return
 	}
+	writeJSON(w, http.StatusAccepted, map[string]string{"trace_id": t.TraceID})
 }
 
 func (s *Server) handleScore(w http.ResponseWriter, r *http.Request) {
@@ -97,18 +78,23 @@ func (s *Server) handleScore(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	res := s.engine.Process(r.Context(), t)
-	if res.Exported {
-		// Push the spans out now so a demo sees the trace in Phoenix as
-		// soon as the response arrives, not a batch interval later.
-		ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), syncFlushTimeout)
-		defer cancel()
-		if err := s.engine.Exporter.Flush(ctx); err != nil {
-			s.logger.Error("trace export flush failed", "trace_id", t.TraceID, "error", err.Error())
-			res.Exported = false
-		}
+	out := s.opts.Engine.Process(r.Context(), t)
+	if out.Exported {
+		out.Exported = s.flush(r.Context(), t.TraceID)
 	}
-	writeJSON(w, http.StatusOK, res)
+	writeJSON(w, http.StatusOK, resultOf(out))
+}
+
+// flush pushes the kept trace out now, so a demo sees it in the trace store
+// as soon as the response arrives, not a batch interval later.
+func (s *Server) flush(ctx context.Context, traceID string) bool {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), syncFlushTimeout)
+	defer cancel()
+	if err := s.opts.Engine.Flush(ctx); err != nil {
+		s.opts.Reporter.Report(ctx, fault.Unavailable(fault.Server, "flush exported trace", err).WithTrace(traceID))
+		return false
+	}
+	return true
 }
 
 func (s *Server) handleHealthz(w http.ResponseWriter, _ *http.Request) {
@@ -118,30 +104,29 @@ func (s *Server) handleHealthz(w http.ResponseWriter, _ *http.Request) {
 func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), readyTimeout)
 	defer cancel()
-	var problem string
-	if err := s.queue.Ready(); err != nil {
-		problem = "queue is not reachable: " + err.Error()
-	} else if err := s.engine.Scorer.Ready(ctx); err != nil {
-		problem = "kev is not reachable: " + err.Error()
-	}
-	if problem != "" {
+	if problem := s.notReady(ctx); problem != "" {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "unavailable", "error": problem})
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ready"})
 }
 
+func (s *Server) notReady(ctx context.Context) string {
+	if err := s.opts.Queue.Ready(); err != nil {
+		return "queue is not reachable: " + err.Error()
+	}
+	if err := s.opts.Engine.Ready(ctx); err != nil {
+		return "kev is not reachable: " + err.Error()
+	}
+	return ""
+}
+
 // readTrace decodes and validates the request body, assigning a trace ID if
 // the client sent none. On failure it writes the error response.
 func (s *Server) readTrace(w http.ResponseWriter, r *http.Request) (trace.Trace, bool) {
-	t, err := trace.Decode(http.MaxBytesReader(w, r.Body, s.maxBodyBytes))
+	t, err := trace.Decode(http.MaxBytesReader(w, r.Body, s.opts.MaxBodyBytes))
 	if err != nil {
-		var tooLarge *http.MaxBytesError
-		if errors.As(err, &tooLarge) {
-			writeError(w, http.StatusRequestEntityTooLarge, "request body too large")
-			return trace.Trace{}, false
-		}
-		writeError(w, http.StatusBadRequest, err.Error())
+		writeDecodeError(w, err)
 		return trace.Trace{}, false
 	}
 	if t.TraceID == "" {
@@ -149,6 +134,33 @@ func (s *Server) readTrace(w http.ResponseWriter, r *http.Request) (trace.Trace,
 	}
 	t.OTLP = nil // spans come in through the OTLP receivers, not this API
 	return t, true
+}
+
+func writeDecodeError(w http.ResponseWriter, err error) {
+	var tooLarge *http.MaxBytesError
+	if errors.As(err, &tooLarge) {
+		writeError(w, http.StatusRequestEntityTooLarge, "request body too large")
+		return
+	}
+	writeError(w, http.StatusBadRequest, err.Error())
+}
+
+// writeFault answers a failed request with the status its kind calls for.
+// Anything worth retrying gets 503 with Retry-After.
+func writeFault(w http.ResponseWriter, err error) {
+	kind := fault.KindOf(err)
+	switch {
+	case kind == fault.KindFull:
+		w.Header().Set("Retry-After", retryAfterSeconds)
+		writeError(w, http.StatusServiceUnavailable, "queue full, retry later")
+	case fault.Retryable(err):
+		w.Header().Set("Retry-After", retryAfterSeconds)
+		writeError(w, http.StatusServiceUnavailable, "queue unavailable, retry later")
+	case kind == fault.KindInvalid:
+		writeError(w, http.StatusBadRequest, err.Error())
+	default:
+		writeError(w, http.StatusInternalServerError, "internal error")
+	}
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

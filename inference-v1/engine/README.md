@@ -2,11 +2,14 @@
 
 Decides which LLM agent traces are worth keeping for review. For each trace it
 asks a fine-tuned decision model (Kev) whether the final answer is likely
-wrong, applies a keep/drop policy, and exports the kept traces to
-[Arize Phoenix](https://github.com/Arize-ai/phoenix).
+wrong, applies a keep/drop policy, and exports the kept traces over OTLP to
+any number of trace back ends: [Arize Phoenix](https://github.com/Arize-ai/phoenix),
+[Langfuse](https://langfuse.com), an OpenTelemetry Collector, or anything
+else that accepts OTLP/HTTP traces.
 
 Traces arrive as OpenTelemetry spans (OTLP over gRPC or HTTP) or over an HTTP
-JSON API, and wait in a NATS JetStream queue. A worker pool in the same binary
+JSON API, and wait in a queue: in NATS JetStream when `queue.url` is set, or
+in the engine's memory when it is not. A worker pool in the same binary
 pulls them off the queue and does the rest.
 
 ```
@@ -17,20 +20,20 @@ OTLP HTTP :4318 ─┴─> spans stored by trace ID ──> assembled once the t
 POST /v1/traces ──> validate ───────────────────────────────> JetStream stream OBSERVER_TRACES
                                                                                         │
                                                                                         v
-                                             worker pool ──> slice ──> Kev ──> policy ──> Phoenix (kept only)
+                                             worker pool ──> slice ──> Kev ──> policy ──> exporters (kept only)
                                                   │
                                system error, after max_deliver attempts
                                                   v
                                     JetStream stream OBSERVER_TRACES_DLQ
 
-POST /v1/traces:score ──> validate ──> slice ──> Kev ──> policy ──> Phoenix   (no queue)
+POST /v1/traces:score ──> validate ──> slice ──> Kev ──> policy ──> exporters   (no queue)
 ```
 
 ## Setup
 
 Requirements:
 
-- Docker, to run NATS and (optionally) the engine itself
+- Docker, to run Phoenix, NATS (optional, see [Where the queues live](#where-the-queues-live)) and the engine itself
 - Go 1.26 or newer, to build or test outside Docker
 - Python 3, only for regenerating the golden slice files and sending samples
 - A Kev server (not needed for tests). Phoenix runs from the compose file.
@@ -61,7 +64,7 @@ it, or move the compose one with `PHOENIX_PORT` and `PHOENIX_GRPC_PORT`, or
 keep using the host one:
 
 ```sh
-OBSERVER_PHOENIX_ENDPOINT=http://host.docker.internal:6006/v1/traces \
+OBSERVER_EXPORT_ENDPOINT=http://host.docker.internal:6006/v1/traces \
   docker compose up --build -d --no-deps nats observer
 ```
 
@@ -72,7 +75,7 @@ running compose:
 | Variable | Default |
 | --- | --- |
 | `OBSERVER_SCORER_ENDPOINT` | `http://host.docker.internal:8010/v1/systemone` |
-| `OBSERVER_PHOENIX_ENDPOINT` | `http://phoenix:6006/v1/traces` |
+| `OBSERVER_EXPORT_ENDPOINT` | `http://phoenix:6006/v1/traces` (the first exporter) |
 | `PHOENIX_PORT` | `6006` |
 | `PHOENIX_GRPC_PORT` | `4317` |
 | `OBSERVER_MANIFEST_FILE` | `../../finetune/notebooks/runs/observer-kev-0.8b-ft/manifest.json` (mounted into the container) |
@@ -88,10 +91,13 @@ defaults work there.
 ### On the host
 
 ```sh
-make nats     # start only NATS in Docker
 make phoenix  # start only Phoenix in Docker
-make run      # build and start the engine with observer.yaml
+make run      # build and start the engine with observer.yaml, queues in memory
 make test     # go vet + go test -race, fully offline
+
+# Or with the queues in NATS JetStream, as in production:
+make nats
+OBSERVER_NATS_URL=nats://localhost:4222 make run
 ```
 
 `make run` binds 8080, 4317 and 4318. Phoenix, from `make phoenix` or on the
@@ -108,8 +114,8 @@ curl -X POST localhost:8080/v1/traces:score -d @testdata/traces/wrong_river.json
 {"trace_id":"wrong-river-001","decision":"keep","p_keep":0.626,"p_keep_raw":0.6087,"reason":"kev","severity":"normal","model":"kev-latest","latency_ms":78.5,"exported":true}
 ```
 
-The trace then appears in the Phoenix project `observer-ai` with the `eval.*`
-attributes on its root span.
+The trace then appears in the Phoenix project `observer-ai` (the default
+exporter) with the `eval.*` attributes on its root span.
 
 To send a batch of real traces from the labeled evaluation dataset
 (`finetune/notebooks/data/eval/labeled_traces.jsonl`):
@@ -156,7 +162,7 @@ file is loaded.
 | `otlp.span_stream`, `otlp.span_subject` | `OBSERVER_SPANS`, `observer.spans` | Where spans wait, on subject `observer.spans.<trace id>` |
 | `otlp.span_max_age` | `1h` | Spans never assembled are removed after this |
 | `otlp.pending_stream`, `otlp.pending_subject` | `OBSERVER_PENDING`, `observer.pending` | One marker per trace awaiting assembly |
-| `queue.url` | `nats://localhost:4222` | NATS server |
+| `queue.url` | empty | NATS server; empty keeps every queue in memory. See [Where the queues live](#where-the-queues-live) |
 | `queue.connect_timeout` | `30s` | How long to wait for NATS at start-up before exiting |
 | `queue.stream` | `OBSERVER_TRACES` | Work-queue stream |
 | `queue.subject` | `observer.traces` | Subject traces are published to |
@@ -167,7 +173,9 @@ file is loaded.
 | `queue.redelivery_backoff` | `[5s, 30s, 2m, 5m]` | Delay before each redelivery; the last value repeats |
 | `queue.dlq_stream` | `OBSERVER_TRACES_DLQ` | Dead-letter stream |
 | `queue.dlq_subject` | `observer.traces.dlq` | Dead-letter subject |
-| `queue.dlq_max_age` | `168h` | How long dead letters are kept |
+| `queue.dlq_max_age` | `168h` | How long dead letters (traces and exports) are kept |
+| `queue.export_stream`, `queue.export_subject` | `OBSERVER_EXPORTS`, `observer.exports` | Each exporter's queue on NATS: stream `OBSERVER_EXPORTS_<NAME>`, subject `observer.exports.<name>` |
+| `queue.export_dlq_stream`, `queue.export_dlq_subject` | `OBSERVER_EXPORTS_DLQ`, `observer.exports_dlq` | Where exports given up on go, on NATS |
 | `scorer.kind` | `kev` | `kev` for a Kev server, `jev` for TypeSafe's hosted Jev |
 | `scorer.api_key_env` | `JEV_API_KEY` for `jev`, unset for `kev` | Environment variable holding the scorer's API key, sent as a bearer token. Start-up fails if it names an unset variable |
 | `scorer.endpoint` | `http://localhost:8010/v1/systemone` | Kev endpoint |
@@ -180,8 +188,17 @@ file is loaded.
 | `policy.keep_threshold` | `0.5` | Keep when calibrated `p_keep` reaches this |
 | `policy.random_floor` | `0.02` | Share of below-threshold traces kept at random |
 | `alert.severity_high` | `0.8` | `p_keep` at which a kept trace is `high` severity |
-| `export.phoenix_endpoint` | `http://localhost:6006/v1/traces` | Phoenix OTLP/HTTP URL, including the path |
-| `export.project` | `observer-ai` | Phoenix project |
+| `observability.error_sinks` | `[{kind: stdout}]` | Where the engine's own errors are written, one JSON object per line: `stdout`, and/or `file` with a `path` |
+| `exporters` | one Phoenix at `http://localhost:6006/v1/traces` | The trace back ends kept traces go to; see [Exporters](#exporters). An empty list exports nothing |
+| `exporters[].name` | (required) | Names the back end in logs, errors and its NATS stream: letters, digits, `-`, `_`; unique |
+| `exporters[].endpoint` | (required) | OTLP/HTTP traces URL, including the path |
+| `exporters[].headers` | none | Headers sent as written. Keep secrets out of the file |
+| `exporters[].headers_env` | none | Environment variable holding more headers, as `key=value,key2=value2`. Start-up fails if it is unset |
+| `exporters[].resource_attributes` | none | Resource attributes added to every span sent to this back end |
+| `exporters[].queue_size` | `1024` | Kept traces waiting for this back end; past it a trace is skipped for it and the skip reported |
+| `exporters[].concurrency` | `4` | Traces sent to this back end at once |
+| `exporters[].max_deliver` | `3` | Tries before the exporter gives up on a trace |
+| `exporters[].backoff` | `[1s, 5s, 30s]` | Wait before each retry; the last value repeats |
 
 Environment overrides:
 
@@ -189,13 +206,14 @@ Environment overrides:
 | --- | --- |
 | `OBSERVER_NATS_URL` | `queue.url` |
 | `OBSERVER_SCORER_ENDPOINT` | `scorer.endpoint` |
-| `OBSERVER_PHOENIX_ENDPOINT` | `export.phoenix_endpoint` |
+| `OBSERVER_EXPORT_ENDPOINT` | `exporters[0].endpoint` |
 | `OBSERVER_MANIFEST` | `scorer.manifest` |
 | `OBSERVER_OTLP_GRPC_ADDR` | `otlp.grpc_addr` |
 | `OBSERVER_OTLP_HTTP_ADDR` | `otlp.http_addr` |
 
-The standard OpenTelemetry variables also apply to the exporter, for example
-`OTEL_EXPORTER_OTLP_HEADERS` for a Phoenix API key.
+The standard `OTEL_EXPORTER_OTLP_HEADERS` and `OTEL_EXPORTER_OTLP_TRACES_HEADERS`
+are not read: each exporter sends only its own headers, so one back end's
+credentials never reach another. Use `headers_env` instead.
 
 The engine validates the config at start-up and exits with a clear error if:
 
@@ -231,9 +249,10 @@ point at it as if it were a collector:
 | gRPC | `:4317` | `opentelemetry.proto.collector.trace.v1.TraceService/Export`, gzip accepted |
 | HTTP | `:4318`, `POST /v1/traces` | `application/x-protobuf` or `application/json`, gzip accepted, 16 MiB limit |
 
-An export is answered with success as soon as NATS has confirmed the spans
-are stored, typically within a few milliseconds. If NATS cannot take them the
-answer is gRPC `UNAVAILABLE` or HTTP 503, which OTLP exporters retry.
+An export is answered with success as soon as the spans are stored (in NATS,
+once it has confirmed them, typically within a few milliseconds). If they
+cannot be stored the answer is gRPC `UNAVAILABLE` or HTTP 503, which OTLP
+exporters retry.
 
 ### Connecting an agent or service
 
@@ -291,8 +310,8 @@ curl -i http://localhost:4318/v1/traces -H 'Content-Type: application/json' -d '
 ```
 
 It answers `200 {}`. The decision appears in the engine's log about
-`otlp.idle_timeout` (10s) later, and the trace shows up in Phoenix if it was
-kept.
+`otlp.idle_timeout` (10s) later, and the trace shows up in your exporters
+(Phoenix by default) if it was kept.
 
 ### From spans to a decision
 
@@ -308,10 +327,10 @@ kept.
 4. **Queue, score, decide.** The record goes to `OBSERVER_TRACES` and from
    there everything is as for a JSON trace, including redelivery and the
    dead-letter stream.
-5. **Forward.** A kept trace is sent to Phoenix as its original spans, with
-   the original trace and span IDs, under the project `export.project`, with
-   the `eval.*` attributes added to the root span. A dropped trace is sent
-   nowhere and its spans are deleted.
+5. **Forward.** A kept trace is sent to every exporter as its original spans,
+   with the original trace and span IDs, the exporter's
+   `resource_attributes`, and the `eval.*` attributes added to the root
+   span. A dropped trace is sent nowhere and its spans are deleted.
 
 Because of step 2, a decision arrives at least `otlp.idle_timeout` after the
 trace's last span.
@@ -375,8 +394,9 @@ trace yields through the JSON API. A test checks this for every fixture, and
 
 ### `POST /v1/traces`
 
-Stores a trace in the queue. The 202 is sent only after NATS has confirmed
-the trace, so an accepted trace survives a restart of the engine.
+Stores a trace in the queue. On NATS the 202 is sent only after NATS has
+confirmed the trace, so an accepted trace survives a restart of the engine.
+In memory it survives only as long as the process.
 
 ```json
 {
@@ -406,7 +426,7 @@ the trace, so an accepted trace survives a restart of the engine.
 
 Same input, processed synchronously without the queue. Meant for testing and
 demos. It returns the decision and flushes the export, so the trace is in
-Phoenix when the response arrives.
+every exporter's back end when the response arrives.
 
 ```json
 {
@@ -430,7 +450,7 @@ Phoenix when the response arrives.
 | `reason` | `kev`, `random_floor`, `below_threshold` or `fallback` |
 | `severity` | `high`, `normal` or `none` |
 | `latency_ms` | Kev's reported latency; the measured time if Kev reports none or on fallback |
-| `exported` | The trace was kept and its flush to Phoenix did not fail |
+| `exported` | The trace was kept, queued to at least one exporter, and the flush of every exporter did not fail |
 
 ### API docs: `GET /docs` and `GET /openapi.yaml`
 
@@ -445,7 +465,7 @@ status code or a field of the decision response goes missing from it.
 ### `GET /healthz` and `GET /readyz`
 
 `/healthz` returns 200 whenever the process is up. `/readyz` returns 200 only
-if the NATS connection is up and Kev answers `GET /v1/models` on the scorer
+if the queue is up (the NATS connection, when NATS is used) and Kev answers `GET /v1/models` on the scorer
 host within 2 seconds, and 503 otherwise.
 
 ## How a decision is made
@@ -464,7 +484,7 @@ host within 2 seconds, and 503 otherwise.
 5. **Severity.** `high` if kept and `p_keep >= alert.severity_high`, `normal`
    for other keeps, `none` for drops. This version only records severity; it
    sends no alerts.
-6. **Export.** Kept traces go to Phoenix. Each decision produces one JSON log
+6. **Export.** Kept traces are queued to every exporter. Each decision produces one JSON log
    line with `trace_id`, `decision`, `p_keep`, `reason` and `latency_ms`.
 
 ### When Kev cannot score a trace
@@ -480,6 +500,26 @@ The random fallback keeps the trace with probability `random_floor` and drops
 it otherwise, with reason `fallback` either way.
 
 ## The queue
+
+### Where the queues live
+
+The engine has three kinds of queue: the trace work queue with its
+dead-letter stream, the store where OTLP spans wait to be assembled, and one
+export queue per exporter. `queue.url` decides where all of them live:
+
+| `queue.url` | Broker | Survives a restart | Shared by replicas | Dead letters |
+| --- | --- | --- | --- | --- |
+| empty (the default) | in process | no | no, each engine works alone | reported to the error sinks, not stored |
+| `nats://...` or `tls://...` (`OBSERVER_NATS_URL`) | NATS JetStream | yes | yes, through the durable consumers | stored in the DLQ streams, replayable |
+
+Both follow the same rules: a bounded queue (`queue.max_messages`,
+`exporters[].queue_size`), redelivery with backoff up to a delivery limit,
+then a dead letter; spans assembled after `otlp.idle_timeout` of quiet or
+`otlp.max_wait`. Memory suits trying the engine and single-instance setups
+that can lose a few in-flight traces; use NATS for anything that must not.
+Docker Compose sets `OBSERVER_NATS_URL`, so the compose stack uses NATS.
+
+The rest of this section describes NATS.
 
 - **Stream** `OBSERVER_TRACES` uses work-queue retention on file storage: a
   trace is removed once a worker acknowledges it. A full stream refuses new
@@ -506,6 +546,8 @@ it otherwise, with reason `fallback` either way.
 | `OBSERVER_PENDING` | One marker per trace awaiting assembly | The trace is assembled |
 | `OBSERVER_TRACES` | Traces waiting to be scored | A worker acknowledges the trace |
 | `OBSERVER_TRACES_DLQ` | Traces that hit system errors | After `queue.dlq_max_age` |
+| `OBSERVER_EXPORTS_<NAME>` | Kept traces waiting for one exporter (its name upper-cased, `-` as `_`) | The exporter sends the trace, or gives up on it |
+| `OBSERVER_EXPORTS_DLQ` | Kept traces an exporter gave up on, with headers `Observer-Exporter`, `Observer-Dead-Error`, `Observer-Deliveries` | After `queue.dlq_max_age` |
 
 ### Redelivery and the dead-letter stream
 
@@ -550,37 +592,122 @@ nats stream purge OBSERVER_TRACES_DLQ          # clear the dead letters
 NATS monitoring is at http://localhost:8222 (`/jsz?streams=true` for stream
 and consumer counts).
 
-## What Phoenix receives
+## Exporters
+
+Kept traces go to every back end in `exporters`, over OTLP/HTTP. The default
+is the local Phoenix:
+
+```yaml
+exporters:
+  - name: phoenix
+    endpoint: http://localhost:6006/v1/traces
+    resource_attributes:
+      openinference.project.name: observer-ai   # the Phoenix project
+```
+
+Add more entries to send to more back ends. Langfuse, for example, takes
+Basic auth built from its public and secret keys
+([`../examples/langfuse.yaml`](../examples/langfuse.yaml)):
+
+```yaml
+  - name: langfuse
+    endpoint: https://cloud.langfuse.com/api/public/otel/v1/traces
+    headers_env: LANGFUSE_OTLP_HEADERS
+```
+
+```sh
+export LANGFUSE_OTLP_HEADERS="Authorization=Basic%20$(printf '%s' "pk-lf-...:sk-lf-..." | base64)"
+```
+
+**Headers.** An exporter's headers are its `headers`, plus those parsed from
+the variable `headers_env` names, which win on a name clash. The variable
+uses the OpenTelemetry format: `key=value` pairs separated by commas, values
+percent-encoded where needed (`%20` for a space). The engine logs exporter
+names and endpoints, never header values, and a header that fails to parse
+is reported without its value.
+
+**Asynchronous.** Exporting never holds up scoring. Each exporter has its own
+bounded queue (`queue_size`) and its own workers (`concurrency`); a kept
+trace is queued to every exporter and the worker moves on. The queue is in
+NATS JetStream when `queue.url` is set (stream `OBSERVER_EXPORTS_<NAME>`, so
+queued exports survive a restart), else in memory; see
+[Where the queues live](#where-the-queues-live). A slow or unreachable back
+end only fills its own queue: past `queue_size`, traces are skipped for that
+back end alone and each skip is reported to the error sinks (`kind=full`,
+`exporter=<name>`). The decision log's `exported` field says whether at least
+one exporter queued the trace.
+
+**Retries.** A failed send is retried after `backoff` (default 1s, 5s, 30s),
+up to `max_deliver` tries (default 3); each retry is reported. Then the
+exporter gives up: the trace is reported as a severe error and, on NATS,
+moved to `OBSERVER_EXPORTS_DLQ` with the exporter's name, from where it can be
+replayed. An error a retry cannot fix (corrupt stored spans) is given up at
+once. Export failures never send the trace to the trace dead-letter stream:
+it was scored, only its delivery failed.
+
+**Shutdown.** In memory, the engine sends what is queued, within 10 seconds.
+On NATS it stops after the sends in flight; the rest stays queued for the
+next start.
+
+`/v1/traces:score` waits until every exporter has sent its trace before it
+answers, so its `exported` field covers all of them.
+
+### What the back ends receive
+
+The engine writes [OpenInference](https://github.com/Arize-ai/openinference)
+attributes, which Phoenix reads natively and Langfuse and other OTLP back
+ends show as span attributes, plus its own `eval.*` and `observer.*`
+attributes.
 
 **A kept trace that arrived over OTLP** is forwarded as its own spans: same
 trace ID, span IDs, names, timings and attributes. Two things change: the
-resource's `openinference.project.name` is set to `export.project`, and the
-root span gains `eval.decision`, `eval.p_keep`, `eval.p_keep_raw`,
-`eval.reason`, `eval.severity`, `eval.model` and `eval.latency_ms`. The
-forward is synchronous, so the decision log's `exported` field says whether
-Phoenix accepted it.
+exporter's `resource_attributes` are set on every resource (replacing
+attributes of the same name), and the root span gains the decision
+attributes below. The agent's own `service.name` is kept.
 
 **A kept trace from the JSON API** has no spans of its own, so the engine
-builds them. Resource attributes: `service.name=observer-engine` and
-`openinference.project.name=<export.project>`.
+builds them, as a new trace with a generated trace ID. Resource:
+`service.name=observer-engine` plus the exporter's `resource_attributes`.
+A root span `agent_run`, and one child span per tool call, named after the
+tool.
 
-Per kept trace, a root span `agent_run`:
+Root span attributes:
 
-- `openinference.span.kind=AGENT`, `input.value` (question), `output.value` (final answer)
-- `observer.source_trace_id`, and `observer.evidence.<i>` for each evidence item (0-based, untruncated)
-- `eval.decision`, `eval.p_keep`, `eval.p_keep_raw`, `eval.reason`,
-  `eval.severity`, `eval.model`, `eval.latency_ms`
-  (`eval.p_keep` and `eval.p_keep_raw` are omitted on a fallback keep)
+| Attribute | Type | Set on | Value |
+| --- | --- | --- | --- |
+| `openinference.span.kind` | string | rebuilt | `AGENT` |
+| `input.value` | string | rebuilt | The question |
+| `output.value` | string | rebuilt | The final answer |
+| `observer.source_trace_id` | string | rebuilt | The client's `trace_id` |
+| `observer.evidence.<i>` | string | rebuilt | Each evidence item, 0-based, untruncated |
+| `eval.decision` | string | both | `keep` (dropped traces are not exported) |
+| `eval.reason` | string | both | Why: `kev` (the model), `random_floor`, or `fallback` (the model could not score it) |
+| `eval.severity` | string | both | `high` or `normal` |
+| `eval.model` | string | both | The scorer model that decided |
+| `eval.latency_ms` | double | both | Scoring time in milliseconds |
+| `eval.p_keep` | double | both | Calibrated probability the answer is wrong; omitted on a fallback keep |
+| `eval.p_keep_raw` | double | both | The model's probability before calibration; omitted on a fallback keep |
 
-and one child span per tool call, named after the tool:
-`openinference.span.kind=TOOL`, `tool.name`, `input.value` (args as JSON),
-`output.value` (status).
+Tool span attributes (rebuilt traces only; forwarded tool spans are not
+changed):
 
-Spans go through a batch span processor and are flushed on shutdown. The
-client's `trace_id` is recorded as `observer.source_trace_id`; the OTel trace
-ID is generated. If Phoenix is unreachable the engine keeps running and logs
-`trace export failed`; those spans are not retried later, and a Phoenix
-outage does not send traces to the dead-letter stream.
+| Attribute | Type | Value |
+| --- | --- | --- |
+| `openinference.span.kind` | string | `TOOL` |
+| `tool.name` | string | The tool's name |
+| `input.value` | string | Its arguments, as compact JSON; omitted when there are none |
+| `output.value` | string | Its status |
+
+Resource attributes worth setting per back end:
+
+| Attribute | Back end | Effect |
+| --- | --- | --- |
+| `openinference.project.name` | Phoenix | The project the traces are filed under |
+| `deployment.environment` | any | Lets you filter production from staging |
+| `service.version` | any | The agent version the traces came from |
+
+Rebuilt spans go through a batch span processor per exporter; forwarded spans
+are sent at once, with a 10-second timeout per attempt.
 
 ## The slice and its golden files
 
@@ -637,11 +764,13 @@ These are open problems in the current version, not design choices to rely on.
   any model name, so a Kev serving a different model than the manifest
   describes goes unnoticed, and the manifest's temperature is applied to it
   anyway.
-- **Kept traces are lost if Phoenix is down.** A failed export is logged
-  (`trace export failed`) and the trace is still acknowledged: it is not
-  retried and does not go to the dead-letter stream. For JSON traces the
-  failure is only seen after the fact, in the exporter's batch. For OTLP
-  traces the forward is synchronous and retried for about 15 seconds first.
+- **An exporter can lose kept traces.** A trace skipped because the
+  exporter's queue was full is not sent to that back end. One it gave up on
+  after `max_deliver` tries is lost in memory mode; on NATS it waits in
+  `OBSERVER_EXPORTS_DLQ`.
+- **In memory mode, a crash loses queued work.** Traces waiting to be scored,
+  spans waiting to be assembled and traces waiting to be exported live only
+  in the process. Use NATS (`queue.url`) where that matters.
 - **Plain instrumentor spans do not reproduce the training slice exactly.**
   See [Matching what the model was trained on](#matching-what-the-model-was-trained-on).
   The test agent does not set the `observer.*` attributes yet, so its traces
@@ -656,7 +785,7 @@ These are open problems in the current version, not design choices to rely on.
   4317 or 4318 can submit spans.
 - **A trace can be scored and exported twice.** Delivery is at least once and
   nothing deduplicates: a worker that dies between exporting and acknowledging
-  leaves a duplicate in Phoenix. The same happens if a client retries a
+  leaves a duplicate in the back ends. The same happens if a client retries a
   `POST /v1/traces` that had in fact succeeded.
 - **NATS has no authentication.** Anyone who can reach port 4222 can read,
   publish or delete traces. The compose file binds it to loopback, which is
@@ -669,7 +798,8 @@ stops pulling from the queue, and lets in-flight traces finish for up to
 `server.shutdown_timeout`. Spans not yet assembled and traces still queued
 stay in JetStream for the next start. If the timeout runs out, in-flight Kev calls are cancelled and those
 traces go back to the queue; they are not dead-lettered and get no fallback
-decision. Last, the exporter is flushed (up to 10 seconds).
+decision. Last, the exporters send the traces still queued for them and
+shut down (up to 10 seconds in all).
 
 ## Tests
 
@@ -682,14 +812,18 @@ itself, not a fake.
 
 ```
 cmd/observer/      flags, config load, wiring, graceful shutdown
+internal/pipeline/ the core: domain types, interfaces, calibration, the Engine
+internal/fault/    the error type: kind, component, operation, trace
+internal/observe/  the error pipeline and its sinks (stdout, file)
+internal/metrics/  metrics recorders (no-op for now)
 internal/config/   settings and manifest: loaders, compiler, validation, defaults
 internal/trace/    trace types, BuildState, Python repr
 internal/scorer/   Kev client, retries, calibration, error classification
 internal/policy/   keep/drop decision, random floor, severity
 internal/otlp/     OTLP gRPC and HTTP receivers, span-to-trace mapping
 internal/queue/    JetStream streams, publisher, span assembly, worker pool, dead-lettering
-internal/export/   Phoenix exporter (OTLP over HTTP)
-internal/server/   HTTP handlers, the pipeline, OpenAPI spec
+internal/export/   exporters: the async dispatcher and the OTLP/HTTP back end
+internal/server/   HTTP handlers and the OpenAPI spec
 testdata/          trace fixtures, golden slices, fake Kev responses
 scripts/           send_samples.py: post dataset traces to a running engine
 Dockerfile         multi-stage build of the engine image
@@ -707,7 +841,7 @@ nats.conf          NATS server settings (JetStream, 8 MB message limit)
 | `make build` | Build `bin/observer` |
 | `make test` | `go vet ./...` and `go test -race ./...` |
 | `make run` | Build and run on the host with `observer.yaml` (`CONFIG=path` to override) |
-| `make nats` | Start only NATS in Docker, for `make run` |
+| `make nats` | Start only NATS in Docker, for `OBSERVER_NATS_URL=nats://localhost:4222 make run` |
 | `make up` / `make down` | Start or stop the engine and NATS in Docker |
 | `make logs` | Follow the engine container's log |
 | `make dlq` | Show the dead-letter stream's state |

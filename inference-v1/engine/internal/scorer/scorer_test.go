@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
-	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -15,6 +14,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/observer-ai/engine/internal/fault"
 )
 
 const questions = `{"answer_wrong":{"type":"noul","instructions":"Is the final answer wrong?"},"answers_question":{"type":"score","instructions":"How good?","criteria":["Wrong","Fully correct"]}}`
@@ -62,7 +63,6 @@ func newClient(t *testing.T, endpoint string, mutate func(*Config)) (*Client, *s
 		Timeout:          2 * time.Second,
 		MaxRetries:       3,
 		Backoff:          []time.Duration{500 * time.Millisecond, 2 * time.Second, 5 * time.Second},
-		Logger:           slog.New(slog.NewTextHandler(io.Discard, nil)),
 		Sleep:            rec.sleep,
 		Jitter:           func() float64 { return 0.5 },
 	}
@@ -98,7 +98,7 @@ func TestScoreSuccess(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res.PRaw != 0.93 || res.Model != "kev-latest" || res.LatencyMS != 93 || res.Attempts != 1 {
+	if res.Raw != 0.93 || res.Model != "kev-latest" || res.Latency != 93*time.Millisecond || res.Attempts != 1 {
 		t.Errorf("result = %+v", res)
 	}
 	if method != http.MethodPost || path != "/v1/systemone" || contentType != "application/json" {
@@ -127,7 +127,7 @@ func TestScoreJevCompatibleLatency(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res.PRaw != 0.71 || res.LatencyMS != 57.25 || res.Model != "jev-latest" {
+	if res.Raw != 0.71 || res.Latency != 57250*time.Microsecond || res.Model != "jev-latest" {
 		t.Errorf("result = %+v", res)
 	}
 }
@@ -169,8 +169,8 @@ func TestScoreMeasuresLatencyWhenServerReportsNone(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res.LatencyMS <= 0 {
-		t.Errorf("latency = %v, want a measured value", res.LatencyMS)
+	if res.Latency <= 0 {
+		t.Errorf("latency = %v, want a measured value", res.Latency)
 	}
 	if res.Model != "kev-latest" {
 		t.Errorf("model = %q, want the configured model as fallback", res.Model)
@@ -193,7 +193,7 @@ func TestScoreTimeoutIsRetried(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res.Attempts != 2 || res.PRaw != 0.93 {
+	if res.Attempts != 2 || res.Raw != 0.93 {
 		t.Errorf("result = %+v, want success on attempt 2", res)
 	}
 	if len(rec.delays) != 1 {
@@ -288,8 +288,8 @@ func TestScoreAllRetriesFail(t *testing.T) {
 	if !errors.As(err, &status) || status.Code != 500 {
 		t.Errorf("error = %v, want it to wrap the last 500", err)
 	}
-	if !strings.Contains(err.Error(), "giving up after 5 attempts") {
-		t.Errorf("error = %v", err)
+	if e, ok := fault.As(err); !ok || e.Attrs["attempts"] != 5 {
+		t.Errorf("error = %v, want it to record 5 attempts", err)
 	}
 	if calls.Load() != 5 || res.Attempts != 5 {
 		t.Errorf("calls = %d, attempts = %d, want 5 (1 + 4 retries)", calls.Load(), res.Attempts)
@@ -440,43 +440,44 @@ func TestNewRejectsBadConfig(t *testing.T) {
 	}
 }
 
-func TestIsSystemError(t *testing.T) {
+// classify decides between "retry later" and "this request will never work".
+func TestClassify(t *testing.T) {
 	tests := []struct {
 		name string
 		err  error
-		want bool
+		want fault.Kind
 	}{
-		{"nil", nil, false},
-		{"connection refused", errors.New("dial tcp: connection refused"), true},
-		{"timeout", context.DeadlineExceeded, true},
-		{"500", &StatusError{Code: 500}, true},
-		{"503", &StatusError{Code: 503}, true},
-		{"404 model or route missing", &StatusError{Code: 404}, true},
-		{"429", &StatusError{Code: 429}, true},
-		{"401", &StatusError{Code: 401}, true},
-		{"malformed response", permanent(errors.New("decode kev response")), true},
-		{"400", &StatusError{Code: 400}, false},
-		{"413", &StatusError{Code: 413}, false},
-		{"422", &StatusError{Code: 422}, false},
+		{"connection refused", errors.New("dial tcp: connection refused"), fault.KindUnavailable},
+		{"timeout", context.DeadlineExceeded, fault.KindTimeout},
+		{"500", &StatusError{Code: 500}, fault.KindUnavailable},
+		{"503", &StatusError{Code: 503}, fault.KindUnavailable},
+		{"404 model or route missing", &StatusError{Code: 404}, fault.KindUnavailable},
+		{"429", &StatusError{Code: 429}, fault.KindUnavailable},
+		{"401", &StatusError{Code: 401}, fault.KindUnavailable},
+		{"malformed response", permanent(errors.New("decode kev response")), fault.KindUnavailable},
+		{"400", &StatusError{Code: 400}, fault.KindRejected},
+		{"413", &StatusError{Code: 413}, fault.KindRejected},
+		{"422", &StatusError{Code: 422}, fault.KindRejected},
 	}
 	for _, tt := range tests {
-		if got := IsSystemError(tt.err); got != tt.want {
-			t.Errorf("IsSystemError(%s) = %v, want %v", tt.name, got, tt.want)
+		if got := classify(tt.err); got.Kind != tt.want || got.Component != fault.Scorer {
+			t.Errorf("classify(%s) = %s from %s, want %s", tt.name, got.Kind, got.Component, tt.want)
 		}
 	}
 }
 
-// The classification must survive the wrapping Score adds.
-func TestIsSystemErrorOnScoreErrors(t *testing.T) {
-	for code, want := range map[int]bool{500: true, 422: false} {
+// Score returns the classified error, with the number of attempts made.
+func TestScoreErrorsAreClassified(t *testing.T) {
+	for code, want := range map[int]fault.Kind{500: fault.KindUnavailable, 422: fault.KindRejected} {
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(code)
 		}))
 		c, _ := newClient(t, srv.URL, func(cfg *Config) { cfg.MaxRetries = 1 })
 		_, err := c.Score(context.Background(), "s")
 		srv.Close()
-		if got := IsSystemError(err); got != want {
-			t.Errorf("HTTP %d: IsSystemError(%v) = %v, want %v", code, err, got, want)
+		e, ok := fault.As(err)
+		if !ok || e.Kind != want || e.Attrs["attempts"] == nil {
+			t.Errorf("HTTP %d: error = %v (%+v), want kind %s with attempts", code, err, e, want)
 		}
 	}
 }

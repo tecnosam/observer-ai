@@ -36,7 +36,7 @@ func TestDecodeEmptyFinalAnswer(t *testing.T) {
 	if tr.Question != "q" || tr.FinalAnswer != "" {
 		t.Errorf("got %q / %q", tr.Question, tr.FinalAnswer)
 	}
-	if got := BuildState(tr); !strings.HasSuffix(got, "FINAL ANSWER:\n") {
+	if got := string(BuildState(tr)); !strings.HasSuffix(got, "FINAL ANSWER:\n") {
 		t.Errorf("state ends %q, want an empty final answer", got[len(got)-20:])
 	}
 }

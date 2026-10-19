@@ -1,6 +1,10 @@
 package policy
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/observer-ai/engine/internal/pipeline"
+)
 
 var testConfig = Config{KeepThreshold: 0.5, RandomFloor: 0.02, SeverityHigh: 0.8}
 
@@ -22,21 +26,21 @@ func fixed(t *testing.T, values ...float64) (rnd func() float64, draws *int) {
 func TestDecide(t *testing.T) {
 	tests := []struct {
 		name      string
-		pKeep     float64
+		pKeep     pipeline.Probability
 		draw      []float64 // values the random source will return
 		wantKeep  bool
-		wantWhy   string
-		wantSev   string
+		wantWhy   pipeline.Reason
+		wantSev   pipeline.Severity
 		wantDraws int
 	}{
-		{"kev keep, high severity", 0.93, nil, true, ReasonKev, SeverityHigh, 0},
-		{"kev keep at severity boundary", 0.8, nil, true, ReasonKev, SeverityHigh, 0},
-		{"kev keep, normal severity", 0.65, nil, true, ReasonKev, SeverityNormal, 0},
-		{"kev keep at threshold", 0.5, nil, true, ReasonKev, SeverityNormal, 0},
-		{"random-floor keep", 0.1, []float64{0.01}, true, ReasonRandomFloor, SeverityNormal, 1},
-		{"drop just below threshold", 0.4999, []float64{0.5}, false, ReasonBelowThreshold, SeverityNone, 1},
-		{"drop at floor boundary", 0.1, []float64{0.02}, false, ReasonBelowThreshold, SeverityNone, 1},
-		{"drop", 0.1, []float64{0.9}, false, ReasonBelowThreshold, SeverityNone, 1},
+		{"kev keep, high severity", 0.93, nil, true, pipeline.ReasonModel, pipeline.SeverityHigh, 0},
+		{"kev keep at severity boundary", 0.8, nil, true, pipeline.ReasonModel, pipeline.SeverityHigh, 0},
+		{"kev keep, normal severity", 0.65, nil, true, pipeline.ReasonModel, pipeline.SeverityNormal, 0},
+		{"kev keep at threshold", 0.5, nil, true, pipeline.ReasonModel, pipeline.SeverityNormal, 0},
+		{"random-floor keep", 0.1, []float64{0.01}, true, pipeline.ReasonRandomFloor, pipeline.SeverityNormal, 1},
+		{"drop just below threshold", 0.4999, []float64{0.5}, false, pipeline.ReasonBelowThreshold, pipeline.SeverityNone, 1},
+		{"drop at floor boundary", 0.1, []float64{0.02}, false, pipeline.ReasonBelowThreshold, pipeline.SeverityNone, 1},
+		{"drop", 0.1, []float64{0.9}, false, pipeline.ReasonBelowThreshold, pipeline.SeverityNone, 1},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -61,11 +65,11 @@ func TestFallback(t *testing.T) {
 	p := New(testConfig, rnd)
 
 	keep := p.Fallback()
-	if !keep.Keep || keep.Reason != ReasonFallback || keep.Severity != SeverityNormal || keep.Scored {
+	if !keep.Keep || keep.Reason != pipeline.ReasonFallback || keep.Severity != pipeline.SeverityNormal || keep.Scored {
 		t.Errorf("fallback keep = %+v", keep)
 	}
 	drop := p.Fallback()
-	if drop.Keep || drop.Reason != ReasonFallback || drop.Severity != SeverityNone || drop.Scored {
+	if drop.Keep || drop.Reason != pipeline.ReasonFallback || drop.Severity != pipeline.SeverityNone || drop.Scored {
 		t.Errorf("fallback drop = %+v", drop)
 	}
 }
@@ -80,7 +84,7 @@ func TestRandomFloorExtremes(t *testing.T) {
 	}
 
 	always := New(Config{KeepThreshold: 0.5, RandomFloor: 1, SeverityHigh: 0.8}, func() float64 { return 0.999999 })
-	if d := always.Decide(0.1, 0.1); !d.Keep || d.Reason != ReasonRandomFloor {
+	if d := always.Decide(0.1, 0.1); !d.Keep || d.Reason != pipeline.ReasonRandomFloor {
 		t.Errorf("random_floor 1 dropped a trace: %+v", d)
 	}
 }
@@ -89,7 +93,7 @@ func TestRandomFloorExtremes(t *testing.T) {
 // high severity: severity depends only on p_keep.
 func TestSeverityFollowsPKeep(t *testing.T) {
 	p := New(Config{KeepThreshold: 0.9, RandomFloor: 1, SeverityHigh: 0.6}, func() float64 { return 0 })
-	if d := p.Decide(0.7, 0.7); d.Reason != ReasonRandomFloor || d.Severity != SeverityHigh {
+	if d := p.Decide(0.7, 0.7); d.Reason != pipeline.ReasonRandomFloor || d.Severity != pipeline.SeverityHigh {
 		t.Errorf("decision = %+v, want a high-severity random_floor keep", d)
 	}
 }

@@ -18,6 +18,7 @@ import (
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 
+	"github.com/observer-ai/engine/internal/fault"
 	"github.com/observer-ai/engine/internal/queue"
 	"github.com/observer-ai/engine/internal/queue/queuetest"
 	"github.com/observer-ai/engine/internal/trace"
@@ -77,7 +78,7 @@ func setup(t *testing.T, mutate func(*queue.Config)) *fixture {
 }
 
 // start runs workers and stops them when the test ends.
-func (f *fixture) start(t *testing.T, n int, h queue.Handler) *queue.Workers {
+func (f *fixture) start(t *testing.T, n int, h queue.Handler) queue.Stopper {
 	t.Helper()
 	w := f.q.StartWorkers(n, h)
 	t.Cleanup(func() {
@@ -181,7 +182,7 @@ func TestPublishedTraceBuildsTheSameState(t *testing.T) {
 	f.start(t, 3, func(_ context.Context, tr trace.Trace) error {
 		mu.Lock()
 		defer mu.Unlock()
-		got[tr.TraceID] = trace.BuildState(tr)
+		got[tr.TraceID] = string(trace.BuildState(tr))
 		return nil
 	})
 	eventually(t, "all traces to be processed", func() bool {
@@ -331,8 +332,8 @@ func TestPublishWhenStreamIsFull(t *testing.T) {
 	mustPublish(t, f.q, sample("t2"))
 
 	err := f.q.Publish(context.Background(), sample("t3"))
-	if !errors.Is(err, queue.ErrFull) {
-		t.Fatalf("Publish to a full stream = %v, want ErrFull", err)
+	if fault.KindOf(err) != fault.KindFull {
+		t.Fatalf("Publish to a full stream = %v, want a full fault", err)
 	}
 	if n := f.messages(t, f.cfg.Stream); n != 2 {
 		t.Errorf("stream holds %d messages, want the first 2", n)
@@ -357,8 +358,8 @@ func TestPublishAndReadyWhenNATSIsDown(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
 	defer cancel()
 	err := f.q.Publish(ctx, sample("t1"))
-	if !errors.Is(err, queue.ErrUnavailable) {
-		t.Errorf("Publish with NATS down = %v, want ErrUnavailable", err)
+	if !fault.Retryable(err) {
+		t.Errorf("Publish with NATS down = %v, want an unavailable fault", err)
 	}
 }
 

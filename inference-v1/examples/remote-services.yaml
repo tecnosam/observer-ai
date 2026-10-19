@@ -3,11 +3,12 @@
 # The engine on one machine, its dependencies elsewhere: Kev on a GPU host,
 # NATS over TLS, and Phoenix as a hosted service. The hostnames are
 # placeholders. The same three URLs can also come from the environment
-# (OBSERVER_SCORER_ENDPOINT, OBSERVER_NATS_URL, OBSERVER_PHOENIX_ENDPOINT),
-# which is how docker-compose.yml sets them.
+# (OBSERVER_SCORER_ENDPOINT, OBSERVER_NATS_URL, and OBSERVER_EXPORT_ENDPOINT
+# for the first exporter), which is how docker-compose.yml sets them.
 #
-# A hosted Phoenix that needs a key reads it from OTEL_EXPORTER_OTLP_HEADERS,
-# for example: export OTEL_EXPORTER_OTLP_HEADERS="api_key=..."
+# The hosted Phoenix key comes from the variable headers_env names, in the
+# OpenTelemetry headers format:
+#   export PHOENIX_OTLP_HEADERS="api_key=..."
 
 server:
   workers: 16                # more concurrent calls to a bigger Kev server
@@ -24,6 +25,9 @@ scorer:
   manifest: ../../finetune/notebooks/runs/observer-kev-0.8b-ft/manifest.json
   timeout: 20s               # a network hop away instead of on the same machine
 
-export:
-  phoenix_endpoint: https://app.phoenix.arize.com/v1/traces
-  project: observer-ai-production
+exporters:
+  - name: phoenix
+    endpoint: https://app.phoenix.arize.com/v1/traces
+    headers_env: PHOENIX_OTLP_HEADERS
+    resource_attributes:
+      openinference.project.name: observer-ai-production

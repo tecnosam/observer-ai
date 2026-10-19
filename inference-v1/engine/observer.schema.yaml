@@ -78,16 +78,22 @@ properties:
   queue:
     type: object
     description: >-
-      The NATS JetStream work queue between intake (the JSON API and the OTLP
-      assemblers) and the workers, and its dead-letter stream.
+      The work queue between intake (the JSON API and the OTLP assemblers)
+      and the workers with its dead-letter stream, the store where OTLP
+      spans wait to be assembled, and the export queues. With url set they
+      all live in NATS JetStream and survive restarts; with url empty they
+      live in the engine's memory, where only max_messages, max_deliver and
+      redelivery_backoff apply and dead letters are reported, not stored.
     additionalProperties: false
     properties:
       url:
         type: string
-        pattern: '^(nats|tls)://[^/]+'
-        default: nats://localhost:4222
+        pattern: '^((nats|tls)://[^/]+.*)?$'
         x-env: OBSERVER_NATS_URL
-        description: NATS server URL, nats:// or tls://.
+        description: >-
+          NATS server URL, nats:// or tls://. Empty (the default) keeps every
+          queue in process, with no NATS to run; queued work is then lost when
+          the engine stops, and engines cannot share it.
       connect_timeout:
         $ref: '#/$defs/duration'
         default: 30s
@@ -160,7 +166,29 @@ properties:
       dlq_max_age:
         $ref: '#/$defs/duration'
         default: 168h
-        description: How long dead letters are kept before NATS removes them. Must be positive.
+        description: >-
+          How long dead letters (traces and exports) are kept before NATS
+          removes them. Must be positive.
+      export_stream:
+        $ref: '#/$defs/streamName'
+        default: OBSERVER_EXPORTS
+        description: >-
+          Prefix of the exporters' work-queue streams: each exporter gets
+          <export_stream>_<NAME>, its name upper-cased with '-' as '_'. NATS only.
+      export_subject:
+        $ref: '#/$defs/subject'
+        default: observer.exports
+        description: Each exporter's stream takes <export_subject>.<name>. NATS only.
+      export_dlq_stream:
+        $ref: '#/$defs/streamName'
+        default: OBSERVER_EXPORTS_DLQ
+        description: >-
+          Where kept traces go after an exporter gives up on them (exporters[].max_deliver),
+          with headers naming the exporter and the error. NATS only.
+      export_dlq_subject:
+        $ref: '#/$defs/subject'
+        default: observer.exports_dlq
+        description: "Subject of export_dlq_stream. Rule: not under export_subject. NATS only."
 
   otlp:
     type: object
@@ -344,22 +372,114 @@ properties:
           A kept trace with a calibrated probability at or above this gets
           severity `high`; other kept traces get `normal`.
 
-  export:
+  observability:
     type: object
-    description: Where kept traces go. Dropped traces are sent nowhere.
+    description: Where the engine reports its own errors.
     additionalProperties: false
     properties:
-      phoenix_endpoint:
-        $ref: '#/$defs/httpURL'
-        default: http://localhost:6006/v1/traces
-        x-env: OBSERVER_PHOENIX_ENDPOINT
+      error_sinks:
+        type: array
+        default: [{kind: stdout}]
         description: >-
-          Phoenix's OTLP/HTTP URL, including the /v1/traces path. Phoenix may
-          be down at start-up; a failed export is logged and not retried
-          later. For a Phoenix that needs an API key, set
-          OTEL_EXPORTER_OTLP_HEADERS.
-      project:
-        type: string
-        minLength: 1
-        default: observer-ai
-        description: Phoenix project kept traces are filed under.
+          Every place an error is written, one JSON object per line with its
+          kind (unavailable, timeout, rejected, invalid, full, internal), the
+          component it came from, what it was doing and the trace it concerns.
+          Every sink receives every error. An empty list reports nothing.
+        items:
+          type: object
+          additionalProperties: false
+          required: [kind]
+          properties:
+            kind:
+              type: string
+              enum: [stdout, file]
+              description: stdout, or a file that is appended to.
+            path:
+              type: string
+              description: "For a file sink, the file to append to. Rule: required for kind file."
+
+  exporters:
+    type: array
+    x-env: OBSERVER_EXPORT_ENDPOINT
+    default:
+      - name: phoenix
+        endpoint: http://localhost:6006/v1/traces
+        resource_attributes: {openinference.project.name: observer-ai}
+    description: >-
+      Every trace back end kept traces are sent to, over OTLP/HTTP: Phoenix,
+      Langfuse, an OpenTelemetry Collector, or anything else that accepts
+      OTLP traces. Each kept trace goes to all of them, asynchronously: each
+      back end has its own queue and workers, so a slow or unreachable one
+      never holds up scoring or the others. Dropped traces are sent nowhere.
+      An empty list exports nothing. OBSERVER_EXPORT_ENDPOINT, when set,
+      replaces the first exporter's endpoint.
+    items:
+      type: object
+      additionalProperties: false
+      required: [name, endpoint]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          pattern: '^[A-Za-z0-9_-]+$'
+          description: >-
+            Identifies the back end in logs and errors, and names its export
+            stream on NATS. Rule: letters, digits, '-' and '_'; unique among
+            the exporters, ignoring case and '-' versus '_'.
+        endpoint:
+          $ref: '#/$defs/httpURL'
+          description: >-
+            The full OTLP/HTTP traces URL, path included: for example
+            http://localhost:6006/v1/traces for Phoenix, or
+            https://cloud.langfuse.com/api/public/otel/v1/traces for Langfuse.
+            The back end may be down at start-up; a failed export is reported
+            and not retried later.
+        headers:
+          type: object
+          additionalProperties: {type: string}
+          description: >-
+            Headers sent with every request, as written. Keep secrets out of
+            the file and use headers_env for them.
+        headers_env:
+          type: string
+          description: >-
+            Name of an environment variable holding more headers, in the
+            OpenTelemetry format "key=value,key2=value2" (values may be
+            percent-encoded, e.g. Basic%20abc). They are added to headers,
+            replacing any of the same name. The global
+            OTEL_EXPORTER_OTLP_HEADERS is not read, so one back end's
+            credentials never reach another. Rule: when set, the variable
+            must be set and parse at start-up.
+        resource_attributes:
+          type: object
+          additionalProperties: {type: string}
+          description: >-
+            Attributes set on the resource of every span sent to this back
+            end, besides service.name=observer-engine. Phoenix files traces by
+            openinference.project.name.
+        queue_size:
+          type: integer
+          minimum: 0
+          default: 1024
+          description: >-
+            Kept traces waiting to be sent to this back end. Past it, a trace
+            is not sent to this back end and the drop is reported. 0 means
+            the default.
+        concurrency:
+          type: integer
+          minimum: 0
+          default: 4
+          description: Traces sent to this back end at once. 0 means the default.
+        max_deliver:
+          type: integer
+          minimum: 0
+          default: 3
+          description: >-
+            Times a trace is tried before it is given up: reported, and on
+            NATS also moved to queue.export_dlq_stream. Errors a retry cannot
+            fix (corrupt spans) are given up at once. 0 means the default.
+        backoff:
+          type: array
+          items: {$ref: '#/$defs/duration'}
+          default: [1s, 5s, 30s]
+          description: Wait before each retry; the last value repeats. Empty means the default.

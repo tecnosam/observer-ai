@@ -1,8 +1,8 @@
 // Command observer runs the Observer.ai inference engine: it takes agent
-// traces as OTLP spans (gRPC and HTTP) or over a JSON API and queues them in
-// NATS JetStream; a worker pool pulls them off the queue, asks the Kev
+// traces as OTLP spans (gRPC and HTTP) or over a JSON API and queues them, in
+// NATS JetStream or in process; a worker pool pulls them off the queue, asks the Kev
 // decision model whether each is worth keeping, and sends the kept ones to
-// Arize Phoenix.
+// every configured OTLP back end (Phoenix, Langfuse, ...).
 package main
 
 import (
@@ -17,9 +17,14 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/observer-ai/engine/internal/broker"
 	"github.com/observer-ai/engine/internal/config"
 	"github.com/observer-ai/engine/internal/export"
+	"github.com/observer-ai/engine/internal/fault"
+	"github.com/observer-ai/engine/internal/metrics"
+	"github.com/observer-ai/engine/internal/observe"
 	"github.com/observer-ai/engine/internal/otlp"
+	"github.com/observer-ai/engine/internal/pipeline"
 	"github.com/observer-ai/engine/internal/policy"
 	"github.com/observer-ai/engine/internal/queue"
 	"github.com/observer-ai/engine/internal/scorer"
@@ -56,76 +61,162 @@ func run(configPath string, logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	export.LogErrors(logger)
-	exporter, err := export.NewPhoenix(ctx, cfg.Export.PhoenixEndpoint, cfg.Export.Project, logger)
-	if err != nil {
+	a := &app{cfg: cfg, logger: logger}
+	if err := a.start(ctx); err != nil {
+		a.abort()
 		return err
 	}
+	defer a.close()
+	return a.serve(ctx, stop)
+}
 
-	kev, err := scorer.New(cfg.ScorerConfig(logger))
-	if err != nil {
-		return err
+// app is the running engine: every component main starts, kept so they can
+// be stopped in the right order.
+type app struct {
+	cfg    *config.Config
+	logger *slog.Logger
+
+	reporter   *observe.Pipeline
+	broker     broker.AbstractFactory
+	queue      queue.AbstractBroker
+	exporter   *export.Dispatcher
+	engine     *pipeline.Engine
+	workers    queue.Stopper
+	receiver   *otlp.Receiver
+	assemblers queue.Stopper
+	http       *http.Server
+}
+
+// start builds and starts every component, in dependency order.
+func (a *app) start(ctx context.Context) error {
+	steps := []func(context.Context) error{
+		a.startReporter, a.startBroker, a.startQueue, a.startExporter, a.startEngine, a.startWorkers, a.startOTLP, a.startHTTP,
 	}
-
-	q, err := queue.Connect(ctx, cfg.QueueConfig(logger))
-	if err != nil {
-		_ = exporter.Shutdown(context.Background())
-		return err
-	}
-	defer q.Close()
-
-	engine := &server.Engine{
-		Scorer:      kev,
-		Policy:      policy.New(cfg.PolicyConfig(), nil),
-		Exporter:    exporter,
-		Temperature: cfg.Manifest.Temperature,
-		Model:       cfg.Scorer.Model,
-		Logger:      logger,
-	}
-	srv := server.New(server.Options{Engine: engine, Queue: q, Logger: logger})
-
-	// A system error comes back as an error and the queue redelivers the
-	// trace, dead-lettering it after queue.max_deliver attempts.
-	workers := q.StartWorkers(cfg.Server.Workers, func(ctx context.Context, t trace.Trace) error {
-		_, err := engine.ProcessQueued(ctx, t)
-		return err
-	})
-
-	// OTLP: the receivers store spans in NATS by trace ID; the assemblers
-	// turn each completed trace into a record on the same work queue.
-	var receiver *otlp.Receiver
-	var assemblers *queue.Assemblers
-	if cfg.OTLP.Enabled() {
-		receiver = otlp.NewReceiver(q, logger)
-		if err := receiver.Start(cfg.OTLP.GRPCAddr, cfg.OTLP.HTTPAddr); err != nil {
-			stopWorkers(workers, cfg.Server.ShutdownTimeout.Std())
-			_ = exporter.Shutdown(context.Background())
-			if errors.Is(err, syscall.EADDRINUSE) {
-				err = fmt.Errorf("%w (Phoenix also listens on 4317; set otlp.grpc_addr / otlp.http_addr or %s / %s)",
-					err, config.EnvOTLPGRPCAddr, config.EnvOTLPHTTPAddr)
-			}
+	for _, step := range steps {
+		if err := step(ctx); err != nil {
 			return err
 		}
-		assemblers = q.StartAssemblers(cfg.OTLP.Assemblers, otlp.Assemble)
 	}
+	a.logStart()
+	a.probeScorer(ctx)
+	return nil
+}
 
-	httpServer := &http.Server{
-		Addr:              cfg.Server.Addr,
+// startReporter builds the error pipeline every other component reports to.
+func (a *app) startReporter(context.Context) error {
+	reporter, err := observe.BuildPipeline(observe.DefaultSinkFactory{}, a.cfg.ErrorSinks(), metrics.Noop{})
+	a.reporter = reporter
+	return err
+}
+
+// startBroker picks where the queues live: NATS JetStream when queue.url is
+// set, else in process.
+func (a *app) startBroker(context.Context) error {
+	bcfg := a.cfg.BrokerConfig(a.logger)
+	bcfg.Reporter = a.reporter
+	b, err := broker.New(bcfg)
+	a.broker = b
+	return err
+}
+
+func (a *app) startQueue(ctx context.Context) error {
+	qcfg := a.cfg.QueueConfig(a.logger)
+	qcfg.Reporter = a.reporter
+	q, err := a.broker.Ingest(ctx, qcfg)
+	a.queue = q
+	return err
+}
+
+// startExporter comes after startQueue, which waits for JetStream to be up.
+func (a *app) startExporter(ctx context.Context) error {
+	export.ReportErrors(a.reporter)
+	exporter, err := export.NewDispatcher(ctx, export.DispatcherConfig{
+		Backends: a.cfg.ExportBackends(),
+		Factory:  export.OTLPBackendFactory{},
+		Queues:   a.broker.ExportQueues(a.cfg.ExportStreams()),
+		Reporter: a.reporter,
+	})
+	a.exporter = exporter
+	return err
+}
+
+func (a *app) startEngine(context.Context) error {
+	kev, err := scorer.New(a.cfg.ScorerConfig(a.reporter))
+	if err != nil {
+		return err
+	}
+	a.engine = pipeline.NewEngine(pipeline.Deps{
+		Scorer:   kev,
+		Policy:   policy.New(a.cfg.PolicyConfig(), nil),
+		Exporter: a.exporter,
+		Reporter: a.reporter,
+		Metrics:  metrics.Noop{},
+		Logger:   a.logger,
+	}, pipeline.Settings{
+		Temperature: pipeline.Temperature(a.cfg.Manifest.Temperature),
+		Model:       pipeline.ModelName(a.cfg.Scorer.Model),
+	})
+	return nil
+}
+
+// startWorkers pulls traces off the queue. A system error comes back as an
+// error and the queue redelivers the trace, dead-lettering it after
+// queue.max_deliver attempts.
+func (a *app) startWorkers(context.Context) error {
+	a.workers = a.queue.StartWorkers(a.cfg.Server.Workers, func(ctx context.Context, t trace.Trace) error {
+		_, err := a.engine.ProcessQueued(ctx, t)
+		return err
+	})
+	return nil
+}
+
+// startOTLP starts the receivers, which store spans in NATS by trace ID, and
+// the assemblers, which turn each completed trace into a record on the same
+// work queue.
+func (a *app) startOTLP(context.Context) error {
+	if !a.cfg.OTLP.Enabled() {
+		return nil
+	}
+	a.receiver = otlp.NewReceiver(otlp.ReceiverConfig{Sink: a.queue, Reporter: a.reporter})
+	if err := a.receiver.Start(a.cfg.OTLP.GRPCAddr, a.cfg.OTLP.HTTPAddr); err != nil {
+		a.receiver = nil
+		return explainAddrInUse(err)
+	}
+	a.assemblers = a.queue.StartAssemblers(a.cfg.OTLP.Assemblers, otlp.Assemble)
+	return nil
+}
+
+func explainAddrInUse(err error) error {
+	if !errors.Is(err, syscall.EADDRINUSE) {
+		return err
+	}
+	return fmt.Errorf("%w (Phoenix also listens on 4317; set otlp.grpc_addr / otlp.http_addr or %s / %s)",
+		err, config.EnvOTLPGRPCAddr, config.EnvOTLPHTTPAddr)
+}
+
+func (a *app) startHTTP(context.Context) error {
+	srv := server.New(server.Options{Engine: a.engine, Queue: a.queue, Reporter: a.reporter})
+	a.http = &http.Server{
+		Addr:              a.cfg.Server.Addr,
 		Handler:           srv.Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       2 * time.Minute,
 	}
+	return nil
+}
 
-	logger.Info("observer starting",
+func (a *app) logStart() {
+	cfg := a.cfg
+	a.logger.Info("observer starting",
 		"addr", cfg.Server.Addr,
 		"workers", cfg.Server.Workers,
 		"otlp_grpc_addr", cfg.OTLP.GRPCAddr,
 		"otlp_http_addr", cfg.OTLP.HTTPAddr,
 		"otlp_idle_timeout", cfg.OTLP.IdleTimeout.Std().String(),
+		"broker", a.broker.Kind(),
 		"nats_url", cfg.Queue.URL,
 		"stream", cfg.Queue.Stream,
 		"dlq_stream", cfg.Queue.DLQStream,
@@ -139,75 +230,118 @@ func run(configPath string, logger *slog.Logger) error {
 		"temperature", cfg.Manifest.Temperature,
 		"keep_threshold", cfg.Policy.KeepThreshold,
 		"random_floor", cfg.Policy.RandomFloor,
-		"phoenix_endpoint", cfg.Export.PhoenixEndpoint,
-		"project", cfg.Export.Project,
+		"exporters", exporterNames(cfg.Exporters),
 	)
-	probeCtx, cancelProbe := context.WithTimeout(ctx, 2*time.Second)
-	if err := kev.Ready(probeCtx); err != nil {
-		logger.Warn("kev is not reachable yet; queued traces will be redelivered until it is", "error", err.Error())
+}
+
+// exporterNames lists the back ends as name=endpoint, never their headers.
+func exporterNames(exporters []config.Exporter) []string {
+	out := make([]string, len(exporters))
+	for i, e := range exporters {
+		out[i] = e.Name + "=" + e.Endpoint
 	}
-	cancelProbe()
+	return out
+}
 
+// probeScorer warns, without failing start-up, when the model is not up yet.
+func (a *app) probeScorer(ctx context.Context) {
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	if err := a.engine.Ready(ctx); err != nil {
+		a.reporter.Report(ctx, fault.Unavailable(fault.Scorer,
+			"probe at start-up, queued traces will be redelivered until it answers", err))
+	}
+}
+
+// serve runs the HTTP server until a signal arrives or the listener fails.
+func (a *app) serve(ctx context.Context, stop context.CancelFunc) error {
 	serveErr := make(chan error, 1)
-	go func() { serveErr <- httpServer.ListenAndServe() }()
-
+	go func() { serveErr <- a.http.ListenAndServe() }()
 	select {
 	case err := <-serveErr:
 		// The listener failed before any signal. Whatever the workers
 		// picked up meanwhile goes back to the queue or finishes.
-		stopOTLP(receiver, assemblers, cfg.Server.ShutdownTimeout.Std())
-		stopWorkers(workers, cfg.Server.ShutdownTimeout.Std())
-		_ = exporter.Shutdown(context.Background())
+		a.abort()
 		return fmt.Errorf("http server: %w", err)
 	case <-ctx.Done():
 	}
 	stop() // a second signal now kills the process the default way
-	logger.Info("shutting down", "timeout", cfg.Server.ShutdownTimeout.Std().String())
+	return a.shutdown()
+}
 
-	drainCtx, cancelDrain := context.WithTimeout(context.Background(), cfg.Server.ShutdownTimeout.Std())
-	defer cancelDrain()
-	var errs []error
-	if err := httpServer.Shutdown(drainCtx); err != nil {
-		errs = append(errs, fmt.Errorf("stop http server: %w", err))
-	}
-	// Spans not yet assembled and traces still queued stay in JetStream for
-	// the next start; only the work in flight needs to finish.
-	if receiver != nil {
-		if err := receiver.Shutdown(drainCtx); err != nil {
-			errs = append(errs, fmt.Errorf("stop otlp receivers: %w", err))
-		}
-		if err := assemblers.Stop(drainCtx); err != nil {
-			errs = append(errs, fmt.Errorf("stop assemblers: %w", err))
-		}
-	}
-	if err := workers.Stop(drainCtx); err != nil {
-		errs = append(errs, fmt.Errorf("stop workers: %w", err))
-	}
+// shutdown stops taking work, lets the work in flight finish within
+// server.shutdown_timeout, then flushes the exporter. Spans not yet
+// assembled and traces still queued stay in JetStream for the next start.
+func (a *app) shutdown() error {
+	timeout := a.cfg.Server.ShutdownTimeout.Std()
+	a.logger.Info("shutting down", "timeout", timeout.String())
+	drainCtx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
 
-	flushCtx, cancelFlush := context.WithTimeout(context.Background(), exportShutdownTimeout)
-	defer cancelFlush()
-	if err := exporter.Shutdown(flushCtx); err != nil {
-		errs = append(errs, fmt.Errorf("flush exporter: %w", err))
+	errs := []error{
+		wrapStop("stop http server", a.http.Shutdown(drainCtx)),
+		a.stopOTLP(drainCtx),
+		wrapStop("stop workers", a.workers.Stop(drainCtx)),
+		a.flushExporter(),
 	}
 	if err := errors.Join(errs...); err != nil {
 		return err
 	}
-	logger.Info("shutdown complete")
+	a.logger.Info("shutdown complete")
 	return nil
 }
 
-func stopWorkers(w *queue.Workers, timeout time.Duration) {
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-	_ = w.Stop(ctx)
+func (a *app) stopOTLP(ctx context.Context) error {
+	if a.receiver == nil {
+		return nil
+	}
+	return errors.Join(
+		wrapStop("stop otlp receivers", a.receiver.Shutdown(ctx)),
+		wrapStop("stop assemblers", a.assemblers.Stop(ctx)),
+	)
 }
 
-func stopOTLP(r *otlp.Receiver, a *queue.Assemblers, timeout time.Duration) {
-	if r == nil {
-		return
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+// flushExporter has its own time budget, so a slow drain cannot leave the
+// final flush with no time at all.
+func (a *app) flushExporter() error {
+	ctx, cancel := context.WithTimeout(context.Background(), exportShutdownTimeout)
 	defer cancel()
-	_ = r.Shutdown(ctx)
-	_ = a.Stop(ctx)
+	return wrapStop("flush exporter", a.exporter.Shutdown(ctx))
+}
+
+// abort stops whatever start managed to start, after a failure.
+func (a *app) abort() {
+	ctx, cancel := context.WithTimeout(context.Background(), a.cfg.Server.ShutdownTimeout.Std())
+	defer cancel()
+	_ = a.stopOTLP(ctx)
+	if a.workers != nil {
+		_ = a.workers.Stop(ctx)
+	}
+	if a.exporter != nil {
+		_ = a.exporter.Shutdown(context.Background())
+	}
+	a.close()
+}
+
+// close releases the queue, the broker connection and the error sinks, last.
+func (a *app) close() {
+	if a.queue != nil {
+		a.queue.Close()
+		a.queue = nil
+	}
+	if a.broker != nil {
+		a.broker.Close()
+		a.broker = nil
+	}
+	if a.reporter != nil {
+		_ = a.reporter.Close()
+		a.reporter = nil
+	}
+}
+
+func wrapStop(what string, err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("%s: %w", what, err)
 }

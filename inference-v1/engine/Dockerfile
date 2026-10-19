@@ -24,7 +24,7 @@ COPY observer.yaml /etc/observer/observer.yaml
 
 # The baked-in config points at localhost, which inside a container is the
 # container itself. Set OBSERVER_NATS_URL, OBSERVER_SCORER_ENDPOINT and
-# OBSERVER_PHOENIX_ENDPOINT, and mount the model manifest at this path.
+# OBSERVER_EXPORT_ENDPOINT, and mount the model manifest at this path.
 ENV OBSERVER_MANIFEST=/etc/observer/manifest.json
 
 USER observer

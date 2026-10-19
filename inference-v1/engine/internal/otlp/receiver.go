@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log/slog"
 	"mime"
 	"net"
 	"net/http"
@@ -20,6 +19,9 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
+
+	"github.com/observer-ai/engine/internal/fault"
+	"github.com/observer-ai/engine/internal/observe"
 )
 
 const (
@@ -44,18 +46,24 @@ type Sink interface {
 type Receiver struct {
 	coltracepb.UnimplementedTraceServiceServer
 
-	sink   Sink
-	logger *slog.Logger
+	sink     Sink
+	reporter observe.Reporter
 
 	grpcServer *grpc.Server
 	httpServer *http.Server
 }
 
-func NewReceiver(sink Sink, logger *slog.Logger) *Receiver {
-	if logger == nil {
-		logger = slog.Default()
+// ReceiverConfig is what a Receiver is built from.
+type ReceiverConfig struct {
+	Sink     Sink
+	Reporter observe.Reporter // defaults to observe.Discard
+}
+
+func NewReceiver(cfg ReceiverConfig) *Receiver {
+	if cfg.Reporter == nil {
+		cfg.Reporter = observe.Discard
 	}
-	r := &Receiver{sink: sink, logger: logger}
+	r := &Receiver{sink: cfg.Sink, reporter: cfg.Reporter}
 
 	r.grpcServer = grpc.NewServer(grpc.MaxRecvMsgSize(maxRequestBytes))
 	coltracepb.RegisterTraceServiceServer(r.grpcServer, r)
@@ -90,14 +98,14 @@ func (r *Receiver) Start(grpcAddr, httpAddr string) error {
 	if grpcLis != nil {
 		go func() {
 			if err := r.grpcServer.Serve(grpcLis); err != nil {
-				r.logger.Error("otlp gRPC server stopped", "error", err.Error())
+				r.reporter.Report(context.Background(), fault.Unavailable(fault.OTLP, "serve gRPC", err).AsSevere())
 			}
 		}()
 	}
 	if httpLis != nil {
 		go func() {
 			if err := r.httpServer.Serve(httpLis); err != nil && !errors.Is(err, http.ErrServerClosed) {
-				r.logger.Error("otlp HTTP server stopped", "error", err.Error())
+				r.reporter.Report(context.Background(), fault.Unavailable(fault.OTLP, "serve HTTP", err).AsSevere())
 			}
 		}()
 	}
@@ -137,13 +145,14 @@ func (r *Receiver) accept(ctx context.Context, req *coltracepb.ExportTraceServic
 		return err
 	}
 	if skipped > 0 {
-		r.logger.Warn("otlp spans without a valid trace or span ID were skipped", "spans", skipped)
+		r.reporter.Report(ctx, fault.Invalid(fault.OTLP, "accept spans",
+			fault.Msg("spans without a valid trace or span ID were skipped")).With("spans", skipped))
 	}
 	if len(byTrace) == 0 {
 		return nil
 	}
 	if err := r.sink.PublishSpans(ctx, byTrace); err != nil {
-		r.logger.Error("otlp spans could not be stored", "traces", len(byTrace), "error", err.Error())
+		r.reporter.Report(ctx, fault.New(fault.KindOf(err), fault.OTLP, "store spans", err).With("traces", len(byTrace)))
 		return errors.New("span store unavailable, retry later")
 	}
 	return nil

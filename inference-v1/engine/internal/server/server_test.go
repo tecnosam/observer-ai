@@ -23,8 +23,9 @@ import (
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 
 	"github.com/observer-ai/engine/internal/export"
+	"github.com/observer-ai/engine/internal/fault"
+	"github.com/observer-ai/engine/internal/pipeline"
 	"github.com/observer-ai/engine/internal/policy"
-	"github.com/observer-ai/engine/internal/queue"
 	"github.com/observer-ai/engine/internal/scorer"
 	"github.com/observer-ai/engine/internal/trace"
 )
@@ -49,19 +50,19 @@ func readFile(t *testing.T, parts ...string) []byte {
 
 // fakeScorer is an in-process Scorer for handler tests.
 type fakeScorer struct {
-	score func(ctx context.Context, state string) (scorer.Result, error)
+	score func(ctx context.Context, state trace.State) (pipeline.Score, error)
 	ready error
 }
 
-func (f *fakeScorer) Score(ctx context.Context, state string) (scorer.Result, error) {
+func (f *fakeScorer) Score(ctx context.Context, state trace.State) (pipeline.Score, error) {
 	return f.score(ctx, state)
 }
 
 func (f *fakeScorer) Ready(context.Context) error { return f.ready }
 
-func fixedScore(p float64) func(context.Context, string) (scorer.Result, error) {
-	return func(context.Context, string) (scorer.Result, error) {
-		return scorer.Result{PRaw: p, Model: "kev-latest", LatencyMS: 12, Attempts: 1}, nil
+func fixedScore(p float64) func(context.Context, trace.State) (pipeline.Score, error) {
+	return func(context.Context, trace.State) (pipeline.Score, error) {
+		return pipeline.Score{Raw: pipeline.Probability(p), Model: "kev-latest", Latency: 12 * time.Millisecond, Attempts: 1}, nil
 	}
 }
 
@@ -87,14 +88,14 @@ func (q *fakeQueue) Ready() error { return q.readyErr }
 
 type harness struct {
 	srv      *Server
-	engine   *Engine
+	engine   *pipeline.Engine
 	queue    *fakeQueue
 	recorder *tracetest.SpanRecorder
 }
 
 type harnessOpts struct {
-	scorer  Scorer
-	queue   Publisher // defaults to a fakeQueue
+	scorer  pipeline.Scorer
+	queue   pipeline.Publisher // defaults to a fakeQueue
 	rand    func() float64
 	temp    float64
 	maxBody int64
@@ -121,23 +122,40 @@ func newHarness(t *testing.T, o harnessOpts) *harness {
 	rec := tracetest.NewSpanRecorder()
 	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(rec))
 	t.Cleanup(func() { tp.Shutdown(context.Background()) })
-	engine := &Engine{
-		Scorer:      o.scorer,
-		Policy:      policy.New(policy.Config{KeepThreshold: 0.5, RandomFloor: 0.02, SeverityHigh: 0.8}, o.rand),
-		Exporter:    newExporter(tp, o.uploader),
-		Temperature: o.temp,
-		Model:       "kev-latest",
-		Logger:      o.logger,
-	}
-	srv := New(Options{Engine: engine, Queue: o.queue, MaxBodyBytes: o.maxBody, Logger: quiet})
+	engine := pipeline.NewEngine(pipeline.Deps{
+		Scorer:   o.scorer,
+		Policy:   policy.New(policy.Config{KeepThreshold: 0.5, RandomFloor: 0.02, SeverityHigh: 0.8}, o.rand),
+		Exporter: newExporter(t, tp, o.uploader),
+		Logger:   o.logger,
+	}, pipeline.Settings{Temperature: pipeline.Temperature(o.temp), Model: "kev-latest"})
+	srv := New(Options{Engine: engine, Queue: o.queue, MaxBodyBytes: o.maxBody})
 	return &harness{srv: srv, engine: engine, queue: fq, recorder: rec}
 }
 
-func newExporter(tp *sdktrace.TracerProvider, u export.Uploader) *export.Exporter {
-	if u == nil {
-		return export.New(tp)
+// newExporter runs a back end on the recorder behind the same asynchronous
+// Dispatcher the engine uses.
+func newExporter(t *testing.T, tp *sdktrace.TracerProvider, u export.Uploader) *export.Dispatcher {
+	t.Helper()
+	backend := export.New(tp)
+	if u != nil {
+		backend = export.New(tp, export.WithForwarder(u, map[string]string{"openinference.project.name": "observer-ai"}))
 	}
-	return export.New(tp, export.WithForwarder(u, "observer-ai"), export.WithLogger(quiet))
+	d, err := export.NewDispatcher(context.Background(), export.DispatcherConfig{
+		Backends: []export.BackendConfig{{Name: "test"}},
+		Factory:  fixedFactory{backend},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = d.Shutdown(context.Background()) })
+	return d
+}
+
+// fixedFactory hands out one prebuilt back end.
+type fixedFactory struct{ backend export.AbstractBackend }
+
+func (f fixedFactory) Build(context.Context, export.BackendConfig) (export.AbstractBackend, error) {
+	return f.backend, nil
 }
 
 func (h *harness) do(method, path, body string) *httptest.ResponseRecorder {
@@ -267,9 +285,9 @@ func TestEnqueueWhenQueueRefuses(t *testing.T) {
 		err     error
 		wantErr string
 	}{
-		{"full", queue.ErrFull, "queue full"},
-		{"wrapped full", fmt.Errorf("publish: %w", queue.ErrFull), "queue full"},
-		{"unavailable", fmt.Errorf("%w: nats: timeout", queue.ErrUnavailable), "queue unavailable"},
+		{"full", fault.Full(fault.Queue, "publish trace", nil), "queue full"},
+		{"wrapped full", fmt.Errorf("publish: %w", fault.Full(fault.Queue, "publish trace", nil)), "queue full"},
+		{"unavailable", fault.Unavailable(fault.Queue, "publish trace", errors.New("nats: timeout")), "queue unavailable"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -297,7 +315,7 @@ func TestEnqueueWhenQueueRefuses(t *testing.T) {
 // The sync path does not touch the queue, so it keeps working without it.
 func TestScoreWorksWhenQueueIsDown(t *testing.T) {
 	h := newHarness(t, harnessOpts{scorer: &fakeScorer{score: fixedScore(0.9)}})
-	h.queue.publishErr = queue.ErrUnavailable
+	h.queue.publishErr = fault.Unavailable(fault.Queue, "publish trace", nil)
 	h.queue.readyErr = errors.New("nats is reconnecting")
 
 	w := h.do("POST", "/v1/traces:score", `{"question": "q", "final_answer": "a"}`)
@@ -398,7 +416,6 @@ func (k *fakeKev) client(t *testing.T, maxRetries int) *scorer.Client {
 		Timeout:          2 * time.Second,
 		MaxRetries:       maxRetries,
 		Backoff:          []time.Duration{time.Millisecond},
-		Logger:           quiet,
 		Sleep:            func(context.Context, time.Duration) error { return nil },
 	})
 	if err != nil {
@@ -432,7 +449,7 @@ func TestScoreEndToEndKeep(t *testing.T) {
 	}
 
 	got := decodeBody[Result](t, w)
-	wantP := scorer.Calibrate(0.93, 0.86)
+	wantP := float64(pipeline.Calibrate(0.93, 0.86))
 	if got.TraceID != "wrong-river-001" || got.Decision != "keep" || got.Reason != "kev" ||
 		got.Severity != "high" || got.Model != "kev-latest" || got.LatencyMS != 93 || !got.Exported {
 		t.Errorf("result = %+v", got)
@@ -569,22 +586,20 @@ func TestReadyzAgainstFakeKev(t *testing.T) {
 // failingExporter accepts spans but cannot deliver them.
 type failingExporter struct{}
 
-func (failingExporter) Export(_ context.Context, rec export.Record) bool { return rec.Decision.Keep }
-func (failingExporter) Flush(context.Context) error                      { return errors.New("phoenix unreachable") }
+func (failingExporter) Export(_ context.Context, rec pipeline.Record) bool { return rec.Decision.Keep }
+func (failingExporter) Flush(context.Context) error                        { return errors.New("phoenix unreachable") }
 
 // Phoenix being down must not fail the request; the response says the trace
 // was kept but not exported.
 func TestScoreWhenExportFlushFails(t *testing.T) {
 	srv := New(Options{
-		Engine: &Engine{
-			Scorer:      &fakeScorer{score: fixedScore(0.9)},
-			Policy:      policy.New(policy.Config{KeepThreshold: 0.5, RandomFloor: 0, SeverityHigh: 0.8}, nil),
-			Exporter:    failingExporter{},
-			Temperature: 1,
-			Model:       "kev-latest",
-			Logger:      quiet,
-		},
-		Queue: &fakeQueue{}, Logger: quiet,
+		Engine: pipeline.NewEngine(pipeline.Deps{
+			Scorer:   &fakeScorer{score: fixedScore(0.9)},
+			Policy:   policy.New(policy.Config{KeepThreshold: 0.5, RandomFloor: 0, SeverityHigh: 0.8}, nil),
+			Exporter: failingExporter{},
+			Logger:   quiet,
+		}, pipeline.Settings{Temperature: 1, Model: "kev-latest"}),
+		Queue: &fakeQueue{},
 	})
 
 	w := httptest.NewRecorder()

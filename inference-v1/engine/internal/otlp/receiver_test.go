@@ -94,7 +94,7 @@ func post(h http.Handler, contentType string, body []byte, headers ...string) *h
 
 func TestHTTPProtobuf(t *testing.T) {
 	sink := &memorySink{}
-	h := NewReceiver(sink, quiet).HTTPHandler()
+	h := NewReceiver(ReceiverConfig{Sink: sink}).HTTPHandler()
 	body, _ := proto.Marshal(exportRequest())
 
 	w := post(h, "application/x-protobuf", body)
@@ -118,7 +118,7 @@ func TestHTTPProtobuf(t *testing.T) {
 
 func TestHTTPGzip(t *testing.T) {
 	sink := &memorySink{}
-	h := NewReceiver(sink, quiet).HTTPHandler()
+	h := NewReceiver(ReceiverConfig{Sink: sink}).HTTPHandler()
 	raw, _ := proto.Marshal(exportRequest())
 	var zipped bytes.Buffer
 	zw := stdgzip.NewWriter(&zipped)
@@ -143,7 +143,7 @@ func TestHTTPGzip(t *testing.T) {
 // OTLP/JSON writes IDs as hex and 64-bit integers as strings.
 func TestHTTPJSON(t *testing.T) {
 	sink := &memorySink{}
-	h := NewReceiver(sink, quiet).HTTPHandler()
+	h := NewReceiver(ReceiverConfig{Sink: sink}).HTTPHandler()
 	body := `{
 	  "resourceSpans": [{
 	    "resource": {"attributes": [{"key": "service.name", "value": {"stringValue": "json-agent"}}]},
@@ -217,7 +217,7 @@ func TestHTTPJSON(t *testing.T) {
 
 func TestHTTPRejections(t *testing.T) {
 	sink := &memorySink{}
-	h := NewReceiver(sink, quiet).HTTPHandler()
+	h := NewReceiver(ReceiverConfig{Sink: sink}).HTTPHandler()
 	valid, _ := proto.Marshal(exportRequest())
 
 	tests := []struct {
@@ -271,7 +271,7 @@ func TestHTTPRejections(t *testing.T) {
 // way OTLP exporters understand: HTTP 503.
 func TestHTTPSinkUnavailable(t *testing.T) {
 	sink := &memorySink{err: errors.New("nats: no servers available")}
-	h := NewReceiver(sink, quiet).HTTPHandler()
+	h := NewReceiver(ReceiverConfig{Sink: sink}).HTTPHandler()
 	body, _ := proto.Marshal(exportRequest())
 
 	w := post(h, "application/x-protobuf", body)
@@ -293,7 +293,7 @@ func TestHTTPSinkUnavailable(t *testing.T) {
 // An export with nothing usable in it succeeds without touching the sink.
 func TestEmptyExportIsAccepted(t *testing.T) {
 	sink := &memorySink{err: errors.New("must not be called")}
-	h := NewReceiver(sink, quiet).HTTPHandler()
+	h := NewReceiver(ReceiverConfig{Sink: sink}).HTTPHandler()
 	body, _ := proto.Marshal(&coltracepb.ExportTraceServiceRequest{})
 	if w := post(h, "application/x-protobuf", body); w.Code != http.StatusOK {
 		t.Errorf("status = %d, want 200", w.Code)
@@ -312,7 +312,7 @@ func startReceiver(t *testing.T, sink Sink) (grpcAddr, httpAddr string) {
 		return lis.Addr().String()
 	}
 	grpcAddr, httpAddr = free(), free()
-	r := NewReceiver(sink, quiet)
+	r := NewReceiver(ReceiverConfig{Sink: sink})
 	if err := r.Start(grpcAddr, httpAddr); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
@@ -376,17 +376,17 @@ func TestStartServesHTTPAndFailsOnBusyPort(t *testing.T) {
 	}
 
 	// A second receiver cannot take the same ports.
-	err = NewReceiver(sink, quiet).Start(grpcAddr, "")
+	err = NewReceiver(ReceiverConfig{Sink: sink}).Start(grpcAddr, "")
 	if err == nil || !strings.Contains(err.Error(), "gRPC listener") {
 		t.Errorf("Start on a busy gRPC port = %v, want a listener error", err)
 	}
-	err = NewReceiver(sink, quiet).Start("", httpAddr)
+	err = NewReceiver(ReceiverConfig{Sink: sink}).Start("", httpAddr)
 	if err == nil || !strings.Contains(err.Error(), "HTTP listener") {
 		t.Errorf("Start on a busy HTTP port = %v, want a listener error", err)
 	}
 
 	// Both protocols can be switched off.
-	off := NewReceiver(sink, quiet)
+	off := NewReceiver(ReceiverConfig{Sink: sink})
 	if err := off.Start("", ""); err != nil {
 		t.Errorf("Start with both disabled = %v", err)
 	}

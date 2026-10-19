@@ -13,12 +13,14 @@ example here loads.
 | [`kev-sdk-run.yaml`](kev-sdk-run.yaml) | Serve a Kev run made by the fine-tuning SDK |
 | [`json-api-only.yaml`](json-api-only.yaml) | Take traces over the JSON API only, with the OTLP receivers off |
 | [`review-more.yaml`](review-more.yaml) | Keep more traces for review: a lower threshold and a larger random sample |
-| [`remote-services.yaml`](remote-services.yaml) | Run against Kev, NATS and Phoenix on other machines |
+| [`remote-services.yaml`](remote-services.yaml) | Run against Kev, NATS and a hosted Phoenix on other machines |
+| [`langfuse.yaml`](langfuse.yaml) | Send kept traces to Langfuse as well as Phoenix |
 
 ## Running one
 
-From `inference-v1/engine`, with NATS and Phoenix up (`make nats` and
-`make phoenix`):
+From `inference-v1/engine`, with Phoenix up (`make phoenix`). The queues
+stay in memory unless the config or `OBSERVER_NATS_URL` sets `queue.url`
+(then start NATS with `make nats`):
 
 ```sh
 make run CONFIG=../examples/review-more.yaml
@@ -55,10 +57,31 @@ Two things to know before pointing it at real traffic:
   itself; the trace goes back to the queue and is redelivered later with
   `queue.redelivery_backoff`. If that happens often, lower `server.workers`.
 
+## Sending traces to Langfuse, or any OTLP back end
+
+`exporters` is a list: every kept trace goes to each back end in it, each
+with its own queue, so a slow one never holds up the others.
+[`langfuse.yaml`](langfuse.yaml) keeps the local Phoenix and adds Langfuse,
+which takes Basic auth built from your public and secret keys. Keep the
+header in an environment variable and name it in `headers_env`:
+
+```sh
+export LANGFUSE_OTLP_HEADERS="Authorization=Basic%20$(printf '%s' "pk-lf-...:sk-lf-..." | base64)"
+make run CONFIG=../examples/langfuse.yaml
+```
+
+The variable holds headers in the OpenTelemetry format, `key=value` pairs
+separated by commas, with `%20` for a space. The engine refuses to start if
+it is unset. Any other back end that takes OTLP/HTTP traces (Honeycomb, Grafana
+Tempo, an OpenTelemetry Collector) is one more entry: a `name`, its traces
+`endpoint` with the path, and its auth header. The engine's README lists the
+attributes each back end receives.
+
 ## Docker Compose
 
 The compose file bakes `engine/observer.yaml` into the image and sets the
-scorer, NATS and Phoenix URLs from environment variables, which override the
+scorer and NATS URLs and the first exporter's endpoint from environment
+variables (`OBSERVER_EXPORT_ENDPOINT` for the exporter), which override the
 same keys in any config. To run the Jev example in Docker, mount it over the
 baked-in config and pass the key through, in `engine/docker-compose.yml`:
 

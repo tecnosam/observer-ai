@@ -275,7 +275,8 @@ Details:
   export.
 - Sent straight to Phoenix, the project name is `observer_agent`, or
   `PHOENIX_PROJECT_NAME` if set. Through the engine, kept traces are filed under
-  the engine's `export.project`.
+  the `openinference.project.name` in the engine exporter's
+  `resource_attributes` (`observer-ai` by default).
 
 ## Layout
 

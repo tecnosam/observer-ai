@@ -2,7 +2,12 @@ package config
 
 import (
 	"log/slog"
+	"time"
 
+	"github.com/observer-ai/engine/internal/broker"
+	"github.com/observer-ai/engine/internal/export"
+	"github.com/observer-ai/engine/internal/observe"
+	"github.com/observer-ai/engine/internal/pipeline"
 	"github.com/observer-ai/engine/internal/policy"
 	"github.com/observer-ai/engine/internal/queue"
 	"github.com/observer-ai/engine/internal/scorer"
@@ -12,7 +17,7 @@ import (
 // imports this package; main hands each one its part.
 
 // ScorerConfig is the Kev (or Jev) client's settings.
-func (c *Config) ScorerConfig(logger *slog.Logger) scorer.Config {
+func (c *Config) ScorerConfig(reporter observe.Reporter) scorer.Config {
 	return scorer.Config{
 		Endpoint:         c.Scorer.Endpoint,
 		Model:            c.Scorer.Model,
@@ -22,7 +27,7 @@ func (c *Config) ScorerConfig(logger *slog.Logger) scorer.Config {
 		Timeout:          c.Scorer.Timeout.Std(),
 		MaxRetries:       c.Scorer.MaxRetries,
 		Backoff:          durations(c.Scorer.Backoff),
-		Logger:           logger,
+		Reporter:         reporter,
 	}
 }
 
@@ -49,10 +54,62 @@ func (c *Config) QueueConfig(logger *slog.Logger) queue.Config {
 // PolicyConfig is the keep/drop policy's thresholds.
 func (c *Config) PolicyConfig() policy.Config {
 	return policy.Config{
-		KeepThreshold: c.Policy.KeepThreshold,
-		RandomFloor:   c.Policy.RandomFloor,
-		SeverityHigh:  c.Alert.SeverityHigh,
+		KeepThreshold: pipeline.Probability(c.Policy.KeepThreshold),
+		RandomFloor:   pipeline.Probability(c.Policy.RandomFloor),
+		SeverityHigh:  pipeline.Probability(c.Alert.SeverityHigh),
 	}
+}
+
+// ExportBackends is every configured trace back end, headers resolved.
+func (c *Config) ExportBackends() []export.BackendConfig {
+	out := make([]export.BackendConfig, len(c.Exporters))
+	for i, e := range c.Exporters {
+		out[i] = export.BackendConfig{
+			Name:               e.Name,
+			Endpoint:           e.Endpoint,
+			Headers:            e.ResolvedHeaders,
+			ResourceAttributes: e.ResourceAttributes,
+			QueueSize:          e.QueueSize,
+			Concurrency:        e.Concurrency,
+			MaxDeliver:         e.MaxDeliver,
+			Backoff:            exportBackoff(e.Backoff),
+		}
+	}
+	return out
+}
+
+// exportBackoff is nil when none is set, so the exporter's default applies.
+func exportBackoff(in []Duration) []time.Duration {
+	if len(in) == 0 {
+		return nil
+	}
+	return durations(in)
+}
+
+// BrokerConfig chooses where the queues live: NATS when queue.url is set.
+func (c *Config) BrokerConfig(logger *slog.Logger) broker.Config {
+	return broker.Config{URL: c.Queue.URL, Logger: logger}
+}
+
+// ExportStreams names the export queues' JetStream objects.
+func (c *Config) ExportStreams() export.NATSStreams {
+	return export.NATSStreams{
+		Stream:     c.Queue.ExportStream,
+		Subject:    c.Queue.ExportSubject,
+		Consumer:   c.Queue.Consumer + "-export",
+		DLQStream:  c.Queue.ExportDLQStream,
+		DLQSubject: c.Queue.ExportDLQSubject,
+		DLQMaxAge:  c.Queue.DLQMaxAge.Std(),
+	}
+}
+
+// ErrorSinks is the error pipeline's sinks.
+func (c *Config) ErrorSinks() []observe.SinkConfig {
+	out := make([]observe.SinkConfig, len(c.Observability.ErrorSinks))
+	for i, s := range c.Observability.ErrorSinks {
+		out[i] = observe.SinkConfig{Kind: observe.SinkKind(s.Kind), Path: s.Path}
+	}
+	return out
 }
 
 // spanConfig maps the OTLP settings onto the queue. With OTLP off it is zero,

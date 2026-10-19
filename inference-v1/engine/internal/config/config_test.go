@@ -43,12 +43,15 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.Server != want.Server {
 		t.Errorf("server = %+v, want %+v", cfg.Server, want.Server)
 	}
-	if q := cfg.Queue; q.URL != "nats://localhost:4222" || q.Stream != "OBSERVER_TRACES" || q.MaxDeliver != 5 ||
+	if q := cfg.Queue; q.URL != "" || q.NATS() || q.Stream != "OBSERVER_TRACES" || q.MaxDeliver != 5 ||
 		q.AckWait.Std() != 2*time.Minute || len(q.RedeliveryBackoff) != 4 || q.DLQStream != "OBSERVER_TRACES_DLQ" {
 		t.Errorf("queue defaults not applied: %+v", q)
 	}
-	if cfg.Policy != want.Policy || cfg.Alert != want.Alert || cfg.Export != want.Export {
-		t.Errorf("policy/alert/export defaults not applied: %+v", cfg)
+	if cfg.Policy != want.Policy || cfg.Alert != want.Alert {
+		t.Errorf("policy/alert defaults not applied: %+v", cfg)
+	}
+	if e := cfg.Exporters; len(e) != 1 || e[0].Name != "phoenix" || e[0].Endpoint != want.Exporters[0].Endpoint {
+		t.Errorf("exporter defaults not applied: %+v", e)
 	}
 	if cfg.Scorer.Timeout.Std() != 10*time.Second || cfg.Scorer.MaxRetries != 3 || len(cfg.Scorer.Backoff) != 3 {
 		t.Errorf("scorer defaults not applied: %+v", cfg.Scorer)
@@ -91,9 +94,13 @@ policy:
   random_floor: 1
 alert:
   severity_high: 0.9
-export:
-  phoenix_endpoint: http://phoenix:2/v1/traces
-  project: p
+exporters:
+  - name: phoenix
+    endpoint: http://phoenix:2/v1/traces
+    resource_attributes:
+      openinference.project.name: p
+    queue_size: 8
+    concurrency: 2
 `
 	cfg, err := Load(write(t, yaml, testManifest))
 	if err != nil {
@@ -118,14 +125,15 @@ export:
 	if cfg.Policy.KeepThreshold != 0 || cfg.Policy.RandomFloor != 1 {
 		t.Errorf("policy = %+v", cfg.Policy)
 	}
-	if cfg.Export.Project != "p" {
-		t.Errorf("export = %+v", cfg.Export)
+	if e := cfg.Exporters; len(e) != 1 || e[0].Endpoint != "http://phoenix:2/v1/traces" ||
+		e[0].ResourceAttributes["openinference.project.name"] != "p" || e[0].QueueSize != 8 || e[0].Concurrency != 2 {
+		t.Errorf("exporters = %+v", e)
 	}
 }
 
 func TestEnvOverrides(t *testing.T) {
 	t.Setenv(EnvScorerEndpoint, "http://env-kev:8010/v1/systemone")
-	t.Setenv(EnvPhoenixEndpoint, "http://env-phoenix:6006/v1/traces")
+	t.Setenv(EnvExportEndpoint, "http://env-phoenix:6006/v1/traces")
 	t.Setenv(EnvNATSURL, "nats://env-nats:4222")
 	path := write(t, "scorer:\n  manifest: does-not-exist.json\n  endpoint: http://file:1/x\n", testManifest)
 	t.Setenv(EnvManifest, filepath.Join(filepath.Dir(path), "manifest.json"))
@@ -142,8 +150,8 @@ func TestEnvOverrides(t *testing.T) {
 	if cfg.Scorer.Endpoint != "http://env-kev:8010/v1/systemone" {
 		t.Errorf("scorer endpoint = %q", cfg.Scorer.Endpoint)
 	}
-	if cfg.Export.PhoenixEndpoint != "http://env-phoenix:6006/v1/traces" {
-		t.Errorf("phoenix endpoint = %q", cfg.Export.PhoenixEndpoint)
+	if cfg.Exporters[0].Endpoint != "http://env-phoenix:6006/v1/traces" {
+		t.Errorf("export endpoint = %q", cfg.Exporters[0].Endpoint)
 	}
 }
 
