@@ -66,37 +66,12 @@ func run(configPath string, logger *slog.Logger) error {
 		return err
 	}
 
-	kev, err := scorer.New(scorer.Config{
-		Endpoint:         cfg.Scorer.Endpoint,
-		Model:            cfg.Scorer.Model,
-		Questions:        cfg.Manifest.Questions,
-		DecisionQuestion: cfg.Scorer.DecisionQuestion,
-		APIKey:           cfg.Scorer.APIKey,
-		Timeout:          cfg.Scorer.Timeout.Std(),
-		MaxRetries:       cfg.Scorer.MaxRetries,
-		Backoff:          durations(cfg.Scorer.Backoff),
-		Logger:           logger,
-	})
+	kev, err := scorer.New(cfg.ScorerConfig(logger))
 	if err != nil {
 		return err
 	}
 
-	q, err := queue.Connect(ctx, queue.Config{
-		URL:               cfg.Queue.URL,
-		ConnectTimeout:    cfg.Queue.ConnectTimeout.Std(),
-		Stream:            cfg.Queue.Stream,
-		Subject:           cfg.Queue.Subject,
-		Consumer:          cfg.Queue.Consumer,
-		MaxMessages:       cfg.Queue.MaxMessages,
-		AckWait:           cfg.Queue.AckWait.Std(),
-		MaxDeliver:        cfg.Queue.MaxDeliver,
-		RedeliveryBackoff: durations(cfg.Queue.RedeliveryBackoff),
-		DLQStream:         cfg.Queue.DLQStream,
-		DLQSubject:        cfg.Queue.DLQSubject,
-		DLQMaxAge:         cfg.Queue.DLQMaxAge.Std(),
-		Spans:             spanConfig(cfg.OTLP),
-		Logger:            logger,
-	})
+	q, err := queue.Connect(ctx, cfg.QueueConfig(logger))
 	if err != nil {
 		_ = exporter.Shutdown(context.Background())
 		return err
@@ -104,12 +79,8 @@ func run(configPath string, logger *slog.Logger) error {
 	defer q.Close()
 
 	engine := &server.Engine{
-		Scorer: kev,
-		Policy: policy.New(policy.Config{
-			KeepThreshold: cfg.Policy.KeepThreshold,
-			RandomFloor:   cfg.Policy.RandomFloor,
-			SeverityHigh:  cfg.Alert.SeverityHigh,
-		}, nil),
+		Scorer:      kev,
+		Policy:      policy.New(cfg.PolicyConfig(), nil),
 		Exporter:    exporter,
 		Temperature: cfg.Manifest.Temperature,
 		Model:       cfg.Scorer.Model,
@@ -223,31 +194,6 @@ func run(configPath string, logger *slog.Logger) error {
 	}
 	logger.Info("shutdown complete")
 	return nil
-}
-
-func durations(in []config.Duration) []time.Duration {
-	out := make([]time.Duration, len(in))
-	for i, d := range in {
-		out[i] = d.Std()
-	}
-	return out
-}
-
-// spanConfig maps the OTLP settings onto the queue. With OTLP off it is
-// zero, and the queue creates no span streams.
-func spanConfig(o config.OTLP) queue.SpanConfig {
-	if !o.Enabled() {
-		return queue.SpanConfig{}
-	}
-	return queue.SpanConfig{
-		Stream:         o.SpanStream,
-		Subject:        o.SpanSubject,
-		MaxAge:         o.SpanMaxAge.Std(),
-		PendingStream:  o.PendingStream,
-		PendingSubject: o.PendingSubject,
-		IdleTimeout:    o.IdleTimeout.Std(),
-		MaxWait:        o.MaxWait.Std(),
-	}
 }
 
 func stopWorkers(w *queue.Workers, timeout time.Duration) {

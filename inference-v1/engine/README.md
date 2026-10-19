@@ -682,7 +682,7 @@ itself, not a fake.
 
 ```
 cmd/observer/      flags, config load, wiring, graceful shutdown
-internal/config/   YAML config and manifest loading, validation, defaults
+internal/config/   settings and manifest: loaders, compiler, validation, defaults
 internal/trace/    trace types, BuildState, Python repr
 internal/scorer/   Kev client, retries, calibration, error classification
 internal/policy/   keep/drop decision, random floor, severity

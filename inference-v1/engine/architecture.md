@@ -13,9 +13,9 @@ file is about the code.
 | --- | --- |
 | Web framework? | None. The standard library's `net/http` and its `ServeMux`. No Gin, Echo, Fiber or chi. |
 | Dependency injection? | Yes, by hand: constructors take what they need, and `main` builds everything once. No DI framework or container. |
-| Factory pattern? | Only constructor functions (`scorer.New`, `queue.Connect`, `export.NewPhoenix`). No abstract factories and no registry of implementations. |
+| Factory pattern? | An abstract factory for where settings come from (`config.AbstractLoaderFactory`: a YAML file, or values built in code). Elsewhere, constructor functions (`scorer.New`, `queue.Connect`, `export.NewPhoenix`). |
 | How are dependencies swapped in tests? | Small interfaces declared by the package that uses them, plus a few function-typed fields. |
-| Config? | `gopkg.in/yaml.v3`, decoded strictly over a struct of defaults, then six environment overrides, then validation. Read once at start-up. |
+| Config? | A `Compiler` with an injected loader factory. For the YAML file: `gopkg.in/yaml.v3`, decoded strictly over a struct of defaults, then six environment overrides, then validation. Read once at start-up. |
 | Database? | None. NATS JetStream is the only state: the queues and the spans waiting to be assembled. |
 | Logging? | `log/slog`, JSON to stdout. |
 
@@ -43,7 +43,7 @@ There is no ORM, no router library, no validation library, no CLI library
 ```
 cmd/observer/main.go     the only executable: flags, config, wiring, shutdown
 internal/
-  config/                observer.yaml and manifest.json: types, defaults, loading, validation
+  config/                settings and manifest: loaders, compiler, validation, per-component settings
   trace/                 the Trace record, its JSON decoding, and BuildState (the text Kev reads)
   scorer/                HTTP client for Kev: retries, error classes, temperature calibration
   policy/                keep or drop from a probability: threshold, random floor, severity
@@ -64,10 +64,10 @@ module. Each directory is one package with one job.
 ### Which package imports which
 
 ```
-config   (nothing)          scorer  (nothing)          policy  (nothing)
-trace    (nothing)
+scorer   (nothing)          policy  (nothing)          trace   (nothing)
 otlp     -> trace
 queue    -> trace
+config   -> policy, queue, scorer
 export   -> otlp, policy, trace
 server   -> export, policy, queue, scorer, trace
 main     -> all of them
@@ -77,9 +77,10 @@ Two things are worth noticing:
 
 - **Only `main` imports `config`.** No other package knows the YAML exists.
   Each package that needs settings declares its own `Config` struct
-  (`scorer.Config`, `queue.Config`, `policy.Config`), and `main` copies the
-  values across. A package can therefore be tested, or reused, without a
-  config file.
+  (`scorer.Config`, `queue.Config`, `policy.Config`). `config` builds those
+  structs (`compile.go`), so it depends on the components and never the other
+  way round. A component can therefore be tested, or reused, without a config
+  file.
 - **`trace` is the shared vocabulary.** The receivers, the queue, the
   pipeline and the exporter all pass a `trace.Trace` around; none of them
   depends on another's internals to do so.
@@ -107,45 +108,75 @@ workers call it; the only difference is what happens when Kev fails (see
 
 ## From observer.yaml to running configuration
 
-Go does not "compile" the YAML. The file is read and decoded at start-up, in
-`config.Load` (`internal/config/config.go`), in five steps:
+Go does not "compile" the YAML ahead of time. At start-up a `Compiler` turns
+settings from a source into one validated `Config`. Where the settings come
+from is injected through an abstract factory, so the same compiler serves a
+YAML file or values built in code:
 
-1. **Start from defaults.** `config.Default()` returns a fully populated
-   `Config` struct. Every default lives in that one function.
-2. **Decode the file over it.** `yaml.v3` fills in only the keys the file
+```
+internal/config/
+  config.go      the Config types and Default()
+  loader.go      AbstractLoaderFactory -> AbstractConfigLoader, AbstractManifestLoader
+                 YAMLFileFactory: observer.yaml and the manifest file it names
+                 StaticFactory:   a Config and a Manifest built in code
+  compiler.go    Compiler: the steps below. Load(path) is the YAML shortcut main uses
+  validate.go    the rules a Config must meet
+  manifest.go    reading and checking manifest.json
+  compile.go     a Config to scorer.Config, queue.Config, policy.Config
+  utils.go       small shared helpers
+```
+
+```go
+cfg, err := config.Load("observer.yaml")                    // what the binary does
+cfg, err := config.NewCompiler(config.NewStaticFactory(c, m)).Compile()   // settings built in code
+cfg, err := config.NewCompiler(f, config.WithEnv(nil)).Compile()          // any factory, no environment
+```
+
+`Compiler.Compile` runs in this order:
+
+1. **Load the settings, starting from defaults.** `config.Default()` returns a
+   fully populated `Config` struct; every default lives in that one function.
+   The YAML loader decodes the file over it: `yaml.v3` fills in only the keys
+   the file
    contains, so anything left out keeps its default. The struct fields carry
    `yaml:"..."` tags that give the key names. Decoding is strict
    (`KnownFields(true)`): a misspelt or unknown key stops the engine with the
    line number instead of being silently ignored.
-3. **Apply environment overrides.** Six variables replace their keys when
+2. **Apply environment overrides.** Six variables replace their keys when
    set and non-empty: `OBSERVER_NATS_URL`, `OBSERVER_SCORER_ENDPOINT`,
    `OBSERVER_PHOENIX_ENDPOINT`, `OBSERVER_MANIFEST`,
    `OBSERVER_OTLP_GRPC_ADDR` and `OBSERVER_OTLP_HTTP_ADDR`. These are the
    values that differ between a laptop and a container. Nothing else can be
-   set from the environment.
+   set from the environment. The environment itself is injected
+   (`WithEnv`, `os.Getenv` by default), so tests and embedding programs
+   control it.
+3. **Read the scorer's API key** from the variable `scorer.api_key_env` names
+   (`JEV_API_KEY` by default for `scorer.kind: jev`).
 4. **Validate.** `validate` checks every value and collects all the
    problems before reporting (`errors.Join`), so one run shows every mistake.
    It includes rules that span keys, for example `queue.ack_wait` must be
    longer than the worst-case Kev call computed from `scorer.timeout`,
    `scorer.max_retries` and `scorer.backoff`.
-5. **Load the manifest.** `scorer.manifest` points at the fine-tuning run's
-   `manifest.json` (a relative path resolves against the config file's
-   directory). The engine takes the `questions` object, kept byte-for-byte in
+5. **Load the manifest** through the factory's manifest loader. For a YAML
+   file, `scorer.manifest` points at the fine-tuning run's `manifest.json` (a
+   relative path resolves against the config file's directory); a
+   `StaticFactory` can carry the manifest as a value instead. The engine takes the `questions` object, kept byte-for-byte in
    the order the model was trained on, and the temperature for
    `scorer.decision_question`, and checks that question exists and is a
    `noul`.
 
 The result is one immutable `*config.Config`. `run` in `cmd/observer/main.go`
-then hands each component only the part it needs:
+then hands each component only the part it needs, in the shape it takes:
 
 ```go
-kev, err := scorer.New(scorer.Config{
-    Endpoint:   cfg.Scorer.Endpoint,
-    Timeout:    cfg.Scorer.Timeout.Std(),
-    MaxRetries: cfg.Scorer.MaxRetries,
-    ...
-})
+kev, err := scorer.New(cfg.ScorerConfig(logger))
+q, err := queue.Connect(ctx, cfg.QueueConfig(logger))
+policy.New(cfg.PolicyConfig(), nil)
 ```
+
+`internal/` keeps the package private to this module. A program in another
+module that wants to embed the engine needs `config` (and the components)
+moved out of `internal/`, for example to `pkg/`.
 
 Details worth knowing:
 
@@ -222,9 +253,19 @@ Each component has a `New`-style function that validates its input, fills in
 defaults for optional fields (a nil logger becomes `slog.Default()`, a nil
 HTTP client a new one) and returns a ready value: `scorer.New`,
 `policy.New`, `server.New`, `otlp.NewReceiver`, `queue.Connect`,
-`export.NewPhoenix`. These are plain constructors. Nothing picks an
-implementation by name at run time, so there is no factory in the
-abstract-factory or registry sense.
+`export.NewPhoenix`. These are plain constructors: each component has one
+implementation, so there is nothing to choose between yet.
+
+### Abstract factory for configuration
+
+Settings can come from more than one place: the YAML file the binary reads,
+or values a program builds in code. `config.AbstractLoaderFactory` builds the
+pair of loaders for one source, a config loader and a manifest loader, so the
+two always agree (a YAML file's relative manifest path resolves against the
+file; a `StaticFactory` can carry the manifest as a value). `config.Compiler`
+is given a factory and an environment lookup and never knows which source it
+has. A new source (flags, a database, a remote store) is a new factory, with
+no change to the compiler or to validation.
 
 ### Config structs, and functional options in one place
 
@@ -340,7 +381,8 @@ call concurrently. There are no locks in the pipeline itself.
 
 | To change | Look in |
 | --- | --- |
-| A config key or default | `internal/config/config.go` (`Default`, `validate`), then `observer.schema.yaml` and `observer.yaml` |
+| A config key or default | `internal/config/config.go` (`Default`), `validate.go`, and `compile.go` if a component reads it; then `observer.schema.yaml` and `observer.yaml` |
+| Where settings come from | `internal/config/loader.go`: a new `AbstractLoaderFactory` |
 | An HTTP route | `internal/server/server.go`, then `internal/server/openapi.yaml` |
 | What Kev is shown | `internal/trace/slice.go`; it must stay identical to the Python `build_state` |
 | How spans map to a trace | `internal/otlp/convert.go` |
