@@ -7,6 +7,7 @@ import (
 
 	"github.com/observer-ai/engine/pkg/broker"
 	"github.com/observer-ai/engine/pkg/export"
+	exportnats "github.com/observer-ai/engine/pkg/export/natsq"
 	"github.com/observer-ai/engine/pkg/metrics"
 	"github.com/observer-ai/engine/pkg/observe"
 	"github.com/observer-ai/engine/pkg/pipeline"
@@ -80,6 +81,7 @@ func (c *Config) QueueConfig(logger *slog.Logger) queue.Config {
 		DLQStream:         c.Queue.DLQStream,
 		DLQSubject:        c.Queue.DLQSubject,
 		DLQMaxAge:         c.Queue.DLQMaxAge.Std(),
+		Replicas:          c.Queue.Replicas,
 		Spans:             c.OTLP.spanConfig(),
 		Logger:            logger,
 	}
@@ -122,18 +124,25 @@ func exportBackoff(in []Duration) []time.Duration {
 
 // BrokerConfig chooses where the queues live: NATS when queue.url is set.
 func (c *Config) BrokerConfig(logger *slog.Logger) broker.Config {
-	return broker.Config{URL: c.Queue.URL, Logger: logger}
+	a, t := c.Queue.Auth, c.Queue.TLS
+	return broker.Config{
+		URL:    c.Queue.URL,
+		Auth:   broker.NATSAuth{CredentialsFile: a.CredentialsFile, NkeySeedFile: a.NkeySeedFile, User: a.User, Password: a.Password, Token: a.Token},
+		TLS:    broker.NATSTLS{CAFile: t.CAFile, CertFile: t.CertFile, KeyFile: t.KeyFile},
+		Logger: logger,
+	}
 }
 
 // ExportStreams names the export queues' JetStream objects.
-func (c *Config) ExportStreams() export.NATSStreams {
-	return export.NATSStreams{
+func (c *Config) ExportStreams() exportnats.Streams {
+	return exportnats.Streams{
 		Stream:     c.Queue.ExportStream,
 		Subject:    c.Queue.ExportSubject,
 		Consumer:   c.Queue.Consumer + "-export",
 		DLQStream:  c.Queue.ExportDLQStream,
 		DLQSubject: c.Queue.ExportDLQSubject,
 		DLQMaxAge:  c.Queue.DLQMaxAge.Std(),
+		Replicas:   c.Queue.Replicas,
 	}
 }
 

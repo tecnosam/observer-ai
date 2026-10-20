@@ -1,0 +1,185 @@
+# Observer.ai inference engine chart.
+#
+# The least you set: config.scorer.endpoint (your System One model server)
+# and one manifest (manifests.files or manifests.existingConfigMap). Every
+# other setting has a working default: queues in memory, no exporters.
+
+image:
+  repository: ghcr.io/observer-ai/engine
+  tag: ""                    # defaults to the chart's appVersion
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+nameOverride: ""
+fullnameOverride: ""
+
+replicaCount: 2
+
+# observer.yaml, exactly as engine/observer.schema.yaml describes it. Keys you
+# leave out keep the engine's defaults. The chart sets the listen addresses,
+# and queue.url when nats.enabled; it does not touch anything else.
+config:
+  scorer:
+    endpoint: http://system-one-model:8010/v1/systemone
+    model: kev-latest
+    manifest: /etc/observer/manifests/manifest.json
+  # agents:
+  #   models:
+  #     support-bot:                    # complete on its own; nothing comes from scorer
+  #       endpoint: http://system-one-model:8010/v1/systemone
+  #       model: kev-support
+  #       manifest: /etc/observer/manifests/support-bot.json
+  exporters: []              # none by default; e.g. Phoenix or Langfuse, see engine/README.md
+  # observability:
+  #   metrics:
+  #     endpoint: http://otel-collector:4318/v1/metrics
+
+# Model manifests, mounted as files in /etc/observer/manifests. Give them
+# inline, or name a ConfigMap you manage that holds them (one key per file).
+manifests:
+  files: {}
+  #  manifest.json: |
+  #    {"model": "...", "questions": {...}, "temperatures": {...}}
+  existingConfigMap: ""
+
+# Environment variables for the engine. Secrets the config names by variable
+# (scorer.api_key_env, exporters[].headers_env, queue.auth.token_env, ...)
+# come in here, from Secrets you manage:
+#   env:
+#     - name: JEV_API_KEY
+#       valueFrom: {secretKeyRef: {name: observer-secrets, key: jev-api-key}}
+env: []
+envFrom: []
+
+# Files the config points at, e.g. NATS credentials or certificates.
+extraVolumes: []
+extraVolumeMounts: []
+
+# An external NATS (one you already run): its URL, e.g.
+# nats://nats.messaging:4222. Leave empty, with nats.enabled false, to keep the
+# queues in memory. Ignored when nats.enabled. Auth, TLS and replicas go under
+# config.queue.
+queue:
+  url: ""
+
+service:
+  type: ClusterIP
+  annotations: {}
+  ports:
+    http: 8080               # JSON API, /healthz, /readyz, /docs
+    otlpGrpc: 4317
+    otlpHttp: 4318
+  # How the Service spreads connections. Empty picks for you: ClientIP when
+  # the queues are in memory and no trace-routing gateway runs (so one agent's
+  # spans reach one pod), None otherwise.
+  sessionAffinity: ""
+
+# Every span of a trace must reach the pod that assembles it when the queues
+# are in memory. The gateway is an OpenTelemetry Collector that splits each
+# OTLP batch by trace ID and sends each trace to one engine pod, by
+# consistent hashing. Point your agents at it instead of the engine. Not
+# needed with NATS, where any pod can assemble any trace.
+traceRouting:
+  gateway:
+    enabled: false
+    image:
+      repository: otel/opentelemetry-collector-contrib
+      tag: "0.111.0"
+      pullPolicy: IfNotPresent
+    replicaCount: 2
+    resources:
+      requests: {cpu: 100m, memory: 128Mi}
+      limits: {memory: 512Mi}
+
+resources:
+  requests: {cpu: 250m, memory: 256Mi}
+  limits: {memory: 1Gi}
+
+# Readiness decides whether the Service sends a pod traffic. /healthz keeps a
+# pod in service while its model is down (traces still queue and are retried);
+# /readyz also requires the queue and the default model to answer.
+probes:
+  readinessPath: /healthz
+
+# On CPU. The engine mostly waits on its model, so CPU says little about
+# load; prefer queueDepth below when the queues are in NATS.
+autoscaling:
+  enabled: false
+  minReplicas: 2
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 70
+  # On the backlog: traces waiting to be scored, read by KEDA's
+  # nats-jetstream scaler from the workers' consumer. Needs KEDA installed in
+  # the cluster and the queues in NATS (bundled or queue.url). Replaces the
+  # CPU autoscaler above; enable one or the other.
+  queueDepth:
+    enabled: false
+    minReplicas: 1
+    maxReplicas: 10
+    lagThreshold: 50              # waiting traces per engine pod
+    pollingInterval: 15           # seconds between reads
+    cooldownPeriod: 300           # seconds idle before scaling to minReplicas
+    # host:port of the NATS monitoring endpoint (8222). Defaults to the
+    # bundled NATS; for your own NATS, its headless Service's address.
+    natsMonitoringEndpoint: ""
+    account: "$G"                 # the NATS account the streams live in
+    kedaNamespace: keda           # lets KEDA through the NATS NetworkPolicy
+
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}            # e.g. eks.amazonaws.com/role-arn for IAM roles for service accounts
+
+podAnnotations: {}
+podLabels: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
+# Spread engine pods across nodes; set [] to turn off.
+topologySpreadConstraints:
+  - maxSkew: 1
+    topologyKey: kubernetes.io/hostname
+    whenUnsatisfiable: ScheduleAnyway
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  fsGroup: 10001
+  seccompProfile: {type: RuntimeDefault}
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities: {drop: [ALL]}
+
+# Only engine pods (and the other NATS servers) may reach the bundled NATS.
+networkPolicy:
+  enabled: true
+
+# The bundled NATS JetStream cluster (the official NATS chart): three servers
+# that act as one Service, each with its own volume, replicating every stream
+# the engine creates. Off by default; queues then live in memory, or in
+# queue.url's NATS.
+nats:
+  enabled: false
+  config:
+    cluster:
+      enabled: true
+      replicas: 3
+    jetstream:
+      enabled: true
+      fileStore:
+        pvc:
+          size: 10Gi
+    merge:
+      max_payload: 8388608   # 8 MiB: a trace queued with its original spans
+  podTemplate:
+    topologySpreadConstraints:
+      kubernetes.io/hostname:
+        maxSkew: 1
+        whenUnsatisfiable: DoNotSchedule
+  natsBox:
+    enabled: false

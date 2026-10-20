@@ -122,51 +122,34 @@ func TestTruncateRunes(t *testing.T) {
 	}
 }
 
-func TestPyRepr(t *testing.T) {
+// compactJSON prints what Python's json.dumps(v, ensure_ascii=False,
+// separators=(",", ":")) prints.
+func TestCompactJSON(t *testing.T) {
 	tests := []struct{ in, want string }{
-		{`"plain"`, `'plain'`},
-		{`"it's"`, `"it's"`},
-		{`"say \"hi\""`, `'say "hi"'`},
-		{`"it's \"both\""`, `'it\'s "both"'`},
-		{`"back\\slash"`, `'back\\slash'`},
-		{`"a\nb\tc\r"`, `'a\nb\tc\r'`},
-		{`"\u0000\u001f\u007f"`, `'\x00\x1f\x7f'`},
-		{`"\u00a0\u200b"`, `'\xa0\u200b'`},
-		{`"é日😀"`, `'é日😀'`},
-		{`""`, `''`},
-		{`1`, `1`},
-		{`-0`, `0`},
-		{`1.0`, `1.0`},
-		{`1e16`, `1e+16`},
-		{`1e15`, `1000000000000000.0`},
-		{`0.00001`, `1e-05`},
-		{`-0.0`, `-0.0`},
-		{`1e999`, `inf`},
-		{`true`, `True`},
-		{`false`, `False`},
-		{`null`, `None`},
-		{`[]`, `[]`},
+		{`{"query": "capital of France", "limit": 3}`, `{"query":"capital of France","limit":3}`},
+		{`{"b": 1, "a": 2}`, `{"b":1,"a":2}`},         // key order kept
+		{`{"a": 1, "b": 2, "a": 3}`, `{"a":3,"b":2}`}, // a repeated key: first place, last value
+		{`"Seine"`, `"Seine"`},
+		{`[1, [2, {"x": null}], true, false]`, `[1,[2,{"x":null}],true,false]`},
 		{`{}`, `{}`},
-		{`[1, "a", null]`, `[1, 'a', None]`},
-		{`{"b": 1, "a": {"c": [true]}}`, `{'b': 1, 'a': {'c': [True]}}`},
-		{`{"a": 1, "b": 2, "a": 3}`, `{'a': 3, 'b': 2}`},
+		{`[]`, `[]`},
+		{`{"a": {}, "b": []}`, `{"a":{},"b":[]}`},
+		{`1.5e3`, `1.5e3`},                           // numbers as written
+		{`"caf\u00e9 \ud83d\ude80"`, `"café 🚀"`},     // escapes decoded
+		{`"tab\tnl\nq\"bs\\"`, `"tab\tnl\nq\"bs\\"`}, // required escapes kept
+		{`"nul:\u0000 esc:\u001b del:\u007f"`, `"nul:\u0000 esc:\u001b del:` + "\x7f" + `"`},
+		{`"ls:\u2028 ps:\u2029"`, "\"ls:\u2028 ps:\u2029\""},
+		{`"<b>&</b>"`, `"<b>&</b>"`}, // no HTML escaping
 	}
 	for _, tt := range tests {
-		got, err := pyRepr([]byte(tt.in))
+		got, err := compactJSON([]byte(tt.in))
 		if err != nil {
-			t.Errorf("pyRepr(%s): %v", tt.in, err)
+			t.Errorf("compactJSON(%s): %v", tt.in, err)
 			continue
 		}
 		if got != tt.want {
-			t.Errorf("pyRepr(%s) = %s, want %s", tt.in, got, tt.want)
+			t.Errorf("compactJSON(%s) = %s, want %s", tt.in, got, tt.want)
 		}
-	}
-}
-
-func TestPyReprDepthLimit(t *testing.T) {
-	deep := strings.Repeat("[", maxReprDepth+2) + strings.Repeat("]", maxReprDepth+2)
-	if _, err := pyRepr([]byte(deep)); err == nil {
-		t.Error("expected an error for args nested past the depth limit")
 	}
 }
 

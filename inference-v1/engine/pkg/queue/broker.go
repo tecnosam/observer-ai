@@ -24,6 +24,9 @@ type AbstractBroker interface {
 	StartAssemblers(n int, assemble AssembleFunc) Stopper
 	// Ready reports whether the broker can take traces.
 	Ready() error
+	// Depth is how many traces wait to be scored: queued, waiting to be
+	// redelivered, or being handled.
+	Depth(ctx context.Context) (int64, error)
 	// Close releases the broker. Stop its workers and assemblers first.
 	Close()
 }
@@ -33,8 +36,3 @@ type Stopper interface {
 	// Stop stops the pool after the work in flight, or when ctx ends.
 	Stop(ctx context.Context) error
 }
-
-var (
-	_ AbstractBroker = (*Queue)(nil)
-	_ AbstractBroker = (*MemoryBroker)(nil)
-)

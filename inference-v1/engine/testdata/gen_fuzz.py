@@ -59,7 +59,7 @@ def main():
     mixed_pool = ascii_pool * 40 + rng.sample(points, 4000)
     traces = []
 
-    # Every code point, once as tool args (repr path) and once as evidence.
+    # Every code point, once as tool args (the JSON path) and once as evidence.
     for i in range(0, len(points), 1000):
         chunk = "".join(points[i:i + 1000])
         traces.append({

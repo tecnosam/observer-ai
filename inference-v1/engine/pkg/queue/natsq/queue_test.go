@@ -1,11 +1,9 @@
-package queue_test
+package natsq_test
 
 import (
 	"context"
 	"encoding/json"
 	"errors"
-	"io"
-	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -20,34 +18,14 @@ import (
 
 	"github.com/observer-ai/engine/pkg/fault"
 	"github.com/observer-ai/engine/pkg/queue"
+	"github.com/observer-ai/engine/pkg/queue/natsq"
 	"github.com/observer-ai/engine/pkg/queue/queuetest"
 	"github.com/observer-ai/engine/pkg/trace"
 )
 
-const waitFor = 10 * time.Second
-
-func testConfig(url string) queue.Config {
-	return queue.Config{
-		URL:               url,
-		ConnectTimeout:    5 * time.Second,
-		Stream:            "TRACES",
-		Subject:           "traces.in",
-		Consumer:          "workers",
-		MaxMessages:       1000,
-		AckWait:           30 * time.Second,
-		MaxDeliver:        3,
-		RedeliveryBackoff: []time.Duration{20 * time.Millisecond},
-		DLQStream:         "TRACES_DLQ",
-		DLQSubject:        "traces.dlq",
-		DLQMaxAge:         time.Hour,
-		PollWait:          100 * time.Millisecond,
-		Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
-	}
-}
-
 type fixture struct {
 	srv *server.Server
-	q   *queue.Queue
+	q   *natsq.Queue
 	js  jetstream.JetStream // a separate connection, for inspecting streams
 	cfg queue.Config
 }
@@ -55,11 +33,11 @@ type fixture struct {
 func setup(t *testing.T, mutate func(*queue.Config)) *fixture {
 	t.Helper()
 	srv := queuetest.StartServer(t)
-	cfg := testConfig(srv.ClientURL())
+	cfg := queuetest.Config(srv.ClientURL())
 	if mutate != nil {
 		mutate(&cfg)
 	}
-	q, err := queue.Connect(context.Background(), cfg)
+	q, err := natsq.Connect(context.Background(), cfg)
 	if err != nil {
 		t.Fatalf("Connect: %v", err)
 	}
@@ -82,7 +60,7 @@ func (f *fixture) start(t *testing.T, n int, h queue.Handler) queue.Stopper {
 	t.Helper()
 	w := f.q.StartWorkers(n, h)
 	t.Cleanup(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), waitFor)
+		ctx, cancel := context.WithTimeout(context.Background(), queuetest.WaitFor)
 		defer cancel()
 		w.Stop(ctx)
 	})
@@ -124,23 +102,7 @@ func (f *fixture) deadLetters(t *testing.T) []*jetstream.RawStreamMsg {
 	return out
 }
 
-func eventually(t *testing.T, what string, cond func() bool) {
-	t.Helper()
-	deadline := time.Now().Add(waitFor)
-	for time.Now().Before(deadline) {
-		if cond() {
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	t.Fatalf("timed out waiting for %s", what)
-}
-
-func sample(id string) trace.Trace {
-	return trace.Trace{TraceID: id, Question: "q " + id, FinalAnswer: "a"}
-}
-
-func mustPublish(t *testing.T, q *queue.Queue, tr trace.Trace) {
+func mustPublish(t *testing.T, q *natsq.Queue, tr trace.Trace) {
 	t.Helper()
 	if err := q.Publish(context.Background(), tr); err != nil {
 		t.Fatalf("Publish: %v", err)
@@ -151,7 +113,7 @@ func mustPublish(t *testing.T, q *queue.Queue, tr trace.Trace) {
 // is byte-for-byte the golden slice for every fixture.
 func TestPublishedTraceBuildsTheSameState(t *testing.T) {
 	f := setup(t, nil)
-	paths, err := filepath.Glob("../../testdata/traces/*.json")
+	paths, err := filepath.Glob("../../../testdata/traces/*.json")
 	if err != nil || len(paths) == 0 {
 		t.Fatalf("no trace fixtures: %v", err)
 	}
@@ -168,7 +130,7 @@ func TestPublishedTraceBuildsTheSameState(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		golden, err := os.ReadFile(filepath.Join("../../testdata/golden", name+".txt"))
+		golden, err := os.ReadFile(filepath.Join("../../../testdata/golden", name+".txt"))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -185,7 +147,7 @@ func TestPublishedTraceBuildsTheSameState(t *testing.T) {
 		got[tr.TraceID] = string(trace.BuildState(tr))
 		return nil
 	})
-	eventually(t, "all traces to be processed", func() bool {
+	queuetest.Eventually(t, "all traces to be processed", func() bool {
 		mu.Lock()
 		defer mu.Unlock()
 		return len(got) == len(want)
@@ -195,7 +157,7 @@ func TestPublishedTraceBuildsTheSameState(t *testing.T) {
 			t.Errorf("%s: state after the queue differs from the golden slice\n got %q\nwant %q", name, got[name], state)
 		}
 	}
-	eventually(t, "the work queue to empty", func() bool { return f.messages(t, f.cfg.Stream) == 0 })
+	queuetest.Eventually(t, "the work queue to empty", func() bool { return f.messages(t, f.cfg.Stream) == 0 })
 	if n := f.messages(t, f.cfg.DLQStream); n != 0 {
 		t.Errorf("%d dead letters, want 0", n)
 	}
@@ -203,7 +165,7 @@ func TestPublishedTraceBuildsTheSameState(t *testing.T) {
 
 func TestSystemErrorIsRedeliveredThenSucceeds(t *testing.T) {
 	f := setup(t, nil)
-	mustPublish(t, f.q, sample("t1"))
+	mustPublish(t, f.q, queuetest.Sample("t1"))
 
 	var calls atomic.Int32
 	f.start(t, 2, func(context.Context, trace.Trace) error {
@@ -212,7 +174,7 @@ func TestSystemErrorIsRedeliveredThenSucceeds(t *testing.T) {
 		}
 		return nil
 	})
-	eventually(t, "the trace to be acknowledged", func() bool { return f.messages(t, f.cfg.Stream) == 0 })
+	queuetest.Eventually(t, "the trace to be acknowledged", func() bool { return f.messages(t, f.cfg.Stream) == 0 })
 	if calls.Load() != 2 {
 		t.Errorf("handler called %d times, want 2", calls.Load())
 	}
@@ -223,10 +185,10 @@ func TestSystemErrorIsRedeliveredThenSucceeds(t *testing.T) {
 
 func TestPersistentSystemErrorIsDeadLettered(t *testing.T) {
 	f := setup(t, nil) // max_deliver 3
-	tr := sample("doomed")
+	tr := queuetest.Sample("doomed")
 	tr.Evidence = []string{"é evidence"}
 	mustPublish(t, f.q, tr)
-	mustPublish(t, f.q, sample("fine"))
+	mustPublish(t, f.q, queuetest.Sample("fine"))
 
 	var doomedCalls, fineCalls atomic.Int32
 	f.start(t, 2, func(_ context.Context, got trace.Trace) error {
@@ -238,8 +200,8 @@ func TestPersistentSystemErrorIsDeadLettered(t *testing.T) {
 		return nil
 	})
 
-	eventually(t, "the trace to reach the dead-letter stream", func() bool { return f.messages(t, f.cfg.DLQStream) == 1 })
-	eventually(t, "the work queue to empty", func() bool { return f.messages(t, f.cfg.Stream) == 0 })
+	queuetest.Eventually(t, "the trace to reach the dead-letter stream", func() bool { return f.messages(t, f.cfg.DLQStream) == 1 })
+	queuetest.Eventually(t, "the work queue to empty", func() bool { return f.messages(t, f.cfg.Stream) == 0 })
 	if doomedCalls.Load() != 3 {
 		t.Errorf("failing trace delivered %d times, want max_deliver = 3", doomedCalls.Load())
 	}
@@ -252,21 +214,21 @@ func TestPersistentSystemErrorIsDeadLettered(t *testing.T) {
 		t.Errorf("dead letter subject = %q, want %q", dead.Subject, f.cfg.DLQSubject)
 	}
 	wantHeaders := map[string]string{
-		queue.HeaderTraceID:        "doomed",
-		queue.HeaderDeadReason:     queue.ReasonSystemError,
-		queue.HeaderDeliveries:     "3",
-		queue.HeaderSourceStream:   "TRACES",
-		queue.HeaderSourceSequence: "1",
+		natsq.HeaderTraceID:        "doomed",
+		natsq.HeaderDeadReason:     queue.ReasonSystemError,
+		natsq.HeaderDeliveries:     "3",
+		natsq.HeaderSourceStream:   "TRACES",
+		natsq.HeaderSourceSequence: "1",
 		// Newlines are flattened so the error fits in a header.
-		queue.HeaderDeadError: "scorer: giving up after 4 attempts: kev returned HTTP 503: model loading",
+		natsq.HeaderDeadError: "scorer: giving up after 4 attempts: kev returned HTTP 503: model loading",
 	}
 	for k, want := range wantHeaders {
 		if got := dead.Header.Get(k); got != want {
 			t.Errorf("header %s = %q, want %q", k, got, want)
 		}
 	}
-	if _, err := time.Parse(time.RFC3339, dead.Header.Get(queue.HeaderDeadAt)); err != nil {
-		t.Errorf("header %s = %q is not RFC 3339", queue.HeaderDeadAt, dead.Header.Get(queue.HeaderDeadAt))
+	if _, err := time.Parse(time.RFC3339, dead.Header.Get(natsq.HeaderDeadAt)); err != nil {
+		t.Errorf("header %s = %q is not RFC 3339", natsq.HeaderDeadAt, dead.Header.Get(natsq.HeaderDeadAt))
 	}
 
 	// The body is the original trace, ready to be replayed.
@@ -281,13 +243,13 @@ func TestPersistentSystemErrorIsDeadLettered(t *testing.T) {
 
 func TestMaxDeliverOneDeadLettersOnFirstFailure(t *testing.T) {
 	f := setup(t, func(c *queue.Config) { c.MaxDeliver = 1 })
-	mustPublish(t, f.q, sample("t1"))
+	mustPublish(t, f.q, queuetest.Sample("t1"))
 	var calls atomic.Int32
 	f.start(t, 1, func(context.Context, trace.Trace) error {
 		calls.Add(1)
 		return errors.New("connection refused")
 	})
-	eventually(t, "the dead letter", func() bool { return f.messages(t, f.cfg.DLQStream) == 1 })
+	queuetest.Eventually(t, "the dead letter", func() bool { return f.messages(t, f.cfg.DLQStream) == 1 })
 	if calls.Load() != 1 {
 		t.Errorf("handler called %d times, want 1", calls.Load())
 	}
@@ -305,17 +267,17 @@ func TestInvalidPayloadIsDeadLetteredImmediately(t *testing.T) {
 		calls.Add(1)
 		return nil
 	})
-	eventually(t, "the dead letter", func() bool { return f.messages(t, f.cfg.DLQStream) == 1 })
-	eventually(t, "the work queue to empty", func() bool { return f.messages(t, f.cfg.Stream) == 0 })
+	queuetest.Eventually(t, "the dead letter", func() bool { return f.messages(t, f.cfg.DLQStream) == 1 })
+	queuetest.Eventually(t, "the work queue to empty", func() bool { return f.messages(t, f.cfg.Stream) == 0 })
 
 	dead := f.deadLetters(t)[0]
-	if got := dead.Header.Get(queue.HeaderDeadReason); got != queue.ReasonInvalidPayload {
+	if got := dead.Header.Get(natsq.HeaderDeadReason); got != queue.ReasonInvalidPayload {
 		t.Errorf("reason = %q, want %q", got, queue.ReasonInvalidPayload)
 	}
-	if got := dead.Header.Get(queue.HeaderDeadError); !strings.Contains(got, "final_answer is required") {
+	if got := dead.Header.Get(natsq.HeaderDeadError); !strings.Contains(got, "final_answer is required") {
 		t.Errorf("error header = %q", got)
 	}
-	if got := dead.Header.Get(queue.HeaderDeliveries); got != "1" {
+	if got := dead.Header.Get(natsq.HeaderDeliveries); got != "1" {
 		t.Errorf("deliveries = %q, want 1", got)
 	}
 	if string(dead.Data) != `{"question": "no answer"}` {
@@ -328,10 +290,10 @@ func TestInvalidPayloadIsDeadLetteredImmediately(t *testing.T) {
 
 func TestPublishWhenStreamIsFull(t *testing.T) {
 	f := setup(t, func(c *queue.Config) { c.MaxMessages = 2 })
-	mustPublish(t, f.q, sample("t1"))
-	mustPublish(t, f.q, sample("t2"))
+	mustPublish(t, f.q, queuetest.Sample("t1"))
+	mustPublish(t, f.q, queuetest.Sample("t2"))
 
-	err := f.q.Publish(context.Background(), sample("t3"))
+	err := f.q.Publish(context.Background(), queuetest.Sample("t3"))
 	if fault.KindOf(err) != fault.KindFull {
 		t.Fatalf("Publish to a full stream = %v, want a full fault", err)
 	}
@@ -341,8 +303,8 @@ func TestPublishWhenStreamIsFull(t *testing.T) {
 
 	// Once a worker makes room, publishing works again.
 	f.start(t, 1, func(context.Context, trace.Trace) error { return nil })
-	eventually(t, "room in the stream", func() bool { return f.messages(t, f.cfg.Stream) == 0 })
-	mustPublish(t, f.q, sample("t4"))
+	queuetest.Eventually(t, "room in the stream", func() bool { return f.messages(t, f.cfg.Stream) == 0 })
+	mustPublish(t, f.q, queuetest.Sample("t4"))
 }
 
 func TestPublishAndReadyWhenNATSIsDown(t *testing.T) {
@@ -353,11 +315,11 @@ func TestPublishAndReadyWhenNATSIsDown(t *testing.T) {
 
 	f.srv.Shutdown()
 	f.srv.WaitForShutdown()
-	eventually(t, "the client to notice the disconnect", func() bool { return f.q.Ready() != nil })
+	queuetest.Eventually(t, "the client to notice the disconnect", func() bool { return f.q.Ready() != nil })
 
 	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
 	defer cancel()
-	err := f.q.Publish(ctx, sample("t1"))
+	err := f.q.Publish(ctx, queuetest.Sample("t1"))
 	if !fault.Retryable(err) {
 		t.Errorf("Publish with NATS down = %v, want an unavailable fault", err)
 	}
@@ -367,7 +329,7 @@ func TestWorkersRunConcurrently(t *testing.T) {
 	const n = 4
 	f := setup(t, nil)
 	for i := range n {
-		mustPublish(t, f.q, sample(string(rune('a'+i))))
+		mustPublish(t, f.q, queuetest.Sample(string(rune('a'+i))))
 	}
 
 	var running atomic.Int32
@@ -385,15 +347,15 @@ func TestWorkersRunConcurrently(t *testing.T) {
 	})
 	select {
 	case <-allRunning:
-	case <-time.After(waitFor):
+	case <-time.After(queuetest.WaitFor):
 		t.Fatalf("only %d of %d workers ran at once", running.Load(), n)
 	}
-	eventually(t, "the work queue to empty", func() bool { return f.messages(t, f.cfg.Stream) == 0 })
+	queuetest.Eventually(t, "the work queue to empty", func() bool { return f.messages(t, f.cfg.Stream) == 0 })
 }
 
 func TestStopWaitsForInFlightWork(t *testing.T) {
 	f := setup(t, nil)
-	mustPublish(t, f.q, sample("t1"))
+	mustPublish(t, f.q, queuetest.Sample("t1"))
 
 	started := make(chan struct{})
 	release := make(chan struct{})
@@ -429,7 +391,7 @@ func TestStopWaitsForInFlightWork(t *testing.T) {
 // dead-lettered: it goes back to the queue for the next worker.
 func TestStopTimeoutReturnsTraceToQueue(t *testing.T) {
 	f := setup(t, func(c *queue.Config) { c.MaxDeliver = 1 }) // even on its last delivery
-	mustPublish(t, f.q, sample("t1"))
+	mustPublish(t, f.q, queuetest.Sample("t1"))
 
 	started := make(chan struct{})
 	w := f.q.StartWorkers(1, func(ctx context.Context, _ trace.Trace) error {
@@ -457,14 +419,14 @@ func TestStopTimeoutReturnsTraceToQueue(t *testing.T) {
 		got.Store(tr.TraceID)
 		return nil
 	})
-	eventually(t, "the trace to be redelivered", func() bool { return got.Load() == "t1" })
+	queuetest.Eventually(t, "the trace to be redelivered", func() bool { return got.Load() == "t1" })
 }
 
 func TestConnectFailsWhenNATSNeverAppears(t *testing.T) {
-	cfg := testConfig("nats://127.0.0.1:1")
+	cfg := queuetest.Config("nats://127.0.0.1:1")
 	cfg.ConnectTimeout = 300 * time.Millisecond
 	start := time.Now()
-	_, err := queue.Connect(context.Background(), cfg)
+	_, err := natsq.Connect(context.Background(), cfg)
 	if err == nil {
 		t.Fatal("Connect succeeded with nothing listening")
 	}
@@ -480,9 +442,9 @@ func TestConnectFailsWhenNATSNeverAppears(t *testing.T) {
 // the consumer rather than failing or resetting them.
 func TestConnectIsIdempotent(t *testing.T) {
 	f := setup(t, nil)
-	mustPublish(t, f.q, sample("t1"))
+	mustPublish(t, f.q, queuetest.Sample("t1"))
 
-	second, err := queue.Connect(context.Background(), f.cfg)
+	second, err := natsq.Connect(context.Background(), f.cfg)
 	if err != nil {
 		t.Fatalf("second Connect: %v", err)
 	}
@@ -497,7 +459,7 @@ func TestConnectIsIdempotent(t *testing.T) {
 		return nil
 	})
 	defer w.Stop(context.Background())
-	eventually(t, "the second connection to consume the trace", func() bool { return got.Load() == 1 })
+	queuetest.Eventually(t, "the second connection to consume the trace", func() bool { return got.Load() == 1 })
 }
 
 // A producer that publishes straight to the subject may leave trace_id out.
@@ -519,7 +481,7 @@ func TestTraceWithoutIDGetsStableID(t *testing.T) {
 		}
 		return nil
 	})
-	eventually(t, "two deliveries", func() bool {
+	queuetest.Eventually(t, "two deliveries", func() bool {
 		mu.Lock()
 		defer mu.Unlock()
 		return len(ids) == 2

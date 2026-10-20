@@ -1,4 +1,9 @@
-package export
+// Package natsq is the export.AbstractQueue on NATS JetStream: a record
+// queued for a back end survives an engine restart and a back-end outage
+// (up to MaxDeliver tries), and engines sharing the streams share the
+// sending. The conformance suite in package export checks it keeps memq's
+// rules.
+package natsq
 
 import (
 	"context"
@@ -12,6 +17,7 @@ import (
 	"github.com/nats-io/nats.go/jetstream"
 
 	"github.com/observer-ai/engine/internal/common"
+	"github.com/observer-ai/engine/pkg/export"
 	"github.com/observer-ai/engine/pkg/fault"
 	"github.com/observer-ai/engine/pkg/pipeline"
 	"github.com/observer-ai/engine/pkg/trace"
@@ -22,10 +28,10 @@ const (
 	natsAckTimeout     = 5 * time.Second
 	natsFlushPoll      = 25 * time.Millisecond
 	defaultNATSPoll    = 500 * time.Millisecond // short: the export workers stop last, after the trace workers
-	// natsAckWait outlasts the longest send (a forward gives up after
-	// forwardMaxElapsed), so a record is not handed to a second worker
-	// while the first is still sending it.
-	natsAckWait = 4 * forwardMaxElapsed
+	// natsAckWait outlasts the longest send (an OTLP forward gives up
+	// after 15s), so a record is not handed to a second worker while the
+	// first is still sending it.
+	natsAckWait = time.Minute
 
 	headerTraceID    = "Observer-Trace-Id"
 	headerExporter   = "Observer-Exporter"
@@ -34,31 +40,33 @@ const (
 	headerDeliveries = "Observer-Deliveries"
 )
 
-// NATSStreams names the JetStream objects the export queues use. Each back
+// Streams names the JetStream objects the export queues use. Each back
 // end gets its own work-queue stream <Stream>_<NAME>, on subject
 // <Subject>.<name>, read by the durable consumer <Consumer>-<name>. Records
 // given up after MaxDeliver go to the shared DLQStream on DLQSubject.
-type NATSStreams struct {
+type Streams struct {
 	Stream     string
 	Subject    string
 	Consumer   string
 	DLQStream  string
 	DLQSubject string
 	DLQMaxAge  time.Duration
+	// Replicas is how many copies of each stream a NATS cluster keeps.
+	Replicas int
 	// PollWait bounds how long an idle worker takes to notice Shutdown.
 	PollWait time.Duration
 }
 
-// NATSQueueFactory keeps export queues in NATS JetStream: a record queued
+// Factory keeps export queues in NATS JetStream: a record queued
 // for a back end survives an engine restart and a back-end outage (up to
 // MaxDeliver tries), and engines sharing the streams share the sending.
-type NATSQueueFactory struct {
+type Factory struct {
 	Conn    *common.Conn
-	Streams NATSStreams
+	Streams Streams
 }
 
-func (f NATSQueueFactory) Queue(ctx context.Context, cfg QueueConfig) (AbstractQueue, error) {
-	cfg = withQueueDefaults(cfg)
+func (f Factory) Queue(ctx context.Context, cfg export.QueueConfig) (export.AbstractQueue, error) {
+	cfg = cfg.WithDefaults()
 	s := f.Streams
 	if s.PollWait <= 0 {
 		s.PollWait = defaultNATSPoll
@@ -80,9 +88,9 @@ func (f NATSQueueFactory) Queue(ctx context.Context, cfg QueueConfig) (AbstractQ
 }
 
 type natsQueue struct {
-	cfg     QueueConfig
+	cfg     export.QueueConfig
 	conn    *common.Conn
-	streams NATSStreams
+	streams Streams
 	subject string
 	stream  string
 	cons    jetstream.Consumer
@@ -118,6 +126,7 @@ func (q *natsQueue) workStream() jetstream.StreamConfig {
 		Subjects:    []string{q.subject},
 		Retention:   jetstream.WorkQueuePolicy,
 		Storage:     jetstream.FileStorage,
+		Replicas:    q.streams.Replicas,
 		MaxMsgs:     int64(q.cfg.Size),
 		Discard:     jetstream.DiscardNew,
 	}
@@ -130,13 +139,14 @@ func (q *natsQueue) deadLetterStream() jetstream.StreamConfig {
 		Subjects:    []string{q.streams.DLQSubject},
 		Retention:   jetstream.LimitsPolicy,
 		Storage:     jetstream.FileStorage,
+		Replicas:    q.streams.Replicas,
 		MaxAge:      q.streams.DLQMaxAge,
 	}
 }
 
 func (q *natsQueue) Enqueue(ctx context.Context, rec pipeline.Record) error {
 	if q.pool.Stopping() {
-		return fault.Unavailable(fault.Export, "queue trace for export", errShutDown)
+		return fault.Unavailable(fault.Export, "queue trace for export", export.ErrShutDown)
 	}
 	data, err := encodeRecord(rec, q.conn.MaxPayload())
 	if err != nil {
@@ -169,14 +179,14 @@ func (q *natsQueue) handle(msg jetstream.Msg) {
 		return
 	}
 	sendErr := q.cfg.Send(context.Background(), rec)
-	switch result, delay := settle(q.cfg, rec, attempts, sendErr); result {
-	case sent:
+	switch result, delay := export.Settle(q.cfg, rec, attempts, sendErr); result {
+	case export.Sent:
 		q.ack(msg, rec.Trace.TraceID)
-	case retried:
+	case export.Retried:
 		if err := msg.NakWithDelay(delay); err != nil {
 			q.report(fault.Unavailable(fault.Export, "return trace to export queue", err).WithTrace(rec.Trace.TraceID))
 		}
-	case givenUp:
+	case export.GivenUp:
 		q.deadLetter(msg, rec, attempts, sendErr)
 	}
 }
@@ -196,10 +206,10 @@ func (q *natsQueue) deadLetter(msg jetstream.Msg, rec pipeline.Record, attempts 
 	defer cancel()
 	if _, err := q.conn.JS.PublishMsg(ctx, dead); err != nil {
 		q.report(fault.Unavailable(fault.Export, "dead-letter exported trace, it stays queued", err).AsSevere().WithTrace(rec.Trace.TraceID))
-		_ = msg.NakWithDelay(q.cfg.retry().Delay(attempts))
+		_ = msg.NakWithDelay(q.cfg.RetryDelay(attempts))
 		return
 	}
-	q.report(sendFault(q.cfg, rec, attempts, "export trace, dead-lettered", cause).AsSevere().With("dlq_stream", q.streams.DLQStream))
+	q.report(export.SendFault(q.cfg, rec, attempts, "export trace, dead-lettered", cause).AsSevere().With("dlq_stream", q.streams.DLQStream))
 	q.ack(msg, rec.Trace.TraceID)
 }
 
@@ -213,6 +223,16 @@ func (q *natsQueue) ack(msg jetstream.Msg, traceID string) {
 
 func (q *natsQueue) report(err *fault.Error) {
 	q.cfg.Reporter.Report(context.Background(), err.With("exporter", q.cfg.Name))
+}
+
+// Depth counts the back end's records not yet acknowledged, across every
+// engine sharing the stream.
+func (q *natsQueue) Depth(ctx context.Context) (int64, error) {
+	info, err := q.cons.Info(ctx)
+	if err != nil {
+		return 0, err
+	}
+	return int64(info.NumPending) + int64(info.NumAckPending), nil
 }
 
 // Flush waits until the back end's stream is empty: every record sent,
@@ -243,6 +263,7 @@ func (q *natsQueue) Shutdown(ctx context.Context) error {
 // recordMessage is a pipeline.Record as it is stored in JetStream.
 type recordMessage struct {
 	Trace     trace.Trace `json:"trace"`
+	Agent     string      `json:"agent"`
 	Keep      bool        `json:"keep"`
 	Scored    bool        `json:"scored"`
 	PKeep     float64     `json:"p_keep"`
@@ -258,7 +279,7 @@ type recordMessage struct {
 func encodeRecord(rec pipeline.Record, maxPayload int) ([]byte, error) {
 	d := rec.Decision
 	m := recordMessage{
-		Trace: rec.Trace, Keep: d.Keep, Scored: d.Scored, PKeep: float64(d.PKeep), PKeepRaw: float64(d.PKeepRaw),
+		Trace: rec.Trace, Agent: string(rec.Agent), Keep: d.Keep, Scored: d.Scored, PKeep: float64(d.PKeep), PKeepRaw: float64(d.PKeepRaw),
 		Reason: string(d.Reason), Severity: string(d.Severity), Model: string(rec.Model), LatencyNS: int64(rec.Latency),
 	}
 	data, err := json.Marshal(m)
@@ -276,6 +297,7 @@ func decodeRecord(data []byte) (pipeline.Record, error) {
 	}
 	return pipeline.Record{
 		Trace: m.Trace,
+		Agent: pipeline.AgentLabel(m.Agent),
 		Decision: pipeline.Decision{
 			Keep: m.Keep, Scored: m.Scored, PKeep: pipeline.Probability(m.PKeep), PKeepRaw: pipeline.Probability(m.PKeepRaw),
 			Reason: pipeline.Reason(m.Reason), Severity: pipeline.Severity(m.Severity),

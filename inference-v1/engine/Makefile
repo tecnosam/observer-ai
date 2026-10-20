@@ -5,7 +5,7 @@ FUZZ   := $(or $(TMPDIR),/tmp)/observer-fuzz-golden.jsonl
 
 NATS_BOX := docker run --rm --network observer_default natsio/nats-box:latest nats -s nats://nats:4222
 
-.PHONY: build test run lint fmt golden fuzz-golden clean nats phoenix up down logs dlq agent
+.PHONY: chart-lint build test run lint fmt golden fuzz-golden clean nats phoenix up down logs dlq agent
 
 build:
 	go build -o $(BIN) ./cmd/observer
@@ -72,3 +72,14 @@ fuzz-golden:
 
 clean:
 	rm -rf bin
+
+# Lint the Helm chart and render its main setups (needs helm).
+CHART := deploy/helm/observer
+CHART_MANIFEST := --set-file 'manifests.files.manifest\.json=testdata/manifest.json'
+chart-lint:
+	helm dependency update $(CHART)
+	helm lint $(CHART) $(CHART_MANIFEST)
+	helm template observer $(CHART) $(CHART_MANIFEST) > /dev/null
+	helm template observer $(CHART) $(CHART_MANIFEST) --set nats.enabled=true > /dev/null
+	helm template observer $(CHART) $(CHART_MANIFEST) --set traceRouting.gateway.enabled=true > /dev/null
+	helm template observer $(CHART) $(CHART_MANIFEST) --set nats.enabled=true --set autoscaling.queueDepth.enabled=true > /dev/null

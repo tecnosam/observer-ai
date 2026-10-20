@@ -48,6 +48,10 @@ func collect(t *testing.T, reader *sdkmetric.ManualReader) map[string][]point {
 				for _, dp := range data.DataPoints {
 					out[m.Name] = append(out[m.Name], point{dp.Attributes, dp.Value})
 				}
+			case metricdata.Gauge[int64]:
+				for _, dp := range data.DataPoints {
+					out[m.Name] = append(out[m.Name], point{dp.Attributes, dp.Value})
+				}
 			}
 		}
 	}
@@ -72,7 +76,7 @@ func TestRecorderInstruments(t *testing.T) {
 	r.RequestFinished(ctx, Request{Server: "otlp", Protocol: ProtocolGRPC, Method: "/x.TraceService/Export", Status: 14, Duration: time.Millisecond})
 	r.ScoreFinished(ctx, pipeline.ScoreResult{Agent: "support-bot", Model: "kev-support", Duration: time.Second})
 	r.ScoreFinished(ctx, pipeline.ScoreResult{Agent: "support-bot", Model: "kev-support", Err: fault.Timeout(fault.Scorer, "score", errors.New("slow"))})
-	r.TraceDecided(ctx, pipeline.Record{Trace: trace.Trace{Agent: "support-bot"}, Model: "kev-support",
+	r.TraceDecided(ctx, pipeline.Record{Trace: trace.Trace{Agent: "support-bot"}, Agent: "support-bot", Model: "kev-support",
 		Decision: pipeline.Decision{Keep: true, Reason: pipeline.ReasonModel}})
 	r.SendFinished(ctx, Send{Exporter: "langfuse", Err: fault.Unavailable(fault.Export, "forward", errors.New("503"))})
 	r.ErrorReported(fault.KindFull, fault.Queue)
@@ -163,5 +167,25 @@ func TestStartSendsOTLP(t *testing.T) {
 	}
 	if auth != "Bearer abc" || global != "" {
 		t.Errorf("headers: Authorization %q, x-global %q", auth, global)
+	}
+}
+
+// Every queue is read when metrics are collected; one that fails is skipped.
+func TestObserveQueues(t *testing.T) {
+	r, reader := newRecorder(t)
+	err := r.ObserveQueues(
+		QueueDepth{Queue: "traces", Depth: func(context.Context) (int64, error) { return 42, nil }},
+		QueueDepth{Queue: "export:phoenix", Depth: func(context.Context) (int64, error) { return 3, nil }},
+		QueueDepth{Queue: "export:down", Depth: func(context.Context) (int64, error) { return 0, errors.New("nats down") }},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]int64{}
+	for _, p := range collect(t, reader)["observer.queue.depth"] {
+		got[p.get("observer.queue")] = p.value
+	}
+	if len(got) != 2 || got["traces"] != 42 || got["export:phoenix"] != 3 {
+		t.Errorf("depths = %v", got)
 	}
 }

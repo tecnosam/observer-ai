@@ -1,0 +1,85 @@
+{{- if .Values.traceRouting.gateway.enabled }}
+{{- $gw := .Values.traceRouting.gateway }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "observer.fullname" . }}-gateway
+  labels:
+    {{- include "observer.labels" . | nindent 4 }}
+data:
+  collector.yaml: |
+    # Splits each OTLP batch by trace ID and sends every trace to one engine
+    # pod, chosen by consistent hashing over the pods behind the headless
+    # Service. Pods joining or leaving move only their share of traces.
+    receivers:
+      otlp:
+        protocols:
+          grpc: {endpoint: "0.0.0.0:4317"}
+          http: {endpoint: "0.0.0.0:4318"}
+    exporters:
+      loadbalancing:
+        routing_key: traceID
+        protocol:
+          otlp:
+            tls: {insecure: true}
+        resolver:
+          dns:
+            hostname: {{ include "observer.fullname" . }}-pods.{{ .Release.Namespace }}.svc.cluster.local
+            port: "4317"
+    service:
+      pipelines:
+        traces:
+          receivers: [otlp]
+          exporters: [loadbalancing]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "observer.fullname" . }}-gateway
+  labels:
+    {{- include "observer.labels" . | nindent 4 }}
+spec:
+  replicas: {{ $gw.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "observer.gatewaySelectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        checksum/config: {{ $gw | toYaml | sha256sum }}
+      labels:
+        {{- include "observer.gatewaySelectorLabels" . | nindent 8 }}
+    spec:
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: collector
+          image: "{{ $gw.image.repository }}:{{ $gw.image.tag }}"
+          imagePullPolicy: {{ $gw.image.pullPolicy }}
+          args: ["--config=/etc/collector/collector.yaml"]
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          ports:
+            - {name: otlp-grpc, containerPort: 4317, protocol: TCP}
+            - {name: otlp-http, containerPort: 4318, protocol: TCP}
+          resources:
+            {{- toYaml $gw.resources | nindent 12 }}
+          volumeMounts:
+            - {name: config, mountPath: /etc/collector, readOnly: true}
+      volumes:
+        - name: config
+          configMap: {name: {{ include "observer.fullname" . }}-gateway}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "observer.fullname" . }}-gateway
+  labels:
+    {{- include "observer.labels" . | nindent 4 }}
+spec:
+  selector:
+    {{- include "observer.gatewaySelectorLabels" . | nindent 4 }}
+  ports:
+    - {name: otlp-grpc, port: 4317, targetPort: otlp-grpc, protocol: TCP, appProtocol: grpc}
+    - {name: otlp-http, port: 4318, targetPort: otlp-http, protocol: TCP}
+{{- end }}

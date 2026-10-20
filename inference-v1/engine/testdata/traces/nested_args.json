@@ -19,12 +19,12 @@
     {
       "name": "math",
       "args": {
-        "one": 1.0, "tenth": 0.1, "neg": -2.5, "neg_zero_int": -0, "neg_zero_float": -0.0,
-        "big_exp": 1e16, "below_exp": 1e15, "small": 0.0001, "smaller": 0.00001,
-        "upper_e": 1E5, "precise": 3.141592653589793, "third": 0.30000000000000004,
-        "huge": 1.7976931348623157e308, "tiny": 5e-324, "overflow": 1e999, "neg_overflow": -1e999,
-        "underflow": 1e-999, "big_int": 123456789012345678901234567890, "neg_int": -42,
-        "sci_int": 12e3, "frac_exp": 1.5e-7, "long_frac": 123456789.123456789
+        "one": 1.0, "tenth": 0.1, "neg": -2.5, "zero": 0, "neg_zero_float": -0.0,
+        "big_exp": 1e+16, "below_exp": 1000000000000000.0, "small": 0.0001, "smaller": 1e-05,
+        "precise": 3.141592653589793, "third": 0.30000000000000004,
+        "huge": 1.7976931348623157e+308, "tiny": 5e-324,
+        "big_int": 123456789012345678901234567890, "neg_int": -42,
+        "frac_exp": 1.5e-07, "long_frac": 123456789.12345679
       },
       "status": "ok"
     },

@@ -23,6 +23,7 @@ import (
 	"github.com/observer-ai/engine/pkg/broker"
 	"github.com/observer-ai/engine/pkg/config"
 	"github.com/observer-ai/engine/pkg/export"
+	"github.com/observer-ai/engine/pkg/export/otlpbackend"
 	"github.com/observer-ai/engine/pkg/fault"
 	"github.com/observer-ai/engine/pkg/metrics"
 	"github.com/observer-ai/engine/pkg/observe"
@@ -41,7 +42,12 @@ const exportShutdownTimeout = 10 * time.Second
 func main() {
 	configPath := flag.String("config", "observer.yaml", "path to the YAML config file")
 	logLevel := flag.String("log-level", "info", "log level: debug, info, warn or error")
+	check := flag.Bool("check", false, "load and validate the config and its manifests, then exit")
 	flag.Parse()
+
+	if *check {
+		os.Exit(checkConfig(*configPath))
+	}
 
 	var level slog.Level
 	if err := level.UnmarshalText([]byte(*logLevel)); err != nil {
@@ -55,6 +61,17 @@ func main() {
 		logger.Error("observer stopped", "error", err.Error())
 		os.Exit(1)
 	}
+}
+
+// checkConfig reports whether the config and the manifests it names load
+// and validate: exit status 0 if so, 1 with the problems on stderr if not.
+func checkConfig(path string) int {
+	if _, err := config.Load(path); err != nil {
+		fmt.Fprintf(os.Stderr, "observer: %v\n", err)
+		return 1
+	}
+	fmt.Printf("observer: %s is valid\n", path)
+	return 0
 }
 
 func run(configPath string, logger *slog.Logger) error {
@@ -96,7 +113,7 @@ type app struct {
 func (a *app) start(ctx context.Context) error {
 	steps := []func(context.Context) error{
 		a.startMetrics, a.startReporter, a.startBroker, a.startQueue, a.startExporter,
-		a.startEngine, a.startWorkers, a.startOTLP, a.startHTTP,
+		a.startEngine, a.startWorkers, a.startOTLP, a.startHTTP, a.observeQueues,
 	}
 	for _, step := range steps {
 		if err := step(ctx); err != nil {
@@ -143,16 +160,23 @@ func (a *app) startQueue(ctx context.Context) error {
 
 // startExporter comes after startQueue, which waits for JetStream to be up.
 func (a *app) startExporter(ctx context.Context) error {
-	export.ReportErrors(a.reporter)
+	otlpbackend.ReportErrors(a.reporter)
 	exporter, err := export.NewDispatcher(ctx, export.DispatcherConfig{
 		Backends: a.cfg.ExportBackends(),
-		Factory:  export.OTLPBackendFactory{},
+		Factory:  otlpbackend.Factory{},
 		Queues:   a.broker.ExportQueues(a.cfg.ExportStreams()),
 		Reporter: a.reporter,
 		Metrics:  a.metrics,
 	})
 	a.exporter = exporter
 	return err
+}
+
+// observeQueues reports the trace queue's and every export queue's depth,
+// the signal to autoscale on.
+func (a *app) observeQueues(context.Context) error {
+	queues := append([]metrics.QueueDepth{{Queue: "traces", Depth: a.queue.Depth}}, a.exporter.Depths()...)
+	return a.metrics.ObserveQueues(queues...)
 }
 
 // startEngine builds every model (the default and one per configured

@@ -1,0 +1,40 @@
+{{- $qd := .Values.autoscaling.queueDepth }}
+{{- if $qd.enabled }}
+{{- if .Values.autoscaling.enabled }}
+{{- fail "observer: enable autoscaling (CPU) or autoscaling.queueDepth, not both" }}
+{{- end }}
+{{- if include "observer.inMemory" . }}
+{{- fail "observer: autoscaling.queueDepth needs the queues in NATS (nats.enabled or queue.url); in memory each pod's queue is its own" }}
+{{- end }}
+{{- $queue := .Values.config.queue | default dict }}
+{{- $endpoint := $qd.natsMonitoringEndpoint }}
+{{- if not $endpoint }}
+{{- if not .Values.nats.enabled }}
+{{- fail "observer: set autoscaling.queueDepth.natsMonitoringEndpoint to your NATS's monitoring address (host:8222)" }}
+{{- end }}
+{{- $endpoint = printf "%s-headless.%s.svc.cluster.local:8222" (include "observer.natsName" .) .Release.Namespace }}
+{{- end }}
+# Scales the engine on the traces waiting to be scored: the lag of the
+# workers' durable consumer, which every engine shares.
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: {{ include "observer.fullname" . }}
+  labels:
+    {{- include "observer.labels" . | nindent 4 }}
+spec:
+  scaleTargetRef:
+    name: {{ include "observer.fullname" . }}
+  minReplicaCount: {{ $qd.minReplicas }}
+  maxReplicaCount: {{ $qd.maxReplicas }}
+  pollingInterval: {{ $qd.pollingInterval }}
+  cooldownPeriod: {{ $qd.cooldownPeriod }}
+  triggers:
+    - type: nats-jetstream
+      metadata:
+        natsServerMonitoringEndpoint: {{ $endpoint | quote }}
+        account: {{ $qd.account | quote }}
+        stream: {{ $queue.stream | default "OBSERVER_TRACES" | quote }}
+        consumer: {{ $queue.consumer | default "observer-workers" | quote }}
+        lagThreshold: {{ $qd.lagThreshold | quote }}
+{{- end }}

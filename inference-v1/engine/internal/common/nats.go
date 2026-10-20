@@ -27,6 +27,8 @@ type NATSConfig struct {
 	URL      string
 	Logger   *slog.Logger     // defaults to slog.Default()
 	Reporter observe.Reporter // receives disconnects; defaults to observe.Discard
+	// Options add to the connection's own: authentication, TLS.
+	Options []nats.Option
 }
 
 // Conn is the one NATS connection the engine's JetStream users share: the
@@ -46,7 +48,7 @@ func DialNATS(cfg NATSConfig) (*Conn, error) {
 	if cfg.Reporter == nil {
 		cfg.Reporter = observe.Discard
 	}
-	nc, err := nats.Connect(cfg.URL,
+	opts := append([]nats.Option{
 		nats.Name(connectionName),
 		nats.RetryOnFailedConnect(true),
 		nats.MaxReconnects(-1),
@@ -59,7 +61,8 @@ func DialNATS(cfg NATSConfig) (*Conn, error) {
 		nats.ReconnectHandler(func(nc *nats.Conn) {
 			cfg.Logger.Info("nats reconnected", "url", nc.ConnectedUrlRedacted())
 		}),
-	)
+	}, cfg.Options...)
+	nc, err := nats.Connect(cfg.URL, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("nats: connect to %s: %w", cfg.URL, err)
 	}

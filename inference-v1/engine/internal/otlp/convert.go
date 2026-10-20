@@ -169,19 +169,26 @@ func (a Assembler) Assemble(traceID string, payloads [][]byte) (trace.Trace, err
 }
 
 // agentOf is the first configured attribute set on the root span, else on
-// its resource.
+// its resource, cut to trace.MaxAgentLength.
 func (a Assembler) agentOf(root *tracepb.Span, res *resourcepb.Resource) trace.AgentName {
 	for _, key := range a.AgentAttributes {
 		if v := attr(root, key); v != "" {
-			return trace.AgentName(v)
+			return agentName(v)
 		}
 		for _, kv := range res.GetAttributes() {
 			if kv.GetKey() == key && anyString(kv.GetValue()) != "" {
-				return trace.AgentName(anyString(kv.GetValue()))
+				return agentName(anyString(kv.GetValue()))
 			}
 		}
 	}
 	return ""
+}
+
+func agentName(v string) trace.AgentName {
+	if len(v) > trace.MaxAgentLength {
+		v = strings.ToValidUTF8(v[:trace.MaxAgentLength], "")
+	}
+	return trace.AgentName(v)
 }
 
 // resourceOf is the resource the span was sent under.

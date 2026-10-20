@@ -24,6 +24,8 @@ import (
 
 	"github.com/observer-ai/engine/internal/common"
 	"github.com/observer-ai/engine/pkg/export"
+	exportmem "github.com/observer-ai/engine/pkg/export/memq"
+	"github.com/observer-ai/engine/pkg/export/otlpbackend"
 	"github.com/observer-ai/engine/pkg/fault"
 	"github.com/observer-ai/engine/pkg/pipeline"
 	"github.com/observer-ai/engine/pkg/policy"
@@ -102,7 +104,7 @@ type harnessOpts struct {
 	maxBody int64
 	logger  *slog.Logger
 	// uploader, when set, receives traces that carry their original spans.
-	uploader export.Uploader
+	uploader otlpbackend.Uploader
 	// models, when set, replaces the single model built from scorer.
 	models  pipeline.ModelRouter
 	metrics common.RequestMetrics
@@ -141,15 +143,16 @@ func newHarness(t *testing.T, o harnessOpts) *harness {
 
 // newExporter runs a back end on the recorder behind the same asynchronous
 // Dispatcher the engine uses.
-func newExporter(t *testing.T, tp *sdktrace.TracerProvider, u export.Uploader) *export.Dispatcher {
+func newExporter(t *testing.T, tp *sdktrace.TracerProvider, u otlpbackend.Uploader) *export.Dispatcher {
 	t.Helper()
-	backend := export.New(tp)
+	backend := otlpbackend.New(tp)
 	if u != nil {
-		backend = export.New(tp, export.WithForwarder(u, map[string]string{"openinference.project.name": "observer-ai"}))
+		backend = otlpbackend.New(tp, otlpbackend.WithForwarder(u, map[string]string{"openinference.project.name": "observer-ai"}))
 	}
 	d, err := export.NewDispatcher(context.Background(), export.DispatcherConfig{
 		Backends: []export.BackendConfig{{Name: "test"}},
 		Factory:  fixedFactory{backend},
+		Queues:   exportmem.Factory{},
 	})
 	if err != nil {
 		t.Fatal(err)

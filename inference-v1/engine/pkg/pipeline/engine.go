@@ -84,7 +84,7 @@ func (e *Engine) run(ctx context.Context, t trace.Trace, deferSystemErrors bool)
 func (e *Engine) decide(ctx context.Context, t trace.Trace, start time.Time, deferSystemErrors bool) (Record, error) {
 	model := e.deps.Models.Route(t.Agent)
 	score, err := model.Scorer.Score(ctx, trace.BuildState(t))
-	e.deps.Metrics.ScoreFinished(ctx, ScoreResult{Agent: t.Agent, Model: model.Name, Duration: time.Since(start), Err: err})
+	e.deps.Metrics.ScoreFinished(ctx, ScoreResult{Agent: model.Agent, Model: model.Name, Duration: time.Since(start), Err: err})
 	switch {
 	case err == nil:
 		return e.scored(t, model, score), nil
@@ -97,13 +97,13 @@ func (e *Engine) decide(ctx context.Context, t trace.Trace, start time.Time, def
 
 func (e *Engine) scored(t trace.Trace, model Model, score Score) Record {
 	calibrated := Calibrate(score.Raw, model.Temperature)
-	return Record{Trace: t, Decision: e.deps.Policy.Decide(score.Raw, calibrated), Model: score.Model, Latency: score.Latency}
+	return Record{Trace: t, Agent: model.Agent, Decision: e.deps.Policy.Decide(score.Raw, calibrated), Model: score.Model, Latency: score.Latency}
 }
 
 func (e *Engine) fallback(ctx context.Context, t trace.Trace, model Model, cause error, elapsed time.Duration) Record {
 	e.deps.Reporter.Report(ctx, fault.New(fault.KindOf(cause), fault.Pipeline, "score trace, falling back to a random decision", cause).
-		WithTrace(t.TraceID).With("agent", t.Agent).With("model", model.Name))
-	return Record{Trace: t, Decision: e.deps.Policy.Fallback(), Model: model.Name, Latency: elapsed}
+		WithTrace(t.TraceID).With("agent", model.Agent).With("model", model.Name))
+	return Record{Trace: t, Agent: model.Agent, Decision: e.deps.Policy.Fallback(), Model: model.Name, Latency: elapsed}
 }
 
 // isSystemError reports whether a scoring failure is the system's fault, so
@@ -122,7 +122,7 @@ func (e *Engine) logDecision(out Outcome) {
 	rec, d := out.Record, out.Record.Decision
 	attrs := []any{
 		"trace_id", rec.Trace.TraceID,
-		"agent", rec.Trace.Agent,
+		"agent", rec.Agent,
 		"decision", d.Label(),
 		"reason", d.Reason,
 		"severity", d.Severity,

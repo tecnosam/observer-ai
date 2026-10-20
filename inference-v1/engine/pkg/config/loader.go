@@ -7,7 +7,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"slices"
 
 	"gopkg.in/yaml.v3"
 )
@@ -75,16 +74,30 @@ func (l *yamlFileLoader) LoadConfig() (Config, error) {
 	if err := dec.Decode(&cfg); err != nil && !errors.Is(err, io.EOF) {
 		return Config{}, fmt.Errorf("config %s: %w", l.path, err)
 	}
-	if err := inheritScorer(raw, &cfg); err != nil {
+	if err := applyModelDefaults(raw, &cfg); err != nil {
 		return Config{}, fmt.Errorf("config %s: %w", l.path, err)
 	}
+	resolveQueueFiles(&cfg.Queue, filepath.Dir(l.path))
 	return cfg, nil
 }
 
-// inheritScorer decodes each agents.models entry again, this time over a
-// copy of the scorer section, so an agent's model states only what differs
-// from the default. The strict first decode has already checked the keys.
-func inheritScorer(raw []byte, cfg *Config) error {
+// resolveQueueFiles makes the NATS credential and certificate paths
+// absolute against the config file's directory, as manifest paths are.
+func resolveQueueFiles(q *Queue, dir string) {
+	for _, path := range []*string{
+		&q.Auth.CredentialsFile, &q.Auth.NkeySeedFile, &q.TLS.CAFile, &q.TLS.CertFile, &q.TLS.KeyFile,
+	} {
+		if *path != "" {
+			*path = resolveRelative(*path, dir)
+		}
+	}
+}
+
+// applyModelDefaults decodes each agents.models entry again, this time over
+// DefaultModel(), so a key it leaves out gets the engine's built-in default,
+// as in the scorer section. Nothing comes from the scorer section itself.
+// The strict first decode has already checked the keys.
+func applyModelDefaults(raw []byte, cfg *Config) error {
 	var doc struct {
 		Agents struct {
 			Models map[string]yaml.Node `yaml:"models"`
@@ -94,8 +107,7 @@ func inheritScorer(raw []byte, cfg *Config) error {
 		return err
 	}
 	for agent, node := range doc.Agents.Models {
-		model := cfg.Scorer
-		model.Backoff = slices.Clone(cfg.Scorer.Backoff)
+		model := DefaultModel()
 		if err := node.Decode(&model); err != nil {
 			return fmt.Errorf("agents.models.%s: %w", agent, err)
 		}
@@ -140,9 +152,9 @@ func modelKey(agent string) string {
 //	cfg.Scorer.Endpoint = "http://kev:8010/v1/systemone"
 //	compiled, err := config.NewCompiler(config.NewStaticFactory(cfg, manifest)).Compile()
 //
-// With a nil manifest, it is read from the file scorer.manifest names. An
-// agent's model (cfg.Agents.Models) is given in full, inheriting nothing;
-// its manifest comes from AgentManifests, else from its manifest file.
+// With a nil manifest, it is read from the file scorer.manifest names. Build
+// each agent's model (cfg.Agents.Models) from DefaultModel(); its manifest
+// comes from AgentManifests, else from its manifest file.
 type StaticFactory struct {
 	Config         Config
 	Manifest       *Manifest

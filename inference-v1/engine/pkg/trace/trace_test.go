@@ -53,6 +53,7 @@ func TestDecodeErrors(t *testing.T) {
 		{"tool call without name", `{"question": "q", "final_answer": "a", "tool_calls": [{"args": "x"}]}`, "tool_calls[0].name is required"},
 		{"trailing data", `{"question": "q", "final_answer": "a"} {}`, "unexpected data"},
 		{"array", `[]`, "invalid JSON"},
+		{"agent too long", `{"question": "q", "final_answer": "a", "agent": "` + strings.Repeat("x", MaxAgentLength+1) + `"}`, "agent is longer than 128 bytes"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -69,9 +70,10 @@ func TestStatusText(t *testing.T) {
 		{``, "ok"},
 		{`"error"`, "error"},
 		{`""`, ""},
-		{`null`, "None"},
+		{`null`, "null"},
 		{`404`, "404"},
-		{`true`, "True"},
+		{`true`, "true"},
+		{`{"code": 404}`, `{"code":404}`},
 	}
 	for _, tt := range tests {
 		if got := (ToolCall{Name: "t", Status: []byte(tt.status)}).StatusText(); got != tt.want {

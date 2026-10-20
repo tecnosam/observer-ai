@@ -16,8 +16,9 @@ const (
 type State string
 
 // BuildState renders the trace into the state string the decision model was
-// trained on. It must stay byte-for-byte identical to the Python build_state
-// (see testdata/gen_golden.py); the golden tests enforce that.
+// trained on. It must stay identical to the fine-tuning SDK's build_state
+// (finetune/observer_finetune/observer_finetune/state.py, and its copy in
+// testdata/gen_golden.py); the golden tests on both sides enforce that.
 func BuildState(t Trace) State {
 	var b strings.Builder
 
@@ -36,7 +37,7 @@ func BuildState(t Trace) State {
 		b.WriteString(". ")
 		b.WriteString(c.Name)
 		b.WriteByte('(')
-		b.WriteString(c.argsRepr())
+		b.WriteString(c.ArgsText())
 		b.WriteString(") -> ")
 		b.WriteString(c.StatusText())
 	}
@@ -64,15 +65,14 @@ func BuildState(t Trace) State {
 	return State(b.String())
 }
 
-// argsRepr is the Python repr of the args, or of the empty string when the
-// call has none (c.get("args", "") in the training code).
-func (c ToolCall) argsRepr() string {
+// ArgsText is the call's arguments as compact JSON, or "" when it has none.
+func (c ToolCall) ArgsText() string {
 	if len(c.Args) == 0 {
-		return "''"
+		return ""
 	}
-	s, err := pyRepr(c.Args)
+	s, err := compactJSON(c.Args)
 	if err != nil {
-		// Validate rejects such args before a trace gets here.
+		// Decode only accepts valid JSON, so a trace never gets here.
 		return string(c.Args)
 	}
 	return s

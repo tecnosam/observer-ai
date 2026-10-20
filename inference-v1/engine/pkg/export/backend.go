@@ -46,10 +46,3 @@ const (
 type AbstractBackendFactory interface {
 	Build(ctx context.Context, cfg BackendConfig) (AbstractBackend, error)
 }
-
-// OTLPBackendFactory builds OTLP/HTTP backends.
-type OTLPBackendFactory struct{}
-
-func (OTLPBackendFactory) Build(ctx context.Context, cfg BackendConfig) (AbstractBackend, error) {
-	return NewOTLPBackend(ctx, cfg)
-}

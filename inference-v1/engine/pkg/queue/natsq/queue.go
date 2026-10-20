@@ -1,12 +1,10 @@
-// Package queue is the work queue between the receivers (HTTP API, OTLP)
-// and the workers, and the store where OTLP spans wait to be assembled into
-// traces. AbstractBroker is what the engine uses; Queue implements it on
-// NATS JetStream and MemoryBroker in process.
-//
-// On JetStream, traces are published to a work-queue stream, pulled by a
-// pool of workers through one durable consumer, and moved to a dead-letter
-// stream when they keep failing with system errors.
-package queue
+// Package natsq is the queue.AbstractBroker on NATS JetStream. Traces are
+// published to a work-queue stream, pulled by a pool of workers through one
+// durable consumer, and moved to a dead-letter stream when they keep failing
+// with system errors. OTLP spans wait in a stream, one subject per trace,
+// until their trace is assembled. Every engine sharing the streams shares
+// the work.
+package natsq
 
 import (
 	"context"
@@ -21,6 +19,7 @@ import (
 	"github.com/observer-ai/engine/internal/common"
 	"github.com/observer-ai/engine/pkg/fault"
 	"github.com/observer-ai/engine/pkg/observe"
+	"github.com/observer-ai/engine/pkg/queue"
 	"github.com/observer-ai/engine/pkg/trace"
 )
 
@@ -35,50 +34,14 @@ const (
 	HeaderTraceID = "Observer-Trace-Id"
 )
 
-// Config configures a broker. URL is read only by Connect; the other
-// JetStream settings (streams, subjects, the consumer, ack_wait) only by the
-// NATS implementation.
-type Config struct {
-	URL string
-	// ConnectTimeout bounds the wait for NATS at start-up. After that the
-	// client reconnects on its own for as long as the process runs.
-	ConnectTimeout time.Duration
-
-	Stream      string
-	Subject     string
-	Consumer    string
-	MaxMessages int64
-
-	AckWait           time.Duration
-	MaxDeliver        int
-	RedeliveryBackoff []time.Duration
-
-	DLQStream  string
-	DLQSubject string
-	DLQMaxAge  time.Duration
-
-	// Spans configures assembling traces from OTLP spans. Leave it zero
-	// when the engine runs without the OTLP receivers.
-	Spans SpanConfig
-
-	// PollWait is how long one pull waits for a message, which also bounds
-	// how long an idle worker takes to notice a stop. Defaults to 2s.
-	PollWait time.Duration
-
-	Logger *slog.Logger
-	// Reporter receives every error the queue meets while running. Defaults
-	// to observe.Discard.
-	Reporter observe.Reporter
-}
-
-// retry is the redelivery policy for a trace that hit a system error.
-func (c Config) retry() common.RetryPolicy {
+// retryPolicy is the redelivery policy for a trace that hit a system error.
+func retryPolicy(c queue.Config) common.RetryPolicy {
 	return common.RetryPolicy{MaxDeliver: c.MaxDeliver, Backoff: c.RedeliveryBackoff}
 }
 
 // Queue publishes traces to JetStream and hands them to workers.
 type Queue struct {
-	cfg      Config
+	cfg      queue.Config
 	conn     *common.Conn
 	ownsConn bool // Close closes conn only when Connect opened it
 	js       jetstream.JetStream
@@ -92,12 +55,12 @@ type Queue struct {
 
 // Connect connects to cfg.URL and sets up the queue on its own connection,
 // which Close closes.
-func Connect(ctx context.Context, cfg Config) (*Queue, error) {
+func Connect(ctx context.Context, cfg queue.Config) (*Queue, error) {
 	conn, err := common.DialNATS(common.NATSConfig{URL: cfg.URL, Logger: cfg.Logger, Reporter: cfg.Reporter})
 	if err != nil {
 		return nil, fmt.Errorf("queue: %w", err)
 	}
-	q, err := NewNATS(ctx, conn, cfg)
+	q, err := New(ctx, conn, cfg)
 	if err != nil {
 		conn.Close()
 		return nil, err
@@ -110,7 +73,7 @@ func Connect(ctx context.Context, cfg Config) (*Queue, error) {
 // the workers' durable consumer on a shared connection. It keeps trying
 // until cfg.ConnectTimeout, so the engine can start alongside NATS. Close
 // leaves the connection open.
-func NewNATS(ctx context.Context, conn *common.Conn, cfg Config) (*Queue, error) {
+func New(ctx context.Context, conn *common.Conn, cfg queue.Config) (*Queue, error) {
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}
@@ -148,7 +111,7 @@ func (q *Queue) setup(ctx context.Context) error {
 		return fmt.Errorf("consumer %s: %w", q.cfg.Consumer, err)
 	}
 	q.cons = cons
-	if q.cfg.Spans.enabled() {
+	if q.cfg.Spans.Enabled() {
 		return q.setupSpans(ctx)
 	}
 	return nil
@@ -164,6 +127,7 @@ func (q *Queue) traceStream() jetstream.StreamConfig {
 		Subjects:    []string{q.cfg.Subject},
 		Retention:   jetstream.WorkQueuePolicy,
 		Storage:     jetstream.FileStorage,
+		Replicas:    q.cfg.Replicas,
 		MaxMsgs:     q.cfg.MaxMessages,
 		Discard:     jetstream.DiscardNew,
 	}
@@ -176,6 +140,7 @@ func (q *Queue) deadLetterStream() jetstream.StreamConfig {
 		Subjects:    []string{q.cfg.DLQSubject},
 		Retention:   jetstream.LimitsPolicy,
 		Storage:     jetstream.FileStorage,
+		Replicas:    q.cfg.Replicas,
 		MaxAge:      q.cfg.DLQMaxAge,
 	}
 }
@@ -207,6 +172,16 @@ func (q *Queue) publishTrace(ctx context.Context, traceID string, data []byte, o
 	return nil
 }
 
+// Depth counts the stream's traces not yet acknowledged. The consumer is
+// shared, so every engine sees the same number.
+func (q *Queue) Depth(ctx context.Context) (int64, error) {
+	info, err := q.cons.Info(ctx)
+	if err != nil {
+		return 0, err
+	}
+	return int64(info.NumPending) + int64(info.NumAckPending), nil
+}
+
 // Ready reports whether the connection to NATS is up.
 func (q *Queue) Ready() error {
 	return q.conn.Ready()
@@ -223,3 +198,5 @@ func (q *Queue) Close() {
 		q.conn.Close()
 	}
 }
+
+var _ queue.AbstractBroker = (*Queue)(nil)

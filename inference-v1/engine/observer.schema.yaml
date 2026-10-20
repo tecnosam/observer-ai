@@ -189,6 +189,56 @@ properties:
         $ref: '#/$defs/subject'
         default: observer.exports_dlq
         description: "Subject of export_dlq_stream. Rule: not under export_subject. NATS only."
+      replicas:
+        type: integer
+        minimum: 1
+        maximum: 5
+        default: 1
+        description: >-
+          Copies of each stream the engine creates (traces, dead letters,
+          spans, pending markers, export queues) that a NATS cluster keeps. Set
+          3 on a three-server cluster so losing a server loses nothing. More
+          than the cluster has servers fails at start-up. NATS only.
+      auth:
+        type: object
+        additionalProperties: false
+        description: >-
+          How the engine authenticates to NATS. Set at most one way; secrets
+          come from environment variables. Relative paths resolve against this
+          file's directory. Empty: no authentication, or credentials in the URL.
+          NATS only.
+        properties:
+          credentials_file:
+            type: string
+            description: A .creds file (user JWT and nkey seed), as NATS accounts and Synadia Cloud issue.
+          nkey_seed_file:
+            type: string
+            description: A file holding an nkey seed (SU...).
+          user:
+            type: string
+            description: "A user name. Rule: with password_env."
+          password_env:
+            type: string
+            description: "Name of the environment variable holding user's password. Rule: must be set."
+          token_env:
+            type: string
+            description: "Name of the environment variable holding an auth token. Rule: must be set."
+      tls:
+        type: object
+        additionalProperties: false
+        description: >-
+          TLS to NATS. Any key turns it on, as a tls:// URL does. Relative paths
+          resolve against this file's directory. NATS only.
+        properties:
+          ca_file:
+            type: string
+            description: PEM CA bundle that verifies the server, for a private CA.
+          cert_file:
+            type: string
+            description: "PEM client certificate, for mutual TLS. Rule: with key_file."
+          key_file:
+            type: string
+            description: "PEM key of cert_file. Rule: with cert_file."
 
   otlp:
     type: object
@@ -365,13 +415,16 @@ properties:
       models:
         type: object
         description: >-
-          Agent name to its model, e.g. support-bot: {model: kev-support,
-          manifest: runs/support/manifest.json}. Each entry takes the scorer
-          section's keys and inherits every key it leaves out from it, as
-          written in the file (OBSERVER_SCORER_ENDPOINT and OBSERVER_MANIFEST
-          change only the scorer section). A relative manifest resolves against
-          this file's directory. queue.ack_wait must exceed the slowest
-          model's worst case.
+          Agent name to its own model, e.g. support-bot: {endpoint:
+          http://kev:8010/v1/systemone, model: kev-support, manifest:
+          runs/support/manifest.json}. Each entry takes the scorer section's
+          keys and is complete on its own: endpoint, model and manifest are
+          required, and nothing comes from the scorer section (nor from
+          OBSERVER_SCORER_ENDPOINT or OBSERVER_MANIFEST, which change only the
+          scorer section). Keys it leaves out get the engine's built-in
+          defaults. A relative manifest resolves against this file's
+          directory. queue.ack_wait must exceed the slowest model's worst
+          case.
         additionalProperties:
           $ref: '#/properties/scorer'
 

@@ -1,16 +1,15 @@
-package queue_test
+package natsq_test
 
 import (
 	"context"
-	"errors"
-	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/observer-ai/engine/pkg/fault"
 	"github.com/observer-ai/engine/pkg/queue"
-	"github.com/observer-ai/engine/pkg/trace"
+	"github.com/observer-ai/engine/pkg/queue/natsq"
+	"github.com/observer-ai/engine/pkg/queue/queuetest"
 )
 
 const (
@@ -18,64 +17,17 @@ const (
 	traceB = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 )
 
-func withSpans(idle, maxWait time.Duration) func(*queue.Config) {
-	return func(c *queue.Config) {
-		c.Spans = queue.SpanConfig{
-			Stream:         "SPANS",
-			Subject:        "spans",
-			MaxAge:         time.Hour,
-			PendingStream:  "PENDING",
-			PendingSubject: "pending",
-			IdleTimeout:    idle,
-			MaxWait:        maxWait,
-		}
-	}
-}
-
-// joinBatches stands in for the OTLP assembler: the batches are plain text,
-// the trace's question is the batches joined in arrival order, and a batch
-// saying "unscorable" makes the whole trace unscorable.
-func joinBatches(traceID string, batches [][]byte) (trace.Trace, error) {
-	var parts []string
-	for _, b := range batches {
-		if string(b) == "unscorable" {
-			return trace.Trace{}, errors.New("trace is not scorable: no question")
-		}
-		parts = append(parts, string(b))
-	}
-	return trace.Trace{TraceID: traceID, Question: strings.Join(parts, "+"), FinalAnswer: "a", OTLP: []byte("original spans")}, nil
-}
-
-// collector gathers the traces that reach the work queue.
-type collector struct {
-	mu     sync.Mutex
-	traces []trace.Trace
-}
-
-func (c *collector) handle(_ context.Context, t trace.Trace) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.traces = append(c.traces, t)
-	return nil
-}
-
-func (c *collector) snapshot() []trace.Trace {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return append([]trace.Trace(nil), c.traces...)
-}
-
 func (f *fixture) startAssemblers(t *testing.T, n int) {
 	t.Helper()
-	a := f.q.StartAssemblers(n, joinBatches)
+	a := f.q.StartAssemblers(n, queuetest.JoinBatches)
 	t.Cleanup(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), waitFor)
+		ctx, cancel := context.WithTimeout(context.Background(), queuetest.WaitFor)
 		defer cancel()
 		a.Stop(ctx)
 	})
 }
 
-func publishSpans(t *testing.T, q *queue.Queue, traceID, batch string) {
+func publishSpans(t *testing.T, q *natsq.Queue, traceID, batch string) {
 	t.Helper()
 	if err := q.PublishSpans(context.Background(), map[string][]byte{traceID: []byte(batch)}); err != nil {
 		t.Fatalf("PublishSpans: %v", err)
@@ -84,9 +36,9 @@ func publishSpans(t *testing.T, q *queue.Queue, traceID, batch string) {
 
 func TestSpansAreAssembledAfterIdleTimeout(t *testing.T) {
 	const idle = 300 * time.Millisecond
-	f := setup(t, withSpans(idle, 10*time.Second))
-	got := &collector{}
-	f.start(t, 1, got.handle)
+	f := setup(t, queuetest.WithSpans(idle, 10*time.Second))
+	got := &queuetest.Collector{}
+	f.start(t, 1, got.Handle)
 	f.startAssemblers(t, 2)
 
 	// Three batches for one trace, each arriving before the trace goes quiet.
@@ -98,8 +50,8 @@ func TestSpansAreAssembledAfterIdleTimeout(t *testing.T) {
 	publishSpans(t, f.q, traceA, "root")
 	lastSpan := time.Now()
 
-	eventually(t, "the assembled trace", func() bool { return len(got.snapshot()) == 1 })
-	tr := got.snapshot()[0]
+	queuetest.Eventually(t, "the assembled trace", func() bool { return len(got.Snapshot()) == 1 })
+	tr := got.Snapshot()[0]
 	if tr.TraceID != traceA || tr.Question != "children+more+root" {
 		t.Errorf("assembled trace = %+v, want all three batches in order", tr)
 	}
@@ -114,18 +66,18 @@ func TestSpansAreAssembledAfterIdleTimeout(t *testing.T) {
 	}
 
 	// Spans and marker are gone once the trace is queued.
-	eventually(t, "spans to be purged", func() bool { return f.messages(t, "SPANS") == 0 })
-	eventually(t, "the marker to be acknowledged", func() bool { return f.messages(t, "PENDING") == 0 })
+	queuetest.Eventually(t, "spans to be purged", func() bool { return f.messages(t, "SPANS") == 0 })
+	queuetest.Eventually(t, "the marker to be acknowledged", func() bool { return f.messages(t, "PENDING") == 0 })
 	time.Sleep(2 * idle)
-	if n := len(got.snapshot()); n != 1 {
+	if n := len(got.Snapshot()); n != 1 {
 		t.Errorf("%d traces assembled, want exactly 1", n)
 	}
 }
 
 func TestSpanBatchesOfDifferentTracesStaySeparate(t *testing.T) {
-	f := setup(t, withSpans(150*time.Millisecond, 10*time.Second))
-	got := &collector{}
-	f.start(t, 2, got.handle)
+	f := setup(t, queuetest.WithSpans(150*time.Millisecond, 10*time.Second))
+	got := &queuetest.Collector{}
+	f.start(t, 2, got.Handle)
 	f.startAssemblers(t, 2)
 
 	// One export carrying spans of two traces.
@@ -135,9 +87,9 @@ func TestSpanBatchesOfDifferentTracesStaySeparate(t *testing.T) {
 	}
 	publishSpans(t, f.q, traceA, "a2")
 
-	eventually(t, "both traces", func() bool { return len(got.snapshot()) == 2 })
+	queuetest.Eventually(t, "both traces", func() bool { return len(got.Snapshot()) == 2 })
 	questions := map[string]string{}
-	for _, tr := range got.snapshot() {
+	for _, tr := range got.Snapshot() {
 		questions[tr.TraceID] = tr.Question
 	}
 	if questions[traceA] != "a1+a2" || questions[traceB] != "b1" {
@@ -147,7 +99,7 @@ func TestSpanBatchesOfDifferentTracesStaySeparate(t *testing.T) {
 
 // However many batches arrive, a trace has one pending marker.
 func TestOneMarkerPerTrace(t *testing.T) {
-	f := setup(t, withSpans(time.Hour, time.Hour)) // never assembles during the test
+	f := setup(t, queuetest.WithSpans(time.Hour, time.Hour)) // never assembles during the test
 	for range 5 {
 		publishSpans(t, f.q, traceA, "batch")
 	}
@@ -163,9 +115,9 @@ func TestOneMarkerPerTrace(t *testing.T) {
 // A trace whose spans never stop arriving is still assembled at max_wait.
 func TestMaxWaitForcesAssembly(t *testing.T) {
 	const maxWait = 600 * time.Millisecond
-	f := setup(t, withSpans(250*time.Millisecond, maxWait))
-	got := &collector{}
-	f.start(t, 1, got.handle)
+	f := setup(t, queuetest.WithSpans(250*time.Millisecond, maxWait))
+	got := &queuetest.Collector{}
+	f.start(t, 1, got.Handle)
 	f.startAssemblers(t, 1)
 
 	start := time.Now()
@@ -185,7 +137,7 @@ func TestMaxWaitForcesAssembly(t *testing.T) {
 	}()
 	publishSpans(t, f.q, traceA, "s")
 
-	eventually(t, "the trace to be assembled despite the steady spans", func() bool { return len(got.snapshot()) >= 1 })
+	queuetest.Eventually(t, "the trace to be assembled despite the steady spans", func() bool { return len(got.Snapshot()) >= 1 })
 	elapsed := time.Since(start)
 	close(stop)
 	wg.Wait()
@@ -198,18 +150,18 @@ func TestMaxWaitForcesAssembly(t *testing.T) {
 }
 
 func TestUnscorableSpansAreDiscarded(t *testing.T) {
-	f := setup(t, withSpans(100*time.Millisecond, 10*time.Second))
-	got := &collector{}
-	f.start(t, 1, got.handle)
+	f := setup(t, queuetest.WithSpans(100*time.Millisecond, 10*time.Second))
+	got := &queuetest.Collector{}
+	f.start(t, 1, got.Handle)
 	f.startAssemblers(t, 1)
 
 	publishSpans(t, f.q, traceA, "unscorable")
 	publishSpans(t, f.q, traceB, "fine")
 
-	eventually(t, "the scorable trace", func() bool { return len(got.snapshot()) == 1 })
-	eventually(t, "all spans to be purged", func() bool { return f.messages(t, "SPANS") == 0 })
-	eventually(t, "all markers to be acknowledged", func() bool { return f.messages(t, "PENDING") == 0 })
-	if tr := got.snapshot()[0]; tr.TraceID != traceB {
+	queuetest.Eventually(t, "the scorable trace", func() bool { return len(got.Snapshot()) == 1 })
+	queuetest.Eventually(t, "all spans to be purged", func() bool { return f.messages(t, "SPANS") == 0 })
+	queuetest.Eventually(t, "all markers to be acknowledged", func() bool { return f.messages(t, "PENDING") == 0 })
+	if tr := got.Snapshot()[0]; tr.TraceID != traceB {
 		t.Errorf("queued trace = %s, want only the scorable one", tr.TraceID)
 	}
 	if n := f.messages(t, f.cfg.DLQStream); n != 0 {
@@ -220,31 +172,31 @@ func TestUnscorableSpansAreDiscarded(t *testing.T) {
 // Spans that turn up after their trace was assembled are assembled as a new
 // (partial) trace rather than being left behind.
 func TestLateSpansAreNotStranded(t *testing.T) {
-	f := setup(t, withSpans(100*time.Millisecond, 10*time.Second))
-	got := &collector{}
-	f.start(t, 1, got.handle)
+	f := setup(t, queuetest.WithSpans(100*time.Millisecond, 10*time.Second))
+	got := &queuetest.Collector{}
+	f.start(t, 1, got.Handle)
 	f.startAssemblers(t, 1)
 
 	publishSpans(t, f.q, traceA, "on time")
-	eventually(t, "the first assembly", func() bool { return len(got.snapshot()) == 1 })
-	eventually(t, "the marker to clear", func() bool { return f.messages(t, "PENDING") == 0 })
+	queuetest.Eventually(t, "the first assembly", func() bool { return len(got.Snapshot()) == 1 })
+	queuetest.Eventually(t, "the marker to clear", func() bool { return f.messages(t, "PENDING") == 0 })
 
 	publishSpans(t, f.q, traceA, "late")
-	eventually(t, "the late spans to be assembled", func() bool { return len(got.snapshot()) == 2 })
-	if q := got.snapshot()[1].Question; q != "late" {
+	queuetest.Eventually(t, "the late spans to be assembled", func() bool { return len(got.Snapshot()) == 2 })
+	if q := got.Snapshot()[1].Question; q != "late" {
 		t.Errorf("second assembly = %q, want only the late batch", q)
 	}
-	eventually(t, "spans to be purged", func() bool { return f.messages(t, "SPANS") == 0 })
+	queuetest.Eventually(t, "spans to be purged", func() bool { return f.messages(t, "SPANS") == 0 })
 }
 
 // With the work queue full the spans wait; nothing is lost and the trace is
 // queued once there is room.
 func TestAssemblyWaitsWhenWorkQueueIsFull(t *testing.T) {
 	f := setup(t, func(c *queue.Config) {
-		withSpans(100*time.Millisecond, 10*time.Second)(c)
+		queuetest.WithSpans(100*time.Millisecond, 10*time.Second)(c)
 		c.MaxMessages = 1
 	})
-	mustPublish(t, f.q, sample("blocker")) // fills the work queue; no workers yet
+	mustPublish(t, f.q, queuetest.Sample("blocker")) // fills the work queue; no workers yet
 	f.startAssemblers(t, 1)
 
 	publishSpans(t, f.q, traceA, "waiting")
@@ -256,39 +208,39 @@ func TestAssemblyWaitsWhenWorkQueueIsFull(t *testing.T) {
 		t.Fatalf("%d messages in the work queue, want only the blocker", n)
 	}
 
-	got := &collector{}
-	f.start(t, 1, got.handle)
-	eventually(t, "the assembled trace once there is room", func() bool {
-		for _, tr := range got.snapshot() {
+	got := &queuetest.Collector{}
+	f.start(t, 1, got.Handle)
+	queuetest.Eventually(t, "the assembled trace once there is room", func() bool {
+		for _, tr := range got.Snapshot() {
 			if tr.TraceID == traceA && tr.Question == "waiting" {
 				return true
 			}
 		}
 		return false
 	})
-	eventually(t, "spans to be purged", func() bool { return f.messages(t, "SPANS") == 0 })
+	queuetest.Eventually(t, "spans to be purged", func() bool { return f.messages(t, "SPANS") == 0 })
 }
 
 // Spans stored before a restart are assembled by the next process.
 func TestSpansSurviveAssemblerRestart(t *testing.T) {
-	f := setup(t, withSpans(100*time.Millisecond, 10*time.Second))
+	f := setup(t, queuetest.WithSpans(100*time.Millisecond, 10*time.Second))
 	publishSpans(t, f.q, traceA, "before restart")
 
-	second, err := queue.Connect(context.Background(), f.cfg)
+	second, err := natsq.Connect(context.Background(), f.cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer second.Close()
-	got := &collector{}
-	w := second.StartWorkers(1, got.handle)
-	a := second.StartAssemblers(1, joinBatches)
+	got := &queuetest.Collector{}
+	w := second.StartWorkers(1, got.Handle)
+	a := second.StartAssemblers(1, queuetest.JoinBatches)
 	defer func() {
-		ctx, cancel := context.WithTimeout(context.Background(), waitFor)
+		ctx, cancel := context.WithTimeout(context.Background(), queuetest.WaitFor)
 		defer cancel()
 		a.Stop(ctx)
 		w.Stop(ctx)
 	}()
-	eventually(t, "the trace to be assembled after the restart", func() bool { return len(got.snapshot()) == 1 })
+	queuetest.Eventually(t, "the trace to be assembled after the restart", func() bool { return len(got.Snapshot()) == 1 })
 }
 
 func TestPublishSpansFailures(t *testing.T) {
@@ -299,10 +251,10 @@ func TestPublishSpansFailures(t *testing.T) {
 	}
 
 	// NATS down: the receiver must see an error so the exporter retries.
-	f := setup(t, withSpans(time.Hour, time.Hour))
+	f := setup(t, queuetest.WithSpans(time.Hour, time.Hour))
 	f.srv.Shutdown()
 	f.srv.WaitForShutdown()
-	eventually(t, "the client to notice the disconnect", func() bool { return f.q.Ready() != nil })
+	queuetest.Eventually(t, "the client to notice the disconnect", func() bool { return f.q.Ready() != nil })
 	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
 	defer cancel()
 	err := f.q.PublishSpans(ctx, map[string][]byte{traceA: []byte("x")})

@@ -1,0 +1,20 @@
+Observer.ai engine {{ .Chart.AppVersion }} is installed as {{ include "observer.fullname" . }}.
+
+Queues: {{ if .Values.nats.enabled }}the bundled NATS JetStream cluster ({{ .Values.nats.config.cluster.replicas }} servers){{ else if .Values.queue.url }}NATS at {{ .Values.queue.url }}{{ else }}in memory (lost when a pod restarts; use nats.enabled or queue.url to keep them){{ end }}
+
+Point your agents' OTLP exporters at:
+{{- if .Values.traceRouting.gateway.enabled }}
+  {{ include "observer.fullname" . }}-gateway.{{ .Release.Namespace }}.svc:4317  (gRPC)  or  :4318 (HTTP)
+  (the gateway routes every trace to one engine pod)
+{{- else }}
+  {{ include "observer.fullname" . }}.{{ .Release.Namespace }}.svc:{{ .Values.service.ports.otlpGrpc }}  (gRPC)  or  :{{ .Values.service.ports.otlpHttp }} (HTTP)
+{{- if and (include "observer.inMemory" .) (gt (int .Values.replicaCount) 1) }}
+  With queues in memory and {{ .Values.replicaCount }} replicas, the Service keeps each agent pod on one
+  engine pod (sessionAffinity: {{ include "observer.sessionAffinity" . }}). A trace whose spans come from several
+  services needs traceRouting.gateway.enabled instead.
+{{- end }}
+{{- end }}
+
+JSON API and docs:
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "observer.fullname" . }} 8080:{{ .Values.service.ports.http }}
+  open http://localhost:8080/docs

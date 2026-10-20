@@ -13,6 +13,7 @@ package config
 import (
 	"encoding/json"
 	"fmt"
+	"slices"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -88,9 +89,10 @@ type Agents struct {
 	// in order on the root span and then on its resource. The first one
 	// set wins. Traces from the JSON API name it in their agent field.
 	Attributes []string `yaml:"attributes"`
-	// Models maps an agent's name to its model. In the YAML file, each
-	// entry states only what differs from the scorer section; the rest is
-	// inherited from it. An agent not listed uses the scorer section.
+	// Models maps an agent's name to its own model. Each entry is complete
+	// on its own: endpoint, model and manifest are required, and nothing is
+	// taken from the scorer section; optional keys get DefaultModel()'s
+	// values. An agent not listed uses the scorer section.
 	Models map[string]Scorer `yaml:"models,omitempty"`
 }
 
@@ -160,6 +162,52 @@ type Queue struct {
 	ExportSubject    string `yaml:"export_subject"`
 	ExportDLQStream  string `yaml:"export_dlq_stream"`
 	ExportDLQSubject string `yaml:"export_dlq_subject"`
+
+	// Replicas is how many copies of each stream a NATS cluster keeps (1
+	// to 5). Set it to 3 on a three-server cluster so a server loss loses
+	// nothing.
+	Replicas int `yaml:"replicas"`
+	// Auth and TLS are how the engine connects to a secured NATS.
+	Auth NATSAuth `yaml:"auth"`
+	TLS  NATSTLS  `yaml:"tls"`
+}
+
+// NATSAuth is how the engine authenticates to NATS: at most one of a
+// credentials file, an nkey seed file, a user with a password, or a token.
+// Secrets come from environment variables, never the file.
+type NATSAuth struct {
+	CredentialsFile string `yaml:"credentials_file,omitempty"`
+	NkeySeedFile    string `yaml:"nkey_seed_file,omitempty"`
+	User            string `yaml:"user,omitempty"`
+	PasswordEnv     string `yaml:"password_env,omitempty"`
+	TokenEnv        string `yaml:"token_env,omitempty"`
+
+	// Password and Token are read from PasswordEnv and TokenEnv at load
+	// time; they are not part of the YAML.
+	Password string `yaml:"-"`
+	Token    string `yaml:"-"`
+}
+
+// methods names the ways of authenticating that are set.
+func (a NATSAuth) methods() []string {
+	var set []string
+	for name, v := range map[string]string{
+		"credentials_file": a.CredentialsFile, "nkey_seed_file": a.NkeySeedFile, "user": a.User, "token_env": a.TokenEnv,
+	} {
+		if v != "" {
+			set = append(set, name)
+		}
+	}
+	slices.Sort(set)
+	return set
+}
+
+// NATSTLS verifies the NATS server (CAFile) and, with CertFile and KeyFile,
+// presents a client certificate. Any of them turns TLS on.
+type NATSTLS struct {
+	CAFile   string `yaml:"ca_file,omitempty"`
+	CertFile string `yaml:"cert_file,omitempty"`
+	KeyFile  string `yaml:"key_file,omitempty"`
 }
 
 // NATS reports whether the queues live in NATS JetStream.
@@ -285,6 +333,16 @@ type Manifest struct {
 	Temperature float64 `json:"-"`
 }
 
+// DefaultModel is what an agent's model starts from: the engine's built-in
+// scorer settings (kind, decision question, timeout, retries, backoff), with
+// the keys every model must state for itself (endpoint, model, manifest)
+// left empty.
+func DefaultModel() Scorer {
+	s := Default().Scorer
+	s.Endpoint, s.Model, s.Manifest = "", "", ""
+	return s
+}
+
 // Default returns the configuration used for any key the YAML omits.
 func Default() Config {
 	return Config{
@@ -316,6 +374,7 @@ func Default() Config {
 			ExportSubject:    "observer.exports",
 			ExportDLQStream:  "OBSERVER_EXPORTS_DLQ",
 			ExportDLQSubject: "observer.exports_dlq",
+			Replicas:         1,
 		},
 		OTLP: OTLP{
 			GRPCAddr:       ":4317",

@@ -33,6 +33,11 @@ queue:
   export_subject: observer.exports
   export_dlq_stream: OBSERVER_EXPORTS_DLQ
   export_dlq_subject: observer.exports_dlq
+  replicas: 1                       # copies of each stream on a NATS cluster; 3 on three servers
+  # auth:                           # a secured NATS: one of these
+  #   credentials_file: nats.creds  # or nkey_seed_file, user + password_env, token_env
+  # tls:
+  #   ca_file: ca.pem               # cert_file + key_file for mutual TLS
 
 # OpenTelemetry receivers. Spans are stored by trace ID, assembled
 # into a trace once it goes quiet, then scored like any other trace.
@@ -65,7 +70,8 @@ scorer:
 agents:
   attributes: [agent.name, service.name]         # where a trace names its agent: root span, then resource
   # models:
-  #   support-bot:
+  #   support-bot:                               # each model complete: nothing comes from scorer
+  #     endpoint: http://localhost:8010/v1/systemone
   #     model: kev-support
   #     manifest: runs/support-bot/manifest.json  # see ../examples/agents.yaml
 

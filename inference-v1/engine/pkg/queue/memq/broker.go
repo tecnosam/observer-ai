@@ -1,4 +1,8 @@
-package queue
+// Package memq is the queue.AbstractBroker in process, for running without
+// NATS. It keeps the same rules as natsq (the conformance suite in package
+// queue checks both) but nothing survives a restart and engines cannot
+// share the work.
+package memq
 
 import (
 	"context"
@@ -11,6 +15,7 @@ import (
 	"github.com/observer-ai/engine/internal/common"
 	"github.com/observer-ai/engine/pkg/fault"
 	"github.com/observer-ai/engine/pkg/observe"
+	"github.com/observer-ai/engine/pkg/queue"
 	"github.com/observer-ai/engine/pkg/trace"
 )
 
@@ -21,17 +26,17 @@ const (
 	memoryAssembleBuffer = 64
 )
 
-// errBrokerClosed is returned by a MemoryBroker after Close.
+// errBrokerClosed is returned by a Broker after Close.
 var errBrokerClosed = errors.New("queue: broker is closed")
 
-// MemoryBroker is an in-process AbstractBroker for running without NATS. It
+// Broker is an in-process queue.AbstractBroker for running without NATS. It
 // keeps the same rules as the JetStream queue (a bounded queue, redelivery
 // with backoff up to MaxDeliver, then a dead letter; spans assembled after
 // IdleTimeout of quiet or MaxWait) but nothing survives a restart, and
 // engines cannot share the work. A dead letter is reported to the error
 // sinks, not stored.
-type MemoryBroker struct {
-	cfg    Config
+type Broker struct {
+	cfg    queue.Config
 	logger *slog.Logger
 
 	jobs   chan *memoryItem // never closed: redelivery timers may still send
@@ -56,14 +61,14 @@ type pendingSpans struct {
 
 // NewMemory builds an in-process broker. Of cfg it reads MaxMessages,
 // MaxDeliver, RedeliveryBackoff, Spans.IdleTimeout and Spans.MaxWait.
-func NewMemory(cfg Config) *MemoryBroker {
+func New(cfg queue.Config) *Broker {
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}
 	if cfg.Reporter == nil {
 		cfg.Reporter = observe.Discard
 	}
-	return &MemoryBroker{
+	return &Broker{
 		cfg:    cfg,
 		logger: cfg.Logger,
 		jobs:   make(chan *memoryItem, max(cfg.MaxMessages, 1)),
@@ -71,8 +76,13 @@ func NewMemory(cfg Config) *MemoryBroker {
 	}
 }
 
+// retryPolicy is the redelivery policy for a trace that hit a system error.
+func retryPolicy(c queue.Config) common.RetryPolicy {
+	return common.RetryPolicy{MaxDeliver: c.MaxDeliver, Backoff: c.RedeliveryBackoff}
+}
+
 // Publish queues t. It is refused with fault.KindFull at MaxMessages.
-func (b *MemoryBroker) Publish(_ context.Context, t trace.Trace) error {
+func (b *Broker) Publish(_ context.Context, t trace.Trace) error {
 	if b.closed.Load() {
 		return fault.Unavailable(fault.Queue, "publish trace", errBrokerClosed).WithTrace(t.TraceID)
 	}
@@ -85,8 +95,8 @@ func (b *MemoryBroker) Publish(_ context.Context, t trace.Trace) error {
 }
 
 // PublishSpans stores span batches until their trace goes quiet. It is
-// refused with fault.KindFull when maxPendingAssemblies traces are waiting.
-func (b *MemoryBroker) PublishSpans(_ context.Context, byTrace map[string][]byte) error {
+// refused with fault.KindFull when queue.MaxPendingAssemblies traces are waiting.
+func (b *Broker) PublishSpans(_ context.Context, byTrace map[string][]byte) error {
 	if b.closed.Load() {
 		return fault.Unavailable(fault.Queue, "store spans", errBrokerClosed)
 	}
@@ -96,7 +106,7 @@ func (b *MemoryBroker) PublishSpans(_ context.Context, byTrace map[string][]byte
 	for traceID, data := range byTrace {
 		p := b.spans[traceID]
 		if p == nil {
-			if len(b.spans) >= maxPendingAssemblies {
+			if len(b.spans) >= queue.MaxPendingAssemblies {
 				return fault.Full(fault.Queue, "store spans", fault.Msg("%d traces are waiting to be assembled", len(b.spans))).WithTrace(traceID)
 			}
 			p = &pendingSpans{first: now}
@@ -108,8 +118,13 @@ func (b *MemoryBroker) PublishSpans(_ context.Context, byTrace map[string][]byte
 	return nil
 }
 
+// Depth counts this process's traces: the queue is not shared.
+func (b *Broker) Depth(context.Context) (int64, error) {
+	return b.size.Load(), nil
+}
+
 // Ready reports an error once the broker is closed.
-func (b *MemoryBroker) Ready() error {
+func (b *Broker) Ready() error {
 	if b.closed.Load() {
 		return errBrokerClosed
 	}
@@ -117,7 +132,7 @@ func (b *MemoryBroker) Ready() error {
 }
 
 // Close refuses further traces and spans and says how many were lost.
-func (b *MemoryBroker) Close() {
+func (b *Broker) Close() {
 	if b.closed.Swap(true) {
 		return
 	}
@@ -130,20 +145,20 @@ func (b *MemoryBroker) Close() {
 	}
 }
 
-func (b *MemoryBroker) report(err *fault.Error) {
+func (b *Broker) report(err *fault.Error) {
 	b.cfg.Reporter.Report(context.Background(), err)
 }
 
 // --- workers ---
 
 type memoryWorkers struct {
-	b       *MemoryBroker
-	handler Handler
+	b       *Broker
+	handler queue.Handler
 	*common.Pool
 }
 
 // StartWorkers starts n workers taking traces from the queue.
-func (b *MemoryBroker) StartWorkers(n int, handler Handler) Stopper {
+func (b *Broker) StartWorkers(n int, handler queue.Handler) queue.Stopper {
 	w := &memoryWorkers{b: b, handler: handler, Pool: common.NewPool()}
 	w.Start(n, w.run)
 	return w
@@ -167,7 +182,7 @@ func (w *memoryWorkers) run() {
 func (w *memoryWorkers) handle(it *memoryItem) {
 	it.count++
 	if it.trace.TraceID == "" {
-		it.trace.TraceID = sequenceID(memoryStream, it.sequence)
+		it.trace.TraceID = queue.SequenceID(memoryStream, it.sequence)
 	}
 	err := w.handler(w.WorkCtx(), it.trace)
 	switch {
@@ -177,12 +192,12 @@ func (w *memoryWorkers) handle(it *memoryItem) {
 		it.count-- // not a real attempt
 		w.b.jobs <- it
 		w.b.logger.Warn("trace returned to the queue on shutdown", "trace_id", it.trace.TraceID)
-	case w.b.cfg.retry().Exhausted(it.count):
+	case retryPolicy(w.b.cfg).Exhausted(it.count):
 		w.b.size.Add(-1)
 		w.b.report(fault.New(fault.KindOf(err), fault.Queue, "dead-letter trace", err).AsSevere().
-			WithTrace(it.trace.TraceID).With("reason", ReasonSystemError).With("deliveries", it.count).With("dlq_stream", memoryStream))
+			WithTrace(it.trace.TraceID).With("reason", queue.ReasonSystemError).With("deliveries", it.count).With("dlq_stream", memoryStream))
 	default:
-		delay := w.b.cfg.retry().Delay(it.count)
+		delay := retryPolicy(w.b.cfg).Delay(it.count)
 		w.b.report(fault.New(fault.KindOf(err), fault.Queue, "process trace, will redeliver", err).
 			WithTrace(it.trace.TraceID).With("delivery", it.count).With("max_deliver", w.b.cfg.MaxDeliver).With("retry_in", delay.String()))
 		time.AfterFunc(delay, func() { w.b.jobs <- it })
@@ -192,8 +207,8 @@ func (w *memoryWorkers) handle(it *memoryItem) {
 // --- assemblers ---
 
 type memoryAssemblers struct {
-	b        *MemoryBroker
-	assemble AssembleFunc
+	b        *Broker
+	assemble queue.AssembleFunc
 	due      chan memoryAssembly
 	*common.Pool
 }
@@ -205,7 +220,7 @@ type memoryAssembly struct {
 
 // StartAssemblers starts a scanner that picks out traces gone quiet, and n
 // assemblers that turn them into queued traces.
-func (b *MemoryBroker) StartAssemblers(n int, assemble AssembleFunc) Stopper {
+func (b *Broker) StartAssemblers(n int, assemble queue.AssembleFunc) queue.Stopper {
 	a := &memoryAssemblers{b: b, assemble: assemble, due: make(chan memoryAssembly, memoryAssembleBuffer), Pool: common.NewPool()}
 	a.Start(1, a.scan)
 	a.Start(n, a.run)
@@ -234,7 +249,7 @@ func (a *memoryAssemblers) scan() {
 	}
 }
 
-func (b *MemoryBroker) takeComplete(now time.Time) []memoryAssembly {
+func (b *Broker) takeComplete(now time.Time) []memoryAssembly {
 	sc := b.cfg.Spans
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -275,9 +290,11 @@ func (a *memoryAssemblers) handle(due memoryAssembly) {
 		select {
 		case <-a.Stopped():
 			return
-		case <-time.After(assemblerRetryDelay):
+		case <-time.After(queue.AssemblerRetryDelay):
 		}
 	}
 	a.b.logger.Info("trace assembled from spans",
 		"trace_id", due.traceID, "batches", len(due.batches), "tool_calls", len(t.ToolCalls), "evidence", len(t.Evidence))
 }
+
+var _ queue.AbstractBroker = (*Broker)(nil)

@@ -27,12 +27,14 @@ func writeAgents(t *testing.T, agents string) string {
 	return path
 }
 
-// An agent's model states only what differs; the rest comes from scorer.
-func TestAgentModelInheritsScorer(t *testing.T) {
+// An agent's model is complete on its own: what it leaves out gets the
+// engine's built-in defaults, never the scorer section's values.
+func TestAgentModelTakesNothingFromScorer(t *testing.T) {
 	cfg, err := Load(writeAgents(t, `
 agents:
   models:
     support-bot:
+      endpoint: http://kev-support:8010/v1/systemone
       model: kev-support
       manifest: support.json
 `))
@@ -40,20 +42,20 @@ agents:
 		t.Fatal(err)
 	}
 	m := cfg.Agents.Models["support-bot"]
-	if m.Model != "kev-support" || m.Manifest != "support.json" {
+	if m.Endpoint != "http://kev-support:8010/v1/systemone" || m.Model != "kev-support" || m.Manifest != "support.json" {
 		t.Errorf("own keys = %+v", m)
 	}
-	if m.Endpoint != cfg.Scorer.Endpoint || m.Timeout.Std() != 2*time.Second || m.DecisionQuestion != "answer_wrong" {
-		t.Errorf("inherited keys = %+v, want the scorer section's", m)
+	// scorer.timeout is 2s in this file; the agent's model keeps the built-in 10s.
+	if def := DefaultModel(); m.Timeout != def.Timeout || m.MaxRetries != def.MaxRetries || m.DecisionQuestion != def.DecisionQuestion {
+		t.Errorf("optional keys = %+v, want the built-in defaults", m)
+	}
+	if cfg.Scorer.Timeout.Std() != 2*time.Second {
+		t.Errorf("scorer.timeout changed to %s", cfg.Scorer.Timeout.Std())
 	}
 	if got := cfg.AgentManifests["support-bot"]; got.Model != "support" || got.Temperature != 1.4 {
 		t.Errorf("agent manifest = %+v", got)
 	}
-	if cfg.Manifest.Temperature != 0.86 {
-		t.Errorf("default manifest changed: %+v", cfg.Manifest)
-	}
 
-	// Compiled for the components: one model per agent, with its own temperature.
 	ms := cfg.Models(nil)
 	if a := ms.ByAgent[trace.AgentName("support-bot")]; a.Client.Model != "kev-support" || a.Temperature != 1.4 {
 		t.Errorf("compiled agent model = %+v", a)
@@ -63,35 +65,36 @@ agents:
 	}
 }
 
-// An agent's backoff list is its own copy, not the scorer's.
-func TestAgentModelOverridesWholeLists(t *testing.T) {
+// Environment overrides change the scorer section only, and an agent's
+// model never picks them up.
+func TestAgentModelIgnoresScorerEnvironment(t *testing.T) {
+	t.Setenv(EnvScorerEndpoint, "http://host.docker.internal:8010/v1/systemone")
 	cfg, err := Load(writeAgents(t, `
 agents:
   models:
-    support-bot:
-      manifest: support.json
-      backoff: [1s]
+    support-bot: {endpoint: "http://kev-support:8010/v1/systemone", model: kev-support, manifest: support.json}
 `))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := cfg.Agents.Models["support-bot"].Backoff; len(got) != 1 || got[0].Std() != time.Second {
-		t.Errorf("agent backoff = %v", got)
-	}
-	if len(cfg.Scorer.Backoff) != 3 {
-		t.Errorf("scorer backoff changed to %v", cfg.Scorer.Backoff)
+	if cfg.Agents.Models["support-bot"].Endpoint != "http://kev-support:8010/v1/systemone" {
+		t.Errorf("agent endpoint = %q", cfg.Agents.Models["support-bot"].Endpoint)
 	}
 }
 
 func TestAgentModelErrors(t *testing.T) {
+	const ok = "      endpoint: http://kev:8010/v1/systemone\n      model: kev-a\n"
 	cases := []struct {
 		name, agents, want string
 	}{
-		{"unknown key", "agents:\n  models:\n    a:\n      modle: x\n", "field modle not found"},
-		{"bad value", "agents:\n  models:\n    a:\n      manifest: support.json\n      timeout: 0s\n", "agents.models.a.timeout must be positive"},
-		{"missing manifest file", "agents:\n  models:\n    a:\n      manifest: nope.json\n", "nope.json"},
-		{"no attributes", "agents:\n  attributes: []\n  models:\n    a:\n      manifest: support.json\n", "agents.attributes must name at least one"},
-		{"slow model", "agents:\n  models:\n    a:\n      manifest: support.json\n      timeout: 10m\n", "for agents.models.a"},
+		{"no endpoint", "agents:\n  models:\n    a:\n      model: kev-a\n      manifest: support.json\n", "agents.models.a.endpoint is required"},
+		{"no model", "agents:\n  models:\n    a:\n      endpoint: http://kev:8010/v1/systemone\n      manifest: support.json\n", "agents.models.a.model is required"},
+		{"no manifest", "agents:\n  models:\n    a:\n" + ok, "agents.models.a.manifest is required"},
+		{"unknown key", "agents:\n  models:\n    a:\n" + ok + "      modle: x\n", "field modle not found"},
+		{"bad value", "agents:\n  models:\n    a:\n" + ok + "      manifest: support.json\n      timeout: 0s\n", "agents.models.a.timeout must be positive"},
+		{"missing manifest file", "agents:\n  models:\n    a:\n" + ok + "      manifest: nope.json\n", "nope.json"},
+		{"no attributes", "agents:\n  attributes: []\n  models:\n    a:\n" + ok + "      manifest: support.json\n", "agents.attributes must name at least one"},
+		{"slow model", "agents:\n  models:\n    a:\n" + ok + "      manifest: support.json\n      timeout: 10m\n", "for agents.models.a"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -111,6 +114,8 @@ agents:
   models:
     support-bot:
       kind: jev
+      endpoint: https://api.typesafe.ai/v1/systemone
+      model: jev-latest
       api_key_env: SUPPORT_KEY
       manifest: support.json
 `))
@@ -125,8 +130,8 @@ agents:
 // In code, an agent's model is given whole, with its manifest as a value.
 func TestStaticFactoryAgentModels(t *testing.T) {
 	cfg := Default()
-	support := cfg.Scorer
-	support.Model = "kev-support"
+	support := DefaultModel()
+	support.Endpoint, support.Model = "http://kev-support:8010/v1/systemone", "kev-support"
 	cfg.Agents.Models = map[string]Scorer{"support-bot": support}
 	questions := json.RawMessage(`{"answer_wrong": {"type": "noul", "instructions": "?"}}`)
 	f := NewStaticFactory(cfg, &Manifest{Questions: questions})

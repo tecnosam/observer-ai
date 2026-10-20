@@ -1,7 +1,9 @@
 package otlp
 
 import (
+	"strings"
 	"testing"
+	"unicode/utf8"
 
 	tracepb "go.opentelemetry.io/proto/otlp/trace/v1"
 
@@ -57,5 +59,13 @@ func TestAssembleNamesNoAgent(t *testing.T) {
 	tr, err := assemble(t, []*tracepb.Span{rootWith("agent.name", "support-bot")})
 	if err != nil || tr.Agent != "" {
 		t.Errorf("agent = %q, error %v", tr.Agent, err)
+	}
+}
+
+func TestAssemblerCutsLongAgentNames(t *testing.T) {
+	long := strings.Repeat("é", trace.MaxAgentLength) // 2 bytes each
+	got := assembleWith(t, []string{"agent.name"}, "svc", rootWith("agent.name", long)).Agent
+	if len(got) > trace.MaxAgentLength || !utf8.ValidString(string(got)) {
+		t.Errorf("agent is %d bytes, valid UTF-8 %v", len(got), utf8.ValidString(string(got)))
 	}
 }

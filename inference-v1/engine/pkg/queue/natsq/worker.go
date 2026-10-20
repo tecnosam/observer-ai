@@ -1,10 +1,8 @@
-package queue
+package natsq
 
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"strconv"
 	"time"
 
@@ -13,17 +11,12 @@ import (
 
 	"github.com/observer-ai/engine/internal/common"
 	"github.com/observer-ai/engine/pkg/fault"
+	"github.com/observer-ai/engine/pkg/queue"
 	"github.com/observer-ai/engine/pkg/trace"
 )
 
 const (
 	ackTimeout = 5 * time.Second
-)
-
-// Dead-letter reasons, carried in HeaderDeadReason.
-const (
-	ReasonSystemError    = "system_error"    // kept failing until max_deliver
-	ReasonInvalidPayload = "invalid_payload" // not a valid trace; never retried
 )
 
 // Headers on a dead-lettered message. The body is the original payload, so
@@ -37,23 +30,18 @@ const (
 	HeaderSourceSequence = "Observer-Source-Sequence"
 )
 
-// Handler processes one trace. Returning an error means a system error: the
-// trace was not processed and should be tried again later. A handler that
-// reaches a decision, by whatever route, returns nil.
-type Handler func(ctx context.Context, t trace.Trace) error
-
 // Workers is a running pool of queue workers. Stop stops pulling new
 // traces and waits for the ones in flight; if its ctx ends first, the
 // in-flight work is cancelled and those traces go back to the queue.
 type Workers struct {
 	*common.Pool
 	q       *Queue
-	handler Handler
+	handler queue.Handler
 }
 
 // StartWorkers starts n workers pulling from the queue's durable consumer.
 // Every engine process that uses the same consumer name shares the work.
-func (q *Queue) StartWorkers(n int, handler Handler) Stopper {
+func (q *Queue) StartWorkers(n int, handler queue.Handler) queue.Stopper {
 	w := &Workers{Pool: common.NewPool(), q: q, handler: handler}
 	w.Start(n, func() {
 		common.Pull(w.Pool, q.cons, q.cfg.PollWait, w.handle, func(err error) {
@@ -84,11 +72,11 @@ func (w *Workers) handle(msg jetstream.Msg) {
 	d := newDelivery(msg)
 	t, err := trace.Decode(bytes.NewReader(msg.Data()))
 	if err != nil {
-		w.deadLetter(d, ReasonInvalidPayload, err) // nothing a retry could fix
+		w.deadLetter(d, queue.ReasonInvalidPayload, err) // nothing a retry could fix
 		return
 	}
 	if t.TraceID == "" {
-		t.TraceID = sequenceID(w.q.cfg.Stream, d.sequence) // published straight to the subject, without the API's ID
+		t.TraceID = queue.SequenceID(w.q.cfg.Stream, d.sequence) // published straight to the subject, without the API's ID
 	}
 	d.traceID = t.TraceID
 	w.settle(d, w.handler(w.WorkCtx(), t))
@@ -101,8 +89,8 @@ func (w *Workers) settle(d delivery, err error) {
 		w.ack(d)
 	case w.WorkCtx().Err() != nil:
 		w.returnOnShutdown(d)
-	case w.q.cfg.retry().Exhausted(d.count):
-		w.deadLetter(d, ReasonSystemError, err)
+	case retryPolicy(w.q.cfg).Exhausted(d.count):
+		w.deadLetter(d, queue.ReasonSystemError, err)
 	default:
 		w.redeliver(d, err)
 	}
@@ -178,12 +166,5 @@ func (w *Workers) ack(d delivery) {
 // redeliveryDelay is the wait before the next delivery, given how many
 // deliveries have happened so far.
 func (w *Workers) redeliveryDelay(deliveries int) time.Duration {
-	return w.q.cfg.retry().Delay(deliveries)
-}
-
-// sequenceID derives a 32-hex-character trace ID from a message's place in
-// the stream, so a trace keeps the same ID however often it is redelivered.
-func sequenceID(stream string, sequence uint64) string {
-	sum := sha256.Sum256([]byte(stream + ":" + strconv.FormatUint(sequence, 10)))
-	return hex.EncodeToString(sum[:16])
+	return retryPolicy(w.q.cfg).Delay(deliveries)
 }

@@ -1,0 +1,16 @@
+{{- if and (not .Values.manifests.existingConfigMap) (not .Values.manifests.files) }}
+{{- fail "observer: give the model manifest(s): manifests.files (inline) or manifests.existingConfigMap" }}
+{{- end }}
+{{- if not .Values.manifests.existingConfigMap }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "observer.manifestsConfigMap" . }}
+  labels:
+    {{- include "observer.labels" . | nindent 4 }}
+data:
+  {{- range $file, $content := .Values.manifests.files }}
+  {{ $file }}: |
+    {{- $content | nindent 4 }}
+  {{- end }}
+{{- end }}

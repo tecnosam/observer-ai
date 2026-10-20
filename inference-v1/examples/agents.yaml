@@ -8,10 +8,11 @@
 #
 #   cd ../engine && make run CONFIG=../examples/agents.yaml
 #
-# Each agents.models entry states only what differs from scorer and inherits
-# the rest. Point each manifest at the run directory the fine-tuning SDK
-# wrote for that agent; the ones in manifests/ are placeholders with neutral
-# temperatures.
+# Each agents.models entry is complete on its own: endpoint, model and
+# manifest are required, and nothing comes from the scorer section; keys it
+# leaves out get the engine's built-in defaults. Point each manifest at the
+# run directory the fine-tuning SDK wrote for that agent; the ones in
+# manifests/ are placeholders with neutral temperatures.
 # Keys not listed here keep the defaults in ../engine/observer.yaml.
 
 scorer:
@@ -23,7 +24,8 @@ agents:
   attributes: [agent.name, service.name]
   models:
     support-bot:
-      model: kev-support-bot                       # same Kev server, another model
+      endpoint: http://localhost:8010/v1/systemone # same Kev server, another model
+      model: kev-support-bot
       manifest: manifests/support-bot.json
     research-agent:
       endpoint: http://localhost:8011/v1/systemone # its own Kev server

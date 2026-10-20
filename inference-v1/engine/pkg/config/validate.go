@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"os"
 	"regexp"
 	"strings"
 	"time"
@@ -56,7 +57,17 @@ func (c *Config) validateAgents(p *problems) {
 		if strings.TrimSpace(agent) == "" {
 			p.add("agents.models: an agent name must not be empty")
 		}
-		validateScorer(p, modelKey(agent), model)
+		key := modelKey(agent)
+		// manifest is required too, but may come as a value in code; the
+		// manifest loader checks it.
+		for field, v := range map[string]string{"endpoint": model.Endpoint, "model": model.Model} {
+			if v == "" {
+				p.add("%s.%s is required: an agent's model takes nothing from the scorer section", key, field)
+			}
+		}
+		if model.Endpoint != "" && model.Model != "" {
+			validateScorer(p, key, model)
+		}
 	}
 }
 
@@ -70,8 +81,35 @@ func (c *Config) validateQueue(p *problems) {
 	p.atLeast("queue.max_deliver", q.MaxDeliver, 1)
 	p.backoff("queue.redelivery_backoff", q.RedeliveryBackoff)
 	p.positive("queue.dlq_max_age", q.DLQMaxAge)
+	if q.Replicas < 1 || q.Replicas > 5 {
+		p.add("queue.replicas must be between 1 and 5, got %d", q.Replicas)
+	}
 	c.validateQueueNames(p)
 	c.validateAckWait(p)
+	if q.NATS() {
+		validateNATSAuth(p, q.Auth)
+		validateNATSTLS(p, q.TLS)
+	}
+}
+
+func validateNATSAuth(p *problems, a NATSAuth) {
+	if set := a.methods(); len(set) > 1 {
+		p.add("queue.auth: set one way to authenticate, got %s", strings.Join(set, ", "))
+	}
+	if (a.User == "") != (a.PasswordEnv == "") {
+		p.add("queue.auth.user and queue.auth.password_env go together")
+	}
+	p.readable("queue.auth.credentials_file", a.CredentialsFile)
+	p.readable("queue.auth.nkey_seed_file", a.NkeySeedFile)
+}
+
+func validateNATSTLS(p *problems, t NATSTLS) {
+	if (t.CertFile == "") != (t.KeyFile == "") {
+		p.add("queue.tls.cert_file and queue.tls.key_file go together")
+	}
+	p.readable("queue.tls.ca_file", t.CAFile)
+	p.readable("queue.tls.cert_file", t.CertFile)
+	p.readable("queue.tls.key_file", t.KeyFile)
 }
 
 func (c *Config) validateQueueNames(p *problems) {
@@ -322,6 +360,20 @@ func (p *problems) headerNames(key string, headers map[string]string) {
 			p.add("%s: a header name must not be empty", key)
 		}
 	}
+}
+
+// readable checks that a configured file can be opened, so a wrong path
+// fails at start-up rather than at the first reconnect.
+func (p *problems) readable(key, path string) {
+	if path == "" {
+		return
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		p.add("%s: %w", key, err)
+		return
+	}
+	f.Close()
 }
 
 // streamNames checks NATS stream (and consumer) names.

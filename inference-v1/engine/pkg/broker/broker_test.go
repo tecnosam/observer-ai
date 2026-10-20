@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/observer-ai/engine/pkg/export"
+	exportnats "github.com/observer-ai/engine/pkg/export/natsq"
 	"github.com/observer-ai/engine/pkg/pipeline"
 	"github.com/observer-ai/engine/pkg/queue"
 	"github.com/observer-ai/engine/pkg/queue/queuetest"
@@ -26,7 +27,7 @@ func queueConfig() queue.Config {
 	}
 }
 
-var streams = export.NATSStreams{
+var streams = exportnats.Streams{
 	Stream: "EXPORTS", Subject: "exports", Consumer: "workers-export",
 	DLQStream: "EXPORTS_DLQ", DLQSubject: "exports_dlq", DLQMaxAge: time.Hour, PollWait: 100 * time.Millisecond,
 }

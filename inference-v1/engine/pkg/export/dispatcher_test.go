@@ -1,4 +1,4 @@
-package export
+package export_test
 
 import (
 	"context"
@@ -7,6 +7,9 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/observer-ai/engine/pkg/export"
+	"github.com/observer-ai/engine/pkg/export/memq"
 
 	"github.com/observer-ai/engine/pkg/fault"
 	"github.com/observer-ai/engine/pkg/pipeline"
@@ -63,20 +66,20 @@ func (b *fakeBackend) state() (sent []string, flushed, shutdown bool) {
 // does not know.
 type fakeFactory map[string]*fakeBackend
 
-func (f fakeFactory) Build(_ context.Context, cfg BackendConfig) (AbstractBackend, error) {
+func (f fakeFactory) Build(_ context.Context, cfg export.BackendConfig) (export.AbstractBackend, error) {
 	if b, ok := f[cfg.Name]; ok {
 		return b, nil
 	}
 	return nil, errors.New("unknown back end")
 }
 
-func newDispatcher(t *testing.T, factory fakeFactory, reporter *recordingReporter, backends ...BackendConfig) *Dispatcher {
+func newDispatcher(t *testing.T, factory fakeFactory, reporter *recordingReporter, backends ...export.BackendConfig) *export.Dispatcher {
 	t.Helper()
-	cfg := DispatcherConfig{Backends: backends, Factory: factory}
+	cfg := export.DispatcherConfig{Backends: backends, Factory: factory, Queues: memq.Factory{}}
 	if reporter != nil {
 		cfg.Reporter = reporter
 	}
-	d, err := NewDispatcher(context.Background(), cfg)
+	d, err := export.NewDispatcher(context.Background(), cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -84,13 +87,9 @@ func newDispatcher(t *testing.T, factory fakeFactory, reporter *recordingReporte
 	return d
 }
 
-func kept(id string) pipeline.Record {
-	return pipeline.Record{Trace: trace.Trace{TraceID: id}, Decision: keepHigh}
-}
-
 func TestDispatcherSendsToEveryBackend(t *testing.T) {
 	a, b := &fakeBackend{}, &fakeBackend{}
-	d := newDispatcher(t, fakeFactory{"a": a, "b": b}, nil, BackendConfig{Name: "a"}, BackendConfig{Name: "b"})
+	d := newDispatcher(t, fakeFactory{"a": a, "b": b}, nil, export.BackendConfig{Name: "a"}, export.BackendConfig{Name: "b"})
 
 	for _, id := range []string{"t1", "t2"} {
 		if !d.Export(context.Background(), kept(id)) {
@@ -110,7 +109,7 @@ func TestDispatcherSendsToEveryBackend(t *testing.T) {
 
 func TestDispatcherSendsDroppedTracesNowhere(t *testing.T) {
 	a := &fakeBackend{}
-	d := newDispatcher(t, fakeFactory{"a": a}, nil, BackendConfig{Name: "a"})
+	d := newDispatcher(t, fakeFactory{"a": a}, nil, export.BackendConfig{Name: "a"})
 	for _, dec := range []pipeline.Decision{
 		{Scored: true, PKeep: 0.1, PKeepRaw: 0.12, Reason: pipeline.ReasonBelowThreshold, Severity: pipeline.SeverityNone},
 		{Reason: pipeline.ReasonFallback, Severity: pipeline.SeverityNone},
@@ -129,7 +128,7 @@ func TestDispatcherSendsDroppedTracesNowhere(t *testing.T) {
 // hold up the caller.
 func TestDispatcherDoesNotWaitForTheBackend(t *testing.T) {
 	slow := &fakeBackend{gate: make(chan struct{})}
-	d := newDispatcher(t, fakeFactory{"slow": slow}, nil, BackendConfig{Name: "slow"})
+	d := newDispatcher(t, fakeFactory{"slow": slow}, nil, export.BackendConfig{Name: "slow"})
 
 	done := make(chan bool)
 	go func() { done <- d.Export(context.Background(), kept("t1")) }()
@@ -156,18 +155,26 @@ func TestDispatcherDoesNotWaitForTheBackend(t *testing.T) {
 	}
 }
 
-// A full queue skips the trace for that back end only, and reports it.
+// A full queue skips the trace for that back end only, and reports it. The
+// bound counts the trace being sent, as JetStream's does.
 func TestDispatcherFullQueueSkipsAndReports(t *testing.T) {
 	stuck := &fakeBackend{gate: make(chan struct{}), started: make(chan struct{}, 1)}
 	fine := &fakeBackend{}
 	reported := &recordingReporter{}
 	d := newDispatcher(t, fakeFactory{"stuck": stuck, "fine": fine}, reported,
-		BackendConfig{Name: "stuck", QueueSize: 1, Concurrency: 1}, BackendConfig{Name: "fine"})
+		export.BackendConfig{Name: "stuck", QueueSize: 1, Concurrency: 1}, export.BackendConfig{Name: "fine"})
+	released := false
+	release := func() {
+		if !released {
+			released = true
+			close(stuck.gate)
+		}
+	}
+	defer release()
 
-	d.Export(context.Background(), kept("t1")) // taken by the only worker, which blocks
+	d.Export(context.Background(), kept("t1")) // being sent: fills the queue of 1
 	<-stuck.started
-	d.Export(context.Background(), kept("t2")) // waits in the queue
-	if !d.Export(context.Background(), kept("t3")) {
+	if !d.Export(context.Background(), kept("t2")) {
 		t.Error("Export returned false although one back end took the trace")
 	}
 
@@ -175,20 +182,19 @@ func TestDispatcherFullQueueSkipsAndReports(t *testing.T) {
 	if len(errs) != 1 || fault.KindOf(errs[0]) != fault.KindFull {
 		t.Fatalf("reported %v, want one full-queue fault", errs)
 	}
-	f, _ := fault.As(errs[0])
-	if f.Attrs["exporter"] != "stuck" || f.TraceID != "t3" {
-		t.Errorf("fault = %+v, want exporter stuck and trace t3", f)
+	if f, _ := fault.As(errs[0]); f.Attrs["exporter"] != "stuck" || f.TraceID != "t2" {
+		t.Errorf("fault = %+v, want exporter stuck and trace t2", f)
 	}
 
-	close(stuck.gate)
+	release()
 	if err := d.Flush(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if sent, _, _ := stuck.state(); len(sent) != 2 {
-		t.Errorf("stuck back end sent %v, want t1 and t2", sent)
+	if sent, _, _ := stuck.state(); len(sent) != 1 {
+		t.Errorf("stuck back end sent %v, want t1 only", sent)
 	}
-	if sent, _, _ := fine.state(); len(sent) != 3 {
-		t.Errorf("other back end sent %v, want all three", sent)
+	if sent, _, _ := fine.state(); len(sent) != 2 {
+		t.Errorf("other back end sent %v, want both", sent)
 	}
 }
 
@@ -197,7 +203,7 @@ func TestDispatcherRetriesThenGivesUp(t *testing.T) {
 	failing := &fakeBackend{err: fault.Unavailable(fault.Export, "forward spans", errors.New("connection refused"))}
 	reported := &recordingReporter{}
 	d := newDispatcher(t, fakeFactory{"langfuse": failing}, reported,
-		BackendConfig{Name: "langfuse", MaxDeliver: 3, Backoff: []time.Duration{time.Millisecond}})
+		export.BackendConfig{Name: "langfuse", MaxDeliver: 3, Backoff: []time.Duration{time.Millisecond}})
 
 	d.Export(context.Background(), kept("t1"))
 	if err := d.Flush(context.Background()); err != nil {
@@ -221,9 +227,10 @@ func TestDispatcherRetriesThenGivesUp(t *testing.T) {
 
 func TestDispatcherRetrySucceeds(t *testing.T) {
 	flaky := &flakyBackend{fails: 1}
-	d, err := NewDispatcher(context.Background(), DispatcherConfig{
-		Backends: []BackendConfig{{Name: "a", Backoff: []time.Duration{time.Millisecond}}},
+	d, err := export.NewDispatcher(context.Background(), export.DispatcherConfig{
+		Backends: []export.BackendConfig{{Name: "a", Backoff: []time.Duration{time.Millisecond}}},
 		Factory:  fixedFactory{flaky},
+		Queues:   memq.Factory{},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -242,7 +249,7 @@ func TestDispatcherRetrySucceeds(t *testing.T) {
 func TestDispatcherGivesUpOnInvalid(t *testing.T) {
 	bad := &fakeBackend{err: fault.Invalid(fault.Export, "annotate stored spans", errors.New("corrupt"))}
 	reported := &recordingReporter{}
-	d := newDispatcher(t, fakeFactory{"a": bad}, reported, BackendConfig{Name: "a"})
+	d := newDispatcher(t, fakeFactory{"a": bad}, reported, export.BackendConfig{Name: "a"})
 	d.Export(context.Background(), kept("t1"))
 	if err := d.Flush(context.Background()); err != nil {
 		t.Fatal(err)
@@ -271,9 +278,9 @@ func (*flakyBackend) Flush(context.Context) error    { return nil }
 func (*flakyBackend) Shutdown(context.Context) error { return nil }
 
 // fixedFactory hands out one prebuilt back end.
-type fixedFactory struct{ backend AbstractBackend }
+type fixedFactory struct{ backend export.AbstractBackend }
 
-func (f fixedFactory) Build(context.Context, BackendConfig) (AbstractBackend, error) {
+func (f fixedFactory) Build(context.Context, export.BackendConfig) (export.AbstractBackend, error) {
 	return f.backend, nil
 }
 
@@ -281,7 +288,7 @@ func (f fixedFactory) Build(context.Context, BackendConfig) (AbstractBackend, er
 // more traces.
 func TestDispatcherShutdown(t *testing.T) {
 	a := &fakeBackend{}
-	d := newDispatcher(t, fakeFactory{"a": a}, nil, BackendConfig{Name: "a"})
+	d := newDispatcher(t, fakeFactory{"a": a}, nil, export.BackendConfig{Name: "a"})
 	d.Export(context.Background(), kept("t1"))
 	if err := d.Shutdown(context.Background()); err != nil {
 		t.Fatal(err)
@@ -301,9 +308,10 @@ func TestDispatcherShutdown(t *testing.T) {
 // are shut down.
 func TestDispatcherBuildFailure(t *testing.T) {
 	a := &fakeBackend{}
-	_, err := NewDispatcher(context.Background(), DispatcherConfig{
-		Backends: []BackendConfig{{Name: "a"}, {Name: "missing"}},
+	_, err := export.NewDispatcher(context.Background(), export.DispatcherConfig{
+		Backends: []export.BackendConfig{{Name: "a"}, {Name: "missing"}},
 		Factory:  fakeFactory{"a": a},
+		Queues:   memq.Factory{},
 	})
 	if fault.KindOf(err) != fault.KindInvalid {
 		t.Fatalf("error = %v, want an invalid fault", err)

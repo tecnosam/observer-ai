@@ -253,6 +253,7 @@ components:
           example: 7f3a91c2e8
         agent:
           type: string
+          maxLength: 128
           description: |
             The agent the trace came from. It picks the model that scores
             the trace (agents.models in the config); an agent with no model

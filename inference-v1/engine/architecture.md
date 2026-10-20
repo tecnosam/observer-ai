@@ -52,9 +52,14 @@ pkg/                     the reusable engine: import these to embed it in anothe
   scorer/                model adapter: /v1/systemone client, its factory, and the per-agent model builder
   policy/                keep or drop from a probability: threshold, random floor, severity
   broker/                chooses where the queues live: the NATS or in-process family of queues
-  queue/                 the trace work queue and span store: AbstractBroker, on JetStream (Queue) or in memory (MemoryBroker)
-    queuetest/           starts an in-process NATS server for tests
-  export/                sends kept traces to every configured back end over OTLP, from a queue per back end
+  queue/                 the trace work queue and span store: AbstractBroker, Config, Handler, the shared rules
+    natsq/               on NATS JetStream: the queue, its workers, span assembly
+    memq/                in process
+    queuetest/           an in-process NATS server and helpers for tests
+  export/                sends kept traces to every back end: Dispatcher, the backend and queue contracts, Settle
+    otlpbackend/         the OTLP/HTTP back end (Phoenix, Langfuse, any OTLP endpoint)
+    natsq/               export queues on NATS JetStream
+    memq/                export queues in process
 internal/                this binary's own pieces: not importable from another module
   server/                JSON API handlers: HTTP in, pipeline calls, HTTP out
   otlp/                  OTLP gRPC and HTTP receivers; turning spans into a Trace
@@ -269,12 +274,12 @@ uses it, and the concrete type lives elsewhere. All of them are small:
 | `scorer.AbstractScorerFactory` | `scorer/factory.go` | `Build` | `scorer.HTTPFactory` (Kev, Jev) |
 | `pipeline.Policy` | `pipeline/interfaces.go` | `Decide`, `Fallback` | `*policy.Policy` |
 | `pipeline.Exporter` | `pipeline/interfaces.go` | `Export`, `Flush` | `*export.Dispatcher` |
-| `export.AbstractBackend` | `export/backend.go` | `Send`, `Flush`, `Shutdown` | `*export.OTLPBackend` |
-| `export.AbstractBackendFactory` | `export/backend.go` | `Build` | `export.OTLPBackendFactory` |
+| `export.AbstractBackend` | `export/backend.go` | `Send`, `Flush`, `Shutdown` | `*otlpbackend.Backend` |
+| `export.AbstractBackendFactory` | `export/backend.go` | `Build` | `otlpbackend.Factory` |
 | `pipeline.Publisher` | `pipeline/interfaces.go` | `Publish`, `Ready` | `queue.AbstractBroker` |
 | `queue.AbstractBroker` | `queue/broker.go` | `Publish`, `PublishSpans`, `StartWorkers`, `StartAssemblers`, `Ready`, `Close` | `*queue.Queue` (JetStream), `*queue.MemoryBroker` |
 | `export.AbstractQueue` | `export/queue.go` | `Enqueue`, `Flush`, `Shutdown` | JetStream and in-memory queues |
-| `export.AbstractQueueFactory` | `export/queue.go` | `Queue` | `export.NATSQueueFactory`, `export.MemoryQueueFactory` |
+| `export.AbstractQueueFactory` | `export/queue.go` | `Queue` | `natsq.Factory`, `memq.Factory` (under `export/`) |
 | `broker.AbstractFactory` | `broker/broker.go` | `Ingest`, `ExportQueues`, `Kind`, `Close` | `*broker.NATS`, `broker.Memory` |
 | `pipeline.Metrics` | `pipeline/interfaces.go` | `ScoreFinished`, `TraceDecided` | `*metrics.Recorder`, `metrics.Noop` |
 | `export.SendMetrics` | `export/dispatcher.go` | `SendFinished` | `*metrics.Recorder`, `metrics.Noop` |
@@ -283,7 +288,7 @@ uses it, and the concrete type lives elsewhere. All of them are small:
 | `observe.Reporter` | `observe/reporter.go` | `Report` | `*observe.Pipeline` |
 | `observe.AbstractSink` | `observe/sink.go` | `Write`, `Close` | stdout and file sinks |
 | `otlp.Sink` | `otlp/receiver.go` | `PublishSpans` | `queue.AbstractBroker` |
-| `export.Uploader` | `export/otlp_backend.go` | `UploadTraces` | the OTLP/HTTP client |
+| `otlpbackend.Uploader` | `export/otlpbackend/backend.go` | `UploadTraces` | the OTLP/HTTP client |
 
 This is what lets `otlp` store spans in the queue without importing the
 `queue` package, and lets the tests replace Kev or a trace back end with a
@@ -364,7 +369,7 @@ of `export.BackendConfig`s and an `export.AbstractBackendFactory`, builds one
 `export.AbstractBackend` per entry, and gives each its own bounded queue and
 workers. `Export` only enqueues, so a slow back end never holds up scoring
 or the others; a full queue skips the trace for that back end and reports
-it. `export.OTLPBackendFactory` builds an `OTLPBackend` for any OTLP/HTTP
+it. `otlpbackend.Factory` builds an `otlpbackend.Backend` for any OTLP/HTTP
 endpoint, which is why Phoenix and Langfuse need no code of their own. A back
 end that does not speak OTLP is a new `AbstractBackend` and factory, with no
 change to the dispatcher or the pipeline. Tests pass a factory that hands
@@ -376,8 +381,8 @@ out an in-memory back end.
 the trace work queue and span store (`queue.AbstractBroker`) and the export
 queues (`export.AbstractQueueFactory`). `broker.New` picks the family from
 `queue.url`: `broker.NATS` opens one connection (`common.Conn`) and builds
-`queue.Queue` and `export.NATSQueueFactory` on it; `broker.Memory` builds
-`queue.MemoryBroker` and `export.MemoryQueueFactory`. Nothing downstream
+`queue/natsq` and `export/natsq` on it; `broker.Memory` builds `queue/memq`
+and `export/memq`. Nothing downstream
 knows which it has: the server publishes to a `pipeline.Publisher`, the OTLP
 receiver stores spans in an `otlp.Sink`, the dispatcher enqueues to an
 `export.AbstractQueue`. Both families keep the same rules (bounded queues,
@@ -392,6 +397,17 @@ Components take a `Config` or `Options` struct rather than a long argument
 list. The exporter is the one place that uses functional options
 (`export.New(tp, export.WithForwarder(...))`),
 because its extras are optional and tests construct it without them.
+
+### One package per implementation
+
+Where an interface has more than one implementation, each lives in its own
+package under the one that defines the interface: `queue/natsq` and
+`queue/memq` under `queue`, `export/natsq`, `export/memq` and
+`export/otlpbackend` under `export`. The parent holds the contract and
+the rules every implementation must keep alike (`queue.SequenceID`,
+`export.Settle`), and its conformance suite runs against every
+implementation. A parent never imports its implementations; `broker`
+picks them.
 
 ### Pipeline
 
@@ -472,11 +488,12 @@ last the queue and the broker's connection.
 
 ### Golden files for cross-language parity
 
-`trace.BuildState` must produce exactly the text the Python training code
-produced, byte for byte, including Python's `repr` of tool arguments
-(`trace/pyrepr.go`). `testdata/golden/` holds states generated by the Python
-code, and the Go tests compare against them. `make fuzz-golden` does the
-same over a few thousand randomized traces.
+`trace.BuildState` must produce the text the fine-tuning SDK trains on,
+with tool arguments as compact JSON (`trace/jsontext.go`).
+`testdata/golden/` holds states generated by the SDK's `build_state`, and
+both the Go tests and the SDK's tests compare against them, so the two sides
+cannot drift apart. `make fuzz-golden` does the same over a few thousand
+randomized traces.
 
 ## Patterns not used, and why
 
@@ -502,10 +519,10 @@ same over a few thousand randomized traces.
 | In-memory broker | besides its workers and assemblers, one scanner for quiet traces and one timer per pending redelivery |
 
 Components shared across goroutines (`scorer.Client`, `policy.Policy`,
-`export.Dispatcher`, `export.OTLPBackend`, `queue.Queue`,
-`queue.MemoryBroker`) are safe to call concurrently. There are no locks in
+`export.Dispatcher`, `otlpbackend.Backend`, `natsq.Queue`, `memq.Broker`)
+are safe to call concurrently. There are no locks in
 the pipeline itself; the in-memory export queue holds one, only to keep
-`Enqueue` and `Shutdown` from racing, and `MemoryBroker` one around its span
+`Enqueue` and `Shutdown` from racing, and `memq.Broker` one around its span
 map.
 
 ## Testing approach
@@ -518,6 +535,13 @@ map.
 - **Fakes at the interfaces.** Kev is an `httptest.Server` returning the
   canned responses in `testdata/kev/`; a trace back end is an in-memory span
   recorder or a fake `AbstractBackend`.
+- **One suite for both brokers.** `pkg/queue/conformance_test.go` runs every
+  queue scenario (delivery, depth, a full queue, redelivery, dead letters,
+  stop timeouts, span assembly) against the in-process broker and JetStream,
+  and `pkg/export/conformance_test.go` does the same for the export queues.
+  A rule one implementation breaks fails there, not in production. Writing
+  it found one such difference: the in-memory export queue did not count a
+  trace being sent toward `queue_size`, while JetStream did.
 - **Specs kept in step by tests.** `TestOpenAPICoversRoutes` fails if a route
   is missing from `openapi.yaml`, and `TestSchemaMatchesConfig` fails if
   `observer.schema.yaml` and the config structs drift apart.
@@ -532,13 +556,13 @@ map.
 | What Kev is shown | `pkg/trace/slice.go`; it must stay identical to the Python `build_state` |
 | How spans map to a trace | `internal/otlp/convert.go` |
 | The keep or drop rule | `pkg/policy/policy.go` |
-| Retry and dead-letter behaviour | `pkg/scorer/scorer.go`, `pkg/queue/worker.go` (NATS), `pkg/queue/memory.go` (memory), `pkg/export/queue.go` (exports) |
+| Retry and dead-letter behaviour | `pkg/scorer/scorer.go`, `pkg/queue/natsq/worker.go` (NATS), `pkg/queue/memq/broker.go` (memory), `pkg/export/queue.go` (exports) |
 | Where the queues live, or a new broker | `pkg/broker/broker.go`: a new `AbstractFactory` with a `queue.AbstractBroker` and an `export.AbstractQueueFactory` |
 | The pipeline's steps or its interfaces | `pkg/pipeline/engine.go`, `pkg/pipeline/interfaces.go` |
 | How a trace finds its model | `pkg/pipeline/model.go` (routing), `internal/otlp/convert.go` (`Assembler.agentOf`) |
 | A model server with another protocol | `pkg/scorer/factory.go`: a new `AbstractScorerFactory` |
 | A metric | `pkg/metrics/metrics.go`, and the hook interface in the package that records it |
 | Where errors are written | `observe.AbstractSinkFactory` in `pkg/observe/sink.go`, and `observability.error_sinks` in the config |
-| What the trace back ends receive | `pkg/export/otlp_backend.go` (attributes), `internal/otlp/convert.go` (`Annotate`, for forwarded spans) |
+| What the trace back ends receive | `pkg/export/otlpbackend/backend.go` (attributes), `internal/otlp/convert.go` (`Annotate`, for forwarded spans) |
 | A new kind of trace back end | `pkg/export/backend.go`: a new `AbstractBackend` and `AbstractBackendFactory` |
 | Start-up and shutdown order | `cmd/observer/main.go` |

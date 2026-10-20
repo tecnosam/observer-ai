@@ -14,13 +14,27 @@ type Model struct {
 	Name        ModelName
 	Scorer      Scorer
 	Temperature Temperature
+	// Agent is the label metrics and logs give the traces this model
+	// scored; Route sets it.
+	Agent AgentLabel
 }
+
+// AgentLabel is a trace's agent as metrics and logs show it: the agent's
+// name when it has a model of its own, else AgentOther or AgentNone. Unlike
+// the name a trace carries, which any client can set to anything, its
+// values are bounded by the config, so it is safe as a metric attribute.
+type AgentLabel string
+
+const (
+	AgentNone  AgentLabel = "none"  // the trace named no agent
+	AgentOther AgentLabel = "other" // it named one with no model of its own
+)
 
 // ModelRouter picks the model that scores a trace. The engine uses one
 // model per agent, each fine-tuned on that agent's traces.
 type ModelRouter interface {
-	// Route returns the model for agent; an unknown or empty agent gets
-	// the default model.
+	// Route returns the model for agent, labelled; an unknown or empty
+	// agent gets the default model.
 	Route(agent trace.AgentName) Model
 	// Ready reports whether the default model can be reached. An agent's
 	// model being down affects only that agent's traces, so it does not
@@ -45,9 +59,15 @@ func SingleModel(m Model) *AgentRouter { return NewAgentRouter(m, nil) }
 
 func (r *AgentRouter) Route(agent trace.AgentName) Model {
 	if m, ok := r.byAgent[agent]; ok {
+		m.Agent = AgentLabel(agent)
 		return m
 	}
-	return r.fallback
+	m := r.fallback
+	m.Agent = AgentOther
+	if agent == "" {
+		m.Agent = AgentNone
+	}
+	return m
 }
 
 // Ready probes the default model only.

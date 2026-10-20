@@ -25,6 +25,7 @@ import (
 	"github.com/observer-ai/engine/internal/otlp"
 	"github.com/observer-ai/engine/pkg/pipeline"
 	"github.com/observer-ai/engine/pkg/queue"
+	"github.com/observer-ai/engine/pkg/queue/natsq"
 	"github.com/observer-ai/engine/pkg/queue/queuetest"
 	"github.com/observer-ai/engine/pkg/trace"
 )
@@ -75,7 +76,7 @@ func newOTLPPipeline(t *testing.T, kev *fakeKev) *otlpPipeline {
 		PollWait: 100 * time.Millisecond,
 		Logger:   quiet,
 	}
-	q, err := queue.Connect(context.Background(), cfg)
+	q, err := natsq.Connect(context.Background(), cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -316,7 +317,7 @@ func TestOTLPPipelineDeadLetterKeepsSpans(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := dead.Header.Get(queue.HeaderTraceID); got != hex.EncodeToString(wrongID) {
+	if got := dead.Header.Get(natsq.HeaderTraceID); got != hex.EncodeToString(wrongID) {
 		t.Errorf("dead letter trace ID = %q", got)
 	}
 	var replay trace.Trace

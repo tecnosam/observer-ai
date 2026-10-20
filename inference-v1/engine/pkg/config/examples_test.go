@@ -22,6 +22,7 @@ func TestExampleConfigsLoad(t *testing.T) {
 	t.Setenv(DefaultJevAPIKeyEnv, "test-key")
 	t.Setenv("LANGFUSE_OTLP_HEADERS", "Authorization=Basic%20dGVzdDp0ZXN0")
 	t.Setenv("PHOENIX_OTLP_HEADERS", "api_key=test")
+	t.Setenv("NATS_TOKEN", "test")
 	for _, path := range paths {
 		t.Run(filepath.Base(path), func(t *testing.T) {
 			if _, err := Load(path); err != nil {

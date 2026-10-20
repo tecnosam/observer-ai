@@ -127,7 +127,7 @@ func TestAssembleADKShapedTrace(t *testing.T) {
 	}
 
 	want := "USER QUESTION:\nWhich river flows through the capital of France?\n\n" +
-		"TOOL CALLS:\n1. search({'query': 'capital of France river'}) -> ok\n2. lookup({'title': 'Paris'}) -> ok\n\n" +
+		"TOOL CALLS:\n1. search({\"query\":\"capital of France river\"}) -> ok\n2. lookup({\"title\":\"Paris\"}) -> ok\n\n" +
 		"EVIDENCE:\n[1] [Paris] Paris is the capital of France.\n[2] [Seine] The Seine flows through Paris.\n\n" +
 		"FINAL ANSWER:\nSeine"
 	if state := string(trace.BuildState(got)); state != want {
@@ -234,11 +234,11 @@ func TestAssembleToolCallDetails(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := "USER QUESTION:\nq\n\nTOOL CALLS:\n" +
-		"1. search({'query': 'x'}) -> error\n" +
-		"2. lookup({'title': 'T'}) -> not_found\n" +
-		"3. calculator('2 + 2') -> ok\n" +
-		"4. fetch({'url': 'u'}) -> ok\n" +
-		"5. now('') -> ok\n\n" +
+		"1. search({\"query\":\"x\"}) -> error\n" +
+		"2. lookup({\"title\":\"T\"}) -> not_found\n" +
+		"3. calculator(\"2 + 2\") -> ok\n" +
+		"4. fetch({\"url\":\"u\"}) -> ok\n" +
+		"5. now() -> ok\n\n" +
 		"EVIDENCE:\n(none)\n\nFINAL ANSWER:\na"
 	if state := string(trace.BuildState(got)); state != want {
 		t.Errorf("state =\n%s\nwant\n%s", state, want)

@@ -45,7 +45,7 @@ type Metrics interface {
 
 // ScoreResult is one call to a model as Metrics sees it.
 type ScoreResult struct {
-	Agent    trace.AgentName
+	Agent    AgentLabel
 	Model    ModelName
 	Duration time.Duration // the whole call, retries included
 	Err      error         // nil on success

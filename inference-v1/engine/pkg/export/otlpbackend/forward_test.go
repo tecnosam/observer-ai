@@ -1,4 +1,4 @@
-package export
+package otlpbackend
 
 import (
 	"context"
@@ -10,6 +10,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/observer-ai/engine/pkg/export"
 
 	coltracepb "go.opentelemetry.io/proto/otlp/collector/trace/v1"
 	commonpb "go.opentelemetry.io/proto/otlp/common/v1"
@@ -196,7 +198,7 @@ func TestBackendReceivesForwardedSpans(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	exp, err := NewOTLPBackend(context.Background(), BackendConfig{Name: "phoenix", Endpoint: srv.URL + "/v1/traces"})
+	exp, err := Open(context.Background(), export.BackendConfig{Name: "phoenix", Endpoint: srv.URL + "/v1/traces"})
 	if err != nil {
 		t.Fatal(err)
 	}

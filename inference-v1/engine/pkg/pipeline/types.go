@@ -60,7 +60,9 @@ type Decision struct {
 
 // Record is one decided trace, as exporters receive it.
 type Record struct {
-	Trace    trace.Trace
+	Trace trace.Trace
+	// Agent is the trace's agent as metrics and logs show it.
+	Agent    AgentLabel
 	Decision Decision
 	Model    ModelName
 	Latency  time.Duration // the scoring latency

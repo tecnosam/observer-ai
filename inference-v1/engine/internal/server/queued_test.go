@@ -16,6 +16,7 @@ import (
 	"github.com/observer-ai/engine/pkg/fault"
 	"github.com/observer-ai/engine/pkg/pipeline"
 	"github.com/observer-ai/engine/pkg/queue"
+	"github.com/observer-ai/engine/pkg/queue/natsq"
 	"github.com/observer-ai/engine/pkg/queue/queuetest"
 	"github.com/observer-ai/engine/pkg/scorer"
 	"github.com/observer-ai/engine/pkg/trace"
@@ -127,7 +128,7 @@ func newSystem(t *testing.T, kev *fakeKev, maxDeliver int) *system {
 		PollWait:          100 * time.Millisecond,
 		Logger:            quiet,
 	}
-	q, err := queue.Connect(context.Background(), cfg)
+	q, err := natsq.Connect(context.Background(), cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -258,13 +259,13 @@ func TestQueuedPipelineDeadLettersWhenKevStaysDown(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := dead.Header.Get(queue.HeaderTraceID); got != "wrong-river-001" {
+	if got := dead.Header.Get(natsq.HeaderTraceID); got != "wrong-river-001" {
 		t.Errorf("dead letter trace ID = %q", got)
 	}
-	if got := dead.Header.Get(queue.HeaderDeadReason); got != queue.ReasonSystemError {
+	if got := dead.Header.Get(natsq.HeaderDeadReason); got != queue.ReasonSystemError {
 		t.Errorf("dead letter reason = %q", got)
 	}
-	if got := dead.Header.Get(queue.HeaderDeadError); !strings.Contains(got, "HTTP 503") || !strings.Contains(got, "model not available") {
+	if got := dead.Header.Get(natsq.HeaderDeadError); !strings.Contains(got, "HTTP 503") || !strings.Contains(got, "model not available") {
 		t.Errorf("dead letter error = %q, want Kev's 503", got)
 	}
 	// Replaying the dead letter must rebuild the same slice.
@@ -343,7 +344,7 @@ func TestQueuePayloadIsTraceJSON(t *testing.T) {
 		AckWait: 30 * time.Second, MaxDeliver: 3,
 		DLQStream: "TRACES_DLQ", DLQSubject: "traces.dlq", DLQMaxAge: time.Hour, Logger: quiet,
 	}
-	q, err := queue.Connect(context.Background(), cfg)
+	q, err := natsq.Connect(context.Background(), cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -374,7 +375,7 @@ func TestQueuePayloadIsTraceJSON(t *testing.T) {
 	if payload["trace_id"] != "7f3a91c2e8" || payload["final_answer"] != "The Seine" {
 		t.Errorf("payload = %s", msg.Data)
 	}
-	if got := msg.Header.Get(queue.HeaderTraceID); got != "7f3a91c2e8" {
-		t.Errorf("header %s = %q", queue.HeaderTraceID, got)
+	if got := msg.Header.Get(natsq.HeaderTraceID); got != "7f3a91c2e8" {
+		t.Errorf("header %s = %q", natsq.HeaderTraceID, got)
 	}
 }

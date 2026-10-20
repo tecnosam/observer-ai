@@ -151,3 +151,40 @@ func TestEngineFallbackNamesTheAgentsModel(t *testing.T) {
 		t.Errorf("score metrics = %+v", m.scores)
 	}
 }
+
+func TestAgentRouterLabels(t *testing.T) {
+	r := NewAgentRouter(Model{Name: "default"}, map[trace.AgentName]Model{"support-bot": {Name: "support"}})
+	for agent, want := range map[trace.AgentName]AgentLabel{"support-bot": "support-bot", "made-up-123": AgentOther, "": AgentNone} {
+		if got := r.Route(agent).Agent; got != want {
+			t.Errorf("Route(%q).Agent = %q, want %q", agent, got, want)
+		}
+	}
+}
+
+// However many agent names clients invent, metrics and logs see only the
+// configured agents, "other" and "none".
+func TestEngineBoundsTheAgentLabel(t *testing.T) {
+	m := &recordingMetrics{}
+	e := NewEngine(Deps{
+		Models: NewAgentRouter(Model{Name: "default", Scorer: &stubScorer{raw: 0.1}}, nil),
+		Policy: &threshold{}, Exporter: nowhere{}, Metrics: m, Logger: quiet,
+	})
+	for _, agent := range []trace.AgentName{"a1", "a2", "a3", ""} {
+		e.Process(context.Background(), sampleTrace(agent))
+	}
+	labels := map[AgentLabel]int{}
+	for _, s := range m.scores {
+		labels[s.Agent]++
+	}
+	for _, r := range m.records {
+		if r.Agent != AgentOther && r.Agent != AgentNone {
+			t.Errorf("record label %q", r.Agent)
+		}
+	}
+	if len(labels) != 2 || labels[AgentOther] != 3 || labels[AgentNone] != 1 {
+		t.Errorf("score labels = %v, want 3 other and 1 none", labels)
+	}
+	if m.records[0].Trace.Agent != "a1" {
+		t.Error("the trace lost its own agent name")
+	}
+}

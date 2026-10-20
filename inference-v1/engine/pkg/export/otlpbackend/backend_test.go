@@ -1,4 +1,4 @@
-package export
+package otlpbackend
 
 import (
 	"context"
@@ -11,6 +11,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/observer-ai/engine/pkg/export"
+
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
@@ -20,7 +22,7 @@ import (
 	"github.com/observer-ai/engine/pkg/trace"
 )
 
-func newRecorded(t *testing.T) (*OTLPBackend, *tracetest.SpanRecorder) {
+func newRecorded(t *testing.T) (*Backend, *tracetest.SpanRecorder) {
 	t.Helper()
 	rec := tracetest.NewSpanRecorder()
 	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(rec))
@@ -202,9 +204,9 @@ func TestBackendDownIsReportedNotFatal(t *testing.T) {
 	t.Cleanup(func() { otel.SetErrorHandler(prev) })
 	ReportErrors(reported)
 
-	exp, err := NewOTLPBackend(context.Background(), BackendConfig{Name: "down", Endpoint: url})
+	exp, err := Open(context.Background(), export.BackendConfig{Name: "down", Endpoint: url})
 	if err != nil {
-		t.Fatalf("NewOTLPBackend with the back end down: %v", err)
+		t.Fatalf("NewBackend with the back end down: %v", err)
 	}
 	keep := pipeline.Decision{Keep: true, Scored: true, PKeep: 0.9, PKeepRaw: 0.9, Reason: pipeline.ReasonModel, Severity: pipeline.SeverityHigh}
 	if err := exp.Send(context.Background(), pipeline.Record{Trace: sampleTrace(), Decision: keep, Model: "kev-latest"}); err != nil {
@@ -236,7 +238,7 @@ func TestBackendReceivesOTLP(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	exp, err := NewOTLPBackend(context.Background(), BackendConfig{
+	exp, err := Open(context.Background(), export.BackendConfig{
 		Name:               "phoenix",
 		Endpoint:           srv.URL + "/v1/traces",
 		Headers:            map[string]string{"Authorization": "Basic abc"},

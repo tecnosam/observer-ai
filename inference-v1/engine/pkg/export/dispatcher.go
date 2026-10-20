@@ -16,8 +16,8 @@ import (
 type DispatcherConfig struct {
 	Backends []BackendConfig
 	Factory  AbstractBackendFactory
-	// Queues builds each back end's queue: in process, or on NATS
-	// JetStream. Defaults to MemoryQueueFactory.
+	// Queues builds each back end's queue: memq in process, or natsq on
+	// NATS JetStream. Required.
 	Queues   AbstractQueueFactory
 	Reporter observe.Reporter // defaults to observe.Discard
 	Metrics  SendMetrics      // defaults to recording nothing
@@ -52,7 +52,7 @@ func NewDispatcher(ctx context.Context, cfg DispatcherConfig) (*Dispatcher, erro
 		cfg.Reporter = observe.Discard
 	}
 	if cfg.Queues == nil {
-		cfg.Queues = MemoryQueueFactory{}
+		return nil, errors.New("export: DispatcherConfig.Queues is required")
 	}
 	if cfg.Metrics == nil {
 		cfg.Metrics = metrics.Noop{}
@@ -98,6 +98,15 @@ func timed(exporter string, send SendFunc, m SendMetrics) SendFunc {
 		m.SendFinished(ctx, metrics.Send{Exporter: exporter, Duration: time.Since(start), Err: err})
 		return err
 	}
+}
+
+// Depths reports each back end's queue, for the queue-depth metric.
+func (d *Dispatcher) Depths() []metrics.QueueDepth {
+	out := make([]metrics.QueueDepth, len(d.routes))
+	for i, r := range d.routes {
+		out[i] = metrics.QueueDepth{Queue: "export:" + r.name, Depth: r.queue.Depth}
+	}
+	return out
 }
 
 // Export queues a kept trace for every back end. It reports whether at

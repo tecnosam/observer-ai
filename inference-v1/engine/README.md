@@ -176,6 +176,9 @@ file is loaded.
 | `queue.dlq_max_age` | `168h` | How long dead letters (traces and exports) are kept |
 | `queue.export_stream`, `queue.export_subject` | `OBSERVER_EXPORTS`, `observer.exports` | Each exporter's queue on NATS: stream `OBSERVER_EXPORTS_<NAME>`, subject `observer.exports.<name>` |
 | `queue.export_dlq_stream`, `queue.export_dlq_subject` | `OBSERVER_EXPORTS_DLQ`, `observer.exports_dlq` | Where exports given up on go, on NATS |
+| `queue.replicas` | `1` | Copies of each stream a NATS cluster keeps; 3 on a three-server cluster |
+| `queue.auth` | none | NATS authentication: one of `credentials_file`, `nkey_seed_file`, `user` with `password_env`, or `token_env` |
+| `queue.tls` | none | NATS TLS: `ca_file` to verify the server, `cert_file` and `key_file` for mutual TLS |
 | `scorer.kind` | `kev` | `kev` for a Kev server, `jev` for TypeSafe's hosted Jev |
 | `scorer.api_key_env` | `JEV_API_KEY` for `jev`, unset for `kev` | Environment variable holding the scorer's API key, sent as a bearer token. Start-up fails if it names an unset variable |
 | `scorer.endpoint` | `http://localhost:8010/v1/systemone` | Kev endpoint |
@@ -186,7 +189,7 @@ file is loaded.
 | `scorer.max_retries` | `3` | In-process retries after the first attempt |
 | `scorer.backoff` | `[500ms, 2s, 5s]` | Base delay before each retry; the last value repeats |
 | `agents.attributes` | `[agent.name, service.name]` | Span attributes naming a trace's agent, tried on the root span then its resource. See [One model per agent](#one-model-per-agent) |
-| `agents.models` | none | Agent name to its model: any `scorer` keys, the rest inherited from `scorer` |
+| `agents.models` | none | Agent name to its own model: `scorer` keys, with `endpoint`, `model` and `manifest` required; nothing comes from `scorer` |
 | `policy.keep_threshold` | `0.5` | Keep when calibrated `p_keep` reaches this |
 | `policy.random_floor` | `0.02` | Share of below-threshold traces kept at random |
 | `alert.severity_high` | `0.8` | `p_keep` at which a kept trace is `high` severity |
@@ -249,7 +252,7 @@ The manifest is the JSON the fine-tuning notebook writes:
 
 Each agent can have its own model, fine-tuned on that agent's traces. The
 `scorer` section is the default model; `agents.models` adds one per agent,
-stating only what differs:
+each complete on its own:
 
 ```yaml
 scorer:                                # the default: any agent not listed below
@@ -260,6 +263,7 @@ agents:
   attributes: [agent.name, service.name]
   models:
     support-bot:
+      endpoint: http://kev:8010/v1/systemone
       model: kev-support                # same Kev server, another model
       manifest: runs/support-bot/manifest.json
     research-agent:
@@ -275,11 +279,13 @@ agents:
 - **Which model.** The agent's entry under `agents.models`, else the
   `scorer` section. A trace that names no agent, or an agent not listed, is
   scored by the default.
-- **Inheritance.** Each entry takes any `scorer` key (`kind`, `endpoint`,
-  `model`, `api_key_env`, `manifest`, `decision_question`, `timeout`,
-  `max_retries`, `backoff`) and inherits the others from `scorer` as written
-  in the file. `OBSERVER_SCORER_ENDPOINT` and `OBSERVER_MANIFEST` change only
-  the `scorer` section.
+- **No inheritance.** Each entry takes the `scorer` keys (`kind`,
+  `endpoint`, `model`, `api_key_env`, `manifest`, `decision_question`,
+  `timeout`, `max_retries`, `backoff`) and is complete on its own:
+  `endpoint`, `model` and `manifest` are required, and nothing is taken from
+  the `scorer` section. Keys it leaves out get the engine's built-in
+  defaults, the same ones `scorer` gets. `OBSERVER_SCORER_ENDPOINT` and
+  `OBSERVER_MANIFEST` change only the `scorer` section.
 - **Calibration.** Each model is calibrated with its own manifest's
   temperature.
 - **Everywhere.** The decision log, the `/v1/traces:score` response, the
@@ -463,7 +469,7 @@ In memory it survives only as long as the process.
 - `question` and `final_answer` are required. `final_answer` may be an empty
   string for a run that ended without an answer.
 - `trace_id` is optional; the engine generates 32 hex characters if it is missing.
-- `agent` is optional and picks the model (see [One model per agent](#one-model-per-agent)).
+- `agent` is optional and picks the model (see [One model per agent](#one-model-per-agent)); at most 128 bytes.
 - `args` may be any JSON value. `status` defaults to `ok`.
 - This is the engine's own JSON API on port 8080. The OTLP receiver also
   serves a `/v1/traces` path, on port 4318, with a different body.
@@ -597,6 +603,32 @@ The rest of this section describes NATS.
   the originals. `nats.conf` raises the NATS message limit to 8 MB for this.
   A trace still too big is queued without its spans and, if kept, exported
   as rebuilt spans instead.
+
+### NATS in production
+
+The engine is a NATS client; it does not run or configure the server
+(`nats.conf` and the compose service are only for trying it). Against a
+secured or clustered NATS, set:
+
+```yaml
+queue:
+  url: tls://nats.internal:4222
+  replicas: 3                                  # every stream the engine creates, kept on 3 servers
+  auth:
+    credentials_file: /var/run/secrets/nats/observer.creds   # or nkey_seed_file, user + password_env, token_env
+  tls:
+    ca_file: /var/run/secrets/nats/ca.pem      # a private CA
+    # cert_file / key_file                     # mutual TLS
+```
+
+`replicas` is applied to every stream the engine creates (traces, dead
+letters, spans, pending markers, each exporter's queue); more than the
+cluster has servers fails at start-up. An existing stream is updated to the
+new count when the server allows it. Passwords and tokens come from
+environment variables (`password_env`, `token_env`); credential, seed and
+certificate files from paths, relative to the config file, typically mounted
+from a Kubernetes secret. The account needs JetStream access to the streams
+under `queue.*` and `otlp.*` and the right to create durable consumers.
 
 ### Streams
 
@@ -793,6 +825,14 @@ observability:
 | `observer.export.duration` | histogram (s) | `observer.exporter` | Sends to a trace back end |
 | `observer.decisions` | counter | `observer.agent`, `observer.model`, `observer.decision`, `observer.reason` | Decided traces |
 | `observer.errors` | counter | `observer.component`, `error.type` | Errors reported to the error sinks |
+| `observer.queue.depth` | gauge | `observer.queue` (`traces`, `export:<exporter>`) | Traces waiting: to be scored, or to be sent to a back end. On NATS every pod reports the shared count; in memory, its own |
+
+`observer.agent` is bounded: an agent with its own model under
+`agents.models` appears by name, a trace naming any other agent as `other`,
+and one naming none as `none`. Agent names come from the traces, so any
+client could otherwise create unlimited metric series. The decision log
+uses the same label; the trace's own agent name stays on its exported spans
+(`eval.agent`) and in its `/v1/traces:score` response, cut to 128 bytes.
 
 A failed request or call also carries `error.type`: the status code (5xx for
 HTTP, any non-OK gRPC code), or the error kind (`unavailable`, `timeout`,
@@ -803,23 +843,50 @@ histogram. The resource has `service.name=observer-engine` plus
 `OTEL_EXPORTER_OTLP_HEADERS` is not read. The last metrics are sent on
 shutdown.
 
+## Deploying
+
+Run the engine inside your private network (a VPC), next to the agents that
+send it traces, and control access there: security groups or firewall rules,
+a Kubernetes NetworkPolicy, and IAM roles or service accounts for whatever
+the engine itself calls. The engine does not authenticate clients on its JSON
+API or OTLP receivers, and serves them without TLS; put a load balancer or
+service mesh in front of it if traffic must be encrypted or authenticated
+in transit.
+
+What leaves the network is what you configure: exporters (with their own
+headers), the metrics endpoint, and a hosted scorer such as Jev, which
+receives every scored trace's text.
+
+On Kubernetes, install with the Helm chart in
+[`deploy/helm/observer`](deploy/helm/observer/README.md): the engine, an
+optional NATS JetStream cluster, and an optional trace-routing gateway for
+several replicas with queues in memory. Kustomize can install the same chart.
+
+Before a rollout, `observer -check -config observer.yaml` loads and
+validates a config and its manifests, then exits: 0 if valid, 1 with the
+problems if not.
+
 ## The slice and its golden files
 
-The model was trained on the output of the Python `build_state`, so
-`BuildState` must reproduce it byte for byte. That includes Python's `repr()`
-for tool arguments (`{'query': 'x'}`, `True`, `None`, `1e+16`, `'\xa0'`) and
-evidence truncated to 1500 Unicode code points rather than bytes.
+The model is trained on the output of the fine-tuning SDK's `build_state`
+(`finetune/observer_finetune/observer_finetune/state.py`), so `BuildState`
+must produce the same text. Tool arguments, and any status that is not a
+string, are written as compact JSON with every character as itself
+(`search({"query":"capital of France","limit":3}) -> ok`), and evidence is
+cut to 1500 Unicode code points rather than bytes.
 
 - `testdata/traces/*.json`: input fixtures
 - `testdata/golden/*.txt`: what Python produces for each
-- `testdata/gen_golden.py`: holds the Python `build_state` and writes the golden files
+- `testdata/gen_golden.py`: holds a copy of the SDK's `build_state` and writes the golden files
+
+The SDK's own tests check its `build_state` against the same golden files.
 
 `TestBuildStateGolden` fails if Go and Python disagree on any fixture. A
 second test sends every fixture through the queue and checks the worker
 builds the same slice.
 
 **To regenerate the golden files** after adding a fixture or changing the
-training code's `build_state` (update the copy in `gen_golden.py` first):
+SDK's `build_state` (update the copy in `gen_golden.py` first):
 
 ```sh
 make golden   # python3 testdata/gen_golden.py
@@ -830,14 +897,14 @@ For a broader check, `make fuzz-golden` compares Go and Python over about
 4,000 randomized traces, including every Unicode code point, random floats and
 random nested arguments. It needs Python and is not part of `make test`.
 
-Known differences from Python, all at the edges:
+Known differences from Python, all at the edges, and deliberately not
+chased:
 
+- Numbers are written as they arrive. Python rewrites unusual spellings
+  (`1E5` as `100000.0`, `12e3` as `12000.0`); what agents export is already
+  in Python's form.
 - Lone UTF-16 surrogates (`"\ud800"`) become U+FFFD in Go; Python keeps them.
 - `NaN` and `Infinity` literals are rejected as invalid JSON; Python accepts them.
-- Arguments nested more than 200 levels deep are rejected with a 400.
-- Which characters `repr()` escapes depends on the Unicode version. Go 1.26 and
-  Python 3.12 agree on every code point; re-run `make fuzz-golden` after
-  changing either.
 
 ## Known limitations
 
@@ -875,15 +942,17 @@ These are open problems in the current version, not design choices to rely on.
   separate, partial trace, which is normally unscorable and discarded; the
   first decision is not revisited. An agent run that pauses for longer than
   the idle timeout between spans is split this way.
-- **The OTLP receivers have no authentication or TLS.** Anyone who can reach
-  4317 or 4318 can submit spans.
+- **The API and the OTLP receivers have no authentication or TLS.** Anyone
+  who can reach 8080, 4317 or 4318 can submit traces. This is by design; see
+  [Deploying](#deploying).
 - **A trace can be scored and exported twice.** Delivery is at least once and
   nothing deduplicates: a worker that dies between exporting and acknowledging
   leaves a duplicate in the back ends. The same happens if a client retries a
   `POST /v1/traces` that had in fact succeeded.
-- **NATS has no authentication.** Anyone who can reach port 4222 can read,
-  publish or delete traces. The compose file binds it to loopback, which is
-  enough locally and nowhere else.
+- **The compose file's NATS has no authentication.** It is there to try the
+  engine, bound to loopback. In production, point `queue.url` at a NATS you
+  run or buy, with `queue.auth`, `queue.tls` and `queue.replicas` (see
+  [NATS in production](#nats-in-production)).
 
 ## Shutdown
 
@@ -908,7 +977,7 @@ itself, not a fake.
 cmd/observer/      flags, config load, wiring, graceful shutdown
 pkg/               the reusable engine, importable by other Go programs:
   pipeline/        the core: domain types, interfaces, model routing, calibration, the Engine
-  trace/           trace types (with the agent), BuildState, Python repr
+  trace/           trace types (with the agent), BuildState, its compact JSON
   fault/           the error type: kind, component, operation, trace
   observe/         the error pipeline and its sinks (stdout, file)
   metrics/         the engine's OpenTelemetry metrics
@@ -916,8 +985,11 @@ pkg/               the reusable engine, importable by other Go programs:
   scorer/          Kev client, its factory, the per-agent model builder
   policy/          keep/drop decision, random floor, severity
   broker/          where the queues live: NATS or in memory
-  queue/           the trace queue and span store: JetStream or in memory
-  export/          exporters: the async dispatcher, its queues, the OTLP/HTTP back end
+  queue/           the trace queue and span store: the contract and shared rules
+    natsq/ memq/   on JetStream, in memory
+  export/          exporters: the async dispatcher, the back-end and queue contracts
+    otlpbackend/   the OTLP/HTTP back end
+    natsq/ memq/   export queues on JetStream, in memory
 internal/          this binary's own pieces:
   server/          HTTP handlers and the OpenAPI spec
   otlp/            OTLP gRPC and HTTP receivers, span-to-trace mapping
@@ -926,6 +998,7 @@ testdata/          trace fixtures, golden slices, fake Kev responses
 scripts/           send_samples.py: post dataset traces to a running engine
 Dockerfile         multi-stage build of the engine image
 docker-compose.yml the engine, NATS JetStream and Phoenix
+deploy/helm/       the Helm chart
 observer.yaml      example config with every default
 observer.schema.yaml  JSON Schema for observer.yaml: every key, its type, default and limits
 architecture.md    stack, package structure, design patterns, how the config is loaded
@@ -944,5 +1017,6 @@ nats.conf          NATS server settings (JetStream, 8 MB message limit)
 | `make logs` | Follow the engine container's log |
 | `make dlq` | Show the dead-letter stream's state |
 | `make lint` | gofmt check and `go vet` |
+| `make chart-lint` | Lint the Helm chart and render its main setups (needs helm) |
 | `make golden` | Regenerate golden slice files |
 | `make fuzz-golden` | Randomized Go-versus-Python slice comparison |

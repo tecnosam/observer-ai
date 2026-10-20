@@ -16,6 +16,9 @@ import (
 // scores the trace; empty means the default model.
 type AgentName string
 
+// MaxAgentLength bounds an agent name, which clients set freely.
+const MaxAgentLength = 128
+
 // Trace is one agent run submitted for a keep/drop decision.
 type Trace struct {
 	TraceID   string     `json:"trace_id,omitempty"`
@@ -34,9 +37,8 @@ type Trace struct {
 	OTLP []byte `json:"otlp_spans,omitempty"`
 }
 
-// ToolCall is one tool invocation. Args and Status stay as raw JSON because
-// the slice renders them the way Python would, which depends on whether the
-// key was present and on its JSON type.
+// ToolCall is one tool invocation. Args and Status stay as raw JSON: the
+// slice writes them as JSON, and needs to know whether each was present.
 type ToolCall struct {
 	Name   string          `json:"name"`
 	Args   json.RawMessage `json:"args,omitempty"`
@@ -44,16 +46,22 @@ type ToolCall struct {
 }
 
 // StatusText returns the status as plain text: the string itself, "ok" when
-// absent, or the Python rendering of any other JSON value.
+// absent, or compact JSON for any other value.
 func (c ToolCall) StatusText() string {
 	if len(c.Status) == 0 {
 		return "ok"
 	}
-	s, err := pyStr(c.Status)
+	if trimmed := bytes.TrimSpace(c.Status); len(trimmed) > 0 && trimmed[0] == '"' {
+		var s string
+		if err := json.Unmarshal(trimmed, &s); err == nil {
+			return s
+		}
+	}
+	text, err := compactJSON(c.Status)
 	if err != nil {
 		return string(c.Status)
 	}
-	return s
+	return text
 }
 
 // Decode parses and validates a trace from JSON. final_answer must be
@@ -91,14 +99,12 @@ func (t Trace) Validate() error {
 	if t.Question == "" {
 		return errors.New("question is required")
 	}
+	if len(t.Agent) > MaxAgentLength {
+		return fmt.Errorf("agent is longer than %d bytes", MaxAgentLength)
+	}
 	for i, c := range t.ToolCalls {
 		if c.Name == "" {
 			return fmt.Errorf("tool_calls[%d].name is required", i)
-		}
-		if len(c.Args) > 0 {
-			if _, err := pyRepr(c.Args); err != nil {
-				return fmt.Errorf("tool_calls[%d].args: %w", i, err)
-			}
 		}
 	}
 	return nil

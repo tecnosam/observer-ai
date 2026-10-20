@@ -9,6 +9,7 @@
 # The hosted Phoenix key comes from the variable headers_env names, in the
 # OpenTelemetry headers format:
 #   export PHOENIX_OTLP_HEADERS="api_key=..."
+# and the NATS token from NATS_TOKEN.
 
 server:
   workers: 16                # more concurrent calls to a bigger Kev server
@@ -17,6 +18,9 @@ server:
 queue:
   url: tls://nats.internal.example.com:4222
   connect_timeout: 60s
+  replicas: 3                # a three-server NATS cluster
+  auth:
+    token_env: NATS_TOKEN    # or credentials_file: observer.creds
 
 scorer:
   kind: kev

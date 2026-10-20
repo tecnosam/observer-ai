@@ -8,12 +8,13 @@ import (
 	"time"
 
 	"github.com/observer-ai/engine/pkg/queue"
+	"github.com/observer-ai/engine/pkg/queue/memq"
 )
 
 // memoryBroker is the in-process broker main uses when queue.url is empty.
-func memoryBroker(t *testing.T) *queue.MemoryBroker {
+func memoryBroker(t *testing.T) *memq.Broker {
 	t.Helper()
-	b := queue.NewMemory(queue.Config{
+	b := memq.New(queue.Config{
 		MaxMessages:       100,
 		MaxDeliver:        2,
 		RedeliveryBackoff: []time.Duration{20 * time.Millisecond},

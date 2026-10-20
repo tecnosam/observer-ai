@@ -12,6 +12,7 @@
 //	observer.export.duration      histogram  sends to a trace back end
 //	observer.decisions            counter    decided traces
 //	observer.errors               counter    errors reported to the error pipeline
+//	observer.queue.depth          gauge      traces waiting, per queue
 //
 // A failed call carries error.type (its fault kind, or the status code), so
 // an error rate is the count with error.type over the total count.
@@ -58,9 +59,16 @@ type Send struct {
 	Err      error // nil on success
 }
 
+// QueueDepth is a queue the depth gauge reads when metrics are collected.
+type QueueDepth struct {
+	Queue string // "traces", or "export:<exporter>"
+	Depth func(ctx context.Context) (int64, error)
+}
+
 // Recorder records on one meter. Build it with New, or Start to also send
 // what it records.
 type Recorder struct {
+	meter          metric.Meter
 	httpDuration   metric.Float64Histogram
 	rpcDuration    metric.Float64Histogram
 	scoreDuration  metric.Float64Histogram
@@ -73,6 +81,7 @@ type Recorder struct {
 func New(meter metric.Meter) (*Recorder, error) {
 	b := builder{meter: meter}
 	r := &Recorder{
+		meter:          meter,
 		httpDuration:   b.histogram("http.server.request.duration", "Duration of HTTP requests the engine answered."),
 		rpcDuration:    b.histogram("rpc.server.call.duration", "Duration of gRPC calls the engine answered."),
 		scoreDuration:  b.histogram("observer.scorer.duration", "Duration of calls to a decision model, retries included."),
@@ -81,6 +90,26 @@ func New(meter metric.Meter) (*Recorder, error) {
 		errors:         b.counter("observer.errors", "{error}", "Errors reported to the error pipeline."),
 	}
 	return r, b.err
+}
+
+// ObserveQueues reports each queue's depth as observer.queue.depth, read
+// every time metrics are collected. A queue that cannot be read is skipped
+// for that collection.
+func (r *Recorder) ObserveQueues(queues ...QueueDepth) error {
+	gauge, err := r.meter.Int64ObservableGauge("observer.queue.depth",
+		metric.WithUnit("{trace}"), metric.WithDescription("Traces waiting in a queue: to be scored, or to be sent to a back end."))
+	if err != nil {
+		return err
+	}
+	_, err = r.meter.RegisterCallback(func(ctx context.Context, o metric.Observer) error {
+		for _, q := range queues {
+			if n, err := q.Depth(ctx); err == nil {
+				o.ObserveInt64(gauge, n, metric.WithAttributes(attribute.String("observer.queue", q.Queue)))
+			}
+		}
+		return nil
+	}, gauge)
+	return err
 }
 
 func (r *Recorder) RequestFinished(ctx context.Context, req Request) {
@@ -97,7 +126,7 @@ func (r *Recorder) ScoreFinished(ctx context.Context, res pipeline.ScoreResult) 
 }
 
 func (r *Recorder) TraceDecided(ctx context.Context, rec pipeline.Record) {
-	attrs := append(modelAttrs(string(rec.Trace.Agent), string(rec.Model)),
+	attrs := append(modelAttrs(string(rec.Agent), string(rec.Model)),
 		attribute.String("observer.decision", rec.Decision.Label()),
 		attribute.String("observer.reason", string(rec.Decision.Reason)))
 	r.decisions.Add(ctx, 1, metric.WithAttributes(attrs...))

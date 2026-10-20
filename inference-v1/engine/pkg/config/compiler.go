@@ -62,6 +62,9 @@ func (c *Compiler) compile(cfg *Config) error {
 	if err := c.resolveHeaders(cfg); err != nil {
 		return err
 	}
+	if err := c.resolveNATSSecrets(&cfg.Queue.Auth); err != nil {
+		return err
+	}
 	if err := cfg.validate(); err != nil {
 		return err
 	}
@@ -124,6 +127,26 @@ func (c *Compiler) resolveAPIKey(s *Scorer) {
 	if s.APIKeyEnv != "" && c.getenv != nil {
 		s.APIKey = c.getenv(s.APIKeyEnv)
 	}
+}
+
+// resolveNATSSecrets reads the NATS password and token from the variables
+// they are named in. A variable that is named must be set.
+func (c *Compiler) resolveNATSSecrets(a *NATSAuth) error {
+	for _, s := range []struct {
+		key, env string
+		into     *string
+	}{
+		{"queue.auth.password_env", a.PasswordEnv, &a.Password},
+		{"queue.auth.token_env", a.TokenEnv, &a.Token},
+	} {
+		if s.env == "" || c.getenv == nil {
+			continue
+		}
+		if *s.into = c.getenv(s.env); *s.into == "" {
+			return fmt.Errorf("%s: $%s is not set", s.key, s.env)
+		}
+	}
+	return nil
 }
 
 // resolveHeaders gives every exporter, and the metrics exporter, its final

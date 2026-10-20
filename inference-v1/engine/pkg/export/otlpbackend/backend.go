@@ -1,4 +1,6 @@
-package export
+// Package otlpbackend is the export.AbstractBackend for any OTLP/HTTP
+// endpoint: Phoenix, Langfuse, an OpenTelemetry Collector.
+package otlpbackend
 
 import (
 	"context"
@@ -16,6 +18,7 @@ import (
 	tracepb "go.opentelemetry.io/proto/otlp/trace/v1"
 
 	"github.com/observer-ai/engine/internal/otlp"
+	"github.com/observer-ai/engine/pkg/export"
 	"github.com/observer-ai/engine/pkg/fault"
 	"github.com/observer-ai/engine/pkg/observe"
 	"github.com/observer-ai/engine/pkg/pipeline"
@@ -42,11 +45,11 @@ type Uploader interface {
 	UploadTraces(ctx context.Context, spans []*tracepb.ResourceSpans) error
 }
 
-// OTLPBackend sends kept traces to one OTLP/HTTP endpoint. A trace that
+// Backend sends kept traces to one OTLP/HTTP endpoint. A trace that
 // arrived as OTLP spans is forwarded as those spans; any other trace is
 // rebuilt as an agent span with one child per tool call. It is safe for
 // concurrent use.
-type OTLPBackend struct {
+type Backend struct {
 	tracer   oteltrace.Tracer
 	flush    func(context.Context) error
 	shutdown func(context.Context) error
@@ -56,19 +59,19 @@ type OTLPBackend struct {
 	resource  []*commonpb.KeyValue
 }
 
-// Option configures an OTLPBackend.
-type Option func(*OTLPBackend)
+// Option configures an Backend.
+type Option func(*Backend)
 
 // WithForwarder makes the backend forward traces that carry their original
 // OTLP spans through u, with resourceAttrs set on their resources.
 func WithForwarder(u Uploader, resourceAttrs map[string]string) Option {
-	return func(b *OTLPBackend) { b.forwarder, b.resource = u, protoAttrs(resourceAttrs) }
+	return func(b *Backend) { b.forwarder, b.resource = u, protoAttrs(resourceAttrs) }
 }
 
 // New returns a backend that creates spans on tp. If tp can flush and shut
 // down (as the SDK's TracerProvider can), Flush and Shutdown use it.
-func New(tp oteltrace.TracerProvider, opts ...Option) *OTLPBackend {
-	b := &OTLPBackend{tracer: tp.Tracer(tracerName)}
+func New(tp oteltrace.TracerProvider, opts ...Option) *Backend {
+	b := &Backend{tracer: tp.Tracer(tracerName)}
 	for _, opt := range opts {
 		opt(b)
 	}
@@ -81,14 +84,14 @@ func New(tp oteltrace.TracerProvider, opts ...Option) *OTLPBackend {
 	return b
 }
 
-// NewOTLPBackend returns a backend that batches spans and sends them to
+// Open returns a backend that batches spans and sends them to
 // cfg.Endpoint, a full OTLP/HTTP traces URL such as
 // http://localhost:6006/v1/traces. It does not connect until the first
 // export, so the backend may be down at start-up.
 //
 // Headers come from cfg only: the OTEL_EXPORTER_OTLP_HEADERS variable is
 // not used, so one backend's credentials never reach another.
-func NewOTLPBackend(ctx context.Context, cfg BackendConfig) (*OTLPBackend, error) {
+func Open(ctx context.Context, cfg export.BackendConfig) (*Backend, error) {
 	exp, err := otlptracehttp.New(ctx, endpointOptions(cfg)...)
 	if err != nil {
 		return nil, fmt.Errorf("export: create OTLP exporter: %w", err)
@@ -120,7 +123,7 @@ func NewOTLPBackend(ctx context.Context, cfg BackendConfig) (*OTLPBackend, error
 
 // endpointOptions are the options both OTLP clients share. Headers are always
 // set, even when empty, which replaces any from the environment.
-func endpointOptions(cfg BackendConfig) []otlptracehttp.Option {
+func endpointOptions(cfg export.BackendConfig) []otlptracehttp.Option {
 	headers := map[string]string{}
 	for k, v := range cfg.Headers {
 		headers[k] = v
@@ -130,7 +133,7 @@ func endpointOptions(cfg BackendConfig) []otlptracehttp.Option {
 
 // resourceOf is the resource of rebuilt spans: the engine's service name plus
 // the configured attributes.
-func resourceOf(cfg BackendConfig) *resource.Resource {
+func resourceOf(cfg export.BackendConfig) *resource.Resource {
 	attrs := []attribute.KeyValue{attribute.String("service.name", serviceName)}
 	for k, v := range cfg.ResourceAttributes {
 		attrs = append(attrs, attribute.String(k, v))
@@ -159,7 +162,7 @@ func ReportErrors(reporter observe.Reporter) {
 // forwarded as those spans, synchronously, so an error means the backend did
 // not accept them. Any other trace is rebuilt as spans and handed to the
 // provider's batch processor, which delivers it in the background.
-func (b *OTLPBackend) Send(ctx context.Context, rec pipeline.Record) error {
+func (b *Backend) Send(ctx context.Context, rec pipeline.Record) error {
 	if len(rec.Trace.OTLP) > 0 && b.forwarder != nil {
 		return b.forward(ctx, rec)
 	}
@@ -168,7 +171,7 @@ func (b *OTLPBackend) Send(ctx context.Context, rec pipeline.Record) error {
 }
 
 // rebuild creates an agent span with one child per tool call.
-func (b *OTLPBackend) rebuild(ctx context.Context, rec pipeline.Record) {
+func (b *Backend) rebuild(ctx context.Context, rec pipeline.Record) {
 	t, d := rec.Trace, rec.Decision
 
 	attrs := []attribute.KeyValue{
@@ -214,7 +217,7 @@ func (b *OTLPBackend) rebuild(ctx context.Context, rec pipeline.Record) {
 // forward sends the trace's own spans on, unchanged except for the eval.*
 // attributes on the root span and the configured resource attributes. The
 // trace keeps its trace and span IDs.
-func (b *OTLPBackend) forward(ctx context.Context, rec pipeline.Record) error {
+func (b *Backend) forward(ctx context.Context, rec pipeline.Record) error {
 	d := rec.Decision
 	attrs := []*commonpb.KeyValue{
 		otlp.StringAttr("eval.agent", string(rec.Trace.Agent)),
@@ -241,7 +244,7 @@ func (b *OTLPBackend) forward(ctx context.Context, rec pipeline.Record) error {
 }
 
 // Flush sends any buffered spans now.
-func (b *OTLPBackend) Flush(ctx context.Context) error {
+func (b *Backend) Flush(ctx context.Context) error {
 	if b.flush == nil {
 		return nil
 	}
@@ -249,9 +252,18 @@ func (b *OTLPBackend) Flush(ctx context.Context) error {
 }
 
 // Shutdown flushes buffered spans and releases the backend.
-func (b *OTLPBackend) Shutdown(ctx context.Context) error {
+func (b *Backend) Shutdown(ctx context.Context) error {
 	if b.shutdown == nil {
 		return nil
 	}
 	return b.shutdown(ctx)
 }
+
+// Factory builds an OTLP/HTTP back end for each configured exporter.
+type Factory struct{}
+
+func (Factory) Build(ctx context.Context, cfg export.BackendConfig) (export.AbstractBackend, error) {
+	return Open(ctx, cfg)
+}
+
+var _ export.AbstractBackend = (*Backend)(nil)

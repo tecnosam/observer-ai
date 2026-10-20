@@ -6,12 +6,17 @@ package broker
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 
 	"github.com/observer-ai/engine/internal/common"
 	"github.com/observer-ai/engine/pkg/export"
+	exportmem "github.com/observer-ai/engine/pkg/export/memq"
+	exportnats "github.com/observer-ai/engine/pkg/export/natsq"
 	"github.com/observer-ai/engine/pkg/observe"
 	"github.com/observer-ai/engine/pkg/queue"
+	tracemem "github.com/observer-ai/engine/pkg/queue/memq"
+	tracenats "github.com/observer-ai/engine/pkg/queue/natsq"
 )
 
 // Kind names a broker in logs.
@@ -28,7 +33,7 @@ type AbstractFactory interface {
 	// Ingest builds the trace queue and span store.
 	Ingest(ctx context.Context, cfg queue.Config) (queue.AbstractBroker, error)
 	// ExportQueues builds the export queues. The streams are read only by NATS.
-	ExportQueues(streams export.NATSStreams) export.AbstractQueueFactory
+	ExportQueues(streams exportnats.Streams) export.AbstractQueueFactory
 	// Close releases what the factory holds. Close what it built first.
 	Close()
 }
@@ -37,6 +42,8 @@ type AbstractFactory interface {
 type Config struct {
 	// URL is the NATS server. Empty means in process.
 	URL      string
+	Auth     NATSAuth
+	TLS      NATSTLS
 	Logger   *slog.Logger
 	Reporter observe.Reporter
 }
@@ -46,7 +53,11 @@ func New(cfg Config) (AbstractFactory, error) {
 	if cfg.URL == "" {
 		return Memory{}, nil
 	}
-	conn, err := common.DialNATS(common.NATSConfig{URL: cfg.URL, Logger: cfg.Logger, Reporter: cfg.Reporter})
+	opts, err := natsOptions(cfg.Auth, cfg.TLS)
+	if err != nil {
+		return nil, fmt.Errorf("nats: %w", err)
+	}
+	conn, err := common.DialNATS(common.NATSConfig{URL: cfg.URL, Logger: cfg.Logger, Reporter: cfg.Reporter, Options: opts})
 	if err != nil {
 		return nil, err
 	}
@@ -63,11 +74,11 @@ type NATS struct {
 func (*NATS) Kind() Kind { return KindNATS }
 
 func (n *NATS) Ingest(ctx context.Context, cfg queue.Config) (queue.AbstractBroker, error) {
-	return queue.NewNATS(ctx, n.conn, cfg)
+	return tracenats.New(ctx, n.conn, cfg)
 }
 
-func (n *NATS) ExportQueues(streams export.NATSStreams) export.AbstractQueueFactory {
-	return export.NATSQueueFactory{Conn: n.conn, Streams: streams}
+func (n *NATS) ExportQueues(streams exportnats.Streams) export.AbstractQueueFactory {
+	return exportnats.Factory{Conn: n.conn, Streams: streams}
 }
 
 func (n *NATS) Close() { n.conn.Close() }
@@ -79,11 +90,11 @@ type Memory struct{}
 func (Memory) Kind() Kind { return KindMemory }
 
 func (Memory) Ingest(_ context.Context, cfg queue.Config) (queue.AbstractBroker, error) {
-	return queue.NewMemory(cfg), nil
+	return tracemem.New(cfg), nil
 }
 
-func (Memory) ExportQueues(export.NATSStreams) export.AbstractQueueFactory {
-	return export.MemoryQueueFactory{}
+func (Memory) ExportQueues(exportnats.Streams) export.AbstractQueueFactory {
+	return exportmem.Factory{}
 }
 
 func (Memory) Close() {}

@@ -1,4 +1,4 @@
-package queue
+package natsq
 
 import (
 	"context"
@@ -13,38 +13,15 @@ import (
 
 	"github.com/observer-ai/engine/internal/common"
 	"github.com/observer-ai/engine/pkg/fault"
+	"github.com/observer-ai/engine/pkg/queue"
 	"github.com/observer-ai/engine/pkg/trace"
 )
 
 const (
-	assemblerAckWait     = 30 * time.Second
-	assemblerOpTimeout   = 10 * time.Second
-	assemblerRetryDelay  = 5 * time.Second
-	assemblerMinRecheck  = 50 * time.Millisecond
-	maxPendingAssemblies = 100_000
+	assemblerAckWait    = 30 * time.Second
+	assemblerOpTimeout  = 10 * time.Second
+	assemblerMinRecheck = 50 * time.Millisecond
 )
-
-// SpanConfig configures how OTLP spans are stored and assembled into traces.
-type SpanConfig struct {
-	// Stream holds spans, one subject per trace: <Subject>.<trace id>.
-	Stream  string
-	Subject string
-	// MaxAge removes spans that were never assembled.
-	MaxAge time.Duration
-
-	// PendingStream holds one marker per trace that has spans waiting.
-	PendingStream  string
-	PendingSubject string
-
-	// IdleTimeout is how long a trace must receive no spans before it is
-	// considered complete.
-	IdleTimeout time.Duration
-	// MaxWait assembles a trace this long after its first span even if
-	// spans are still arriving.
-	MaxWait time.Duration
-}
-
-func (c SpanConfig) enabled() bool { return c.Stream != "" }
 
 func (q *Queue) setupSpans(ctx context.Context) error {
 	sc := q.cfg.Spans
@@ -66,7 +43,7 @@ func (q *Queue) setupSpans(ctx context.Context) error {
 		AckPolicy:     jetstream.AckExplicitPolicy,
 		AckWait:       assemblerAckWait,
 		MaxDeliver:    -1,
-		MaxAckPending: maxPendingAssemblies,
+		MaxAckPending: queue.MaxPendingAssemblies,
 	})
 	if err != nil {
 		return fmt.Errorf("consumer %s-assemblers: %w", q.cfg.Consumer, err)
@@ -85,6 +62,7 @@ func (q *Queue) spanStream() jetstream.StreamConfig {
 		Subjects:    []string{sc.Subject + ".*"},
 		Retention:   jetstream.LimitsPolicy,
 		Storage:     jetstream.FileStorage,
+		Replicas:    q.cfg.Replicas,
 		MaxAge:      sc.MaxAge,
 	}
 }
@@ -100,6 +78,7 @@ func (q *Queue) pendingStream() jetstream.StreamConfig {
 		Subjects:             []string{sc.PendingSubject + ".*"},
 		Retention:            jetstream.WorkQueuePolicy,
 		Storage:              jetstream.FileStorage,
+		Replicas:             q.cfg.Replicas,
 		MaxMsgsPerSubject:    1,
 		Discard:              jetstream.DiscardNew,
 		DiscardNewPerSubject: true,
@@ -110,7 +89,7 @@ func (q *Queue) pendingStream() jetstream.StreamConfig {
 // as pending assembly. It returns once NATS has confirmed every batch.
 // byTrace maps a trace ID to a serialized batch of that trace's spans.
 func (q *Queue) PublishSpans(ctx context.Context, byTrace map[string][]byte) error {
-	if !q.cfg.Spans.enabled() {
+	if !q.cfg.Spans.Enabled() {
 		return errors.New("queue: span storage is not configured")
 	}
 	sc := q.cfg.Spans
@@ -169,24 +148,19 @@ func waitAcks(ctx context.Context, acks []jetstream.PubAckFuture, markers bool) 
 	return nil
 }
 
-// AssembleFunc builds a trace from the span batches collected for it. An
-// error means the spans do not make a trace worth scoring; they are then
-// discarded.
-type AssembleFunc func(traceID string, batches [][]byte) (trace.Trace, error)
-
 // Assemblers is a running pool that turns completed span sets into traces
 // on the work queue. Stop stops them after the trace each is working on;
 // unassembled spans stay in the stream for the next start.
 type Assemblers struct {
 	*common.Pool
 	q        *Queue
-	assemble AssembleFunc
+	assemble queue.AssembleFunc
 }
 
 // StartAssemblers starts n assemblers. Each takes a pending-trace marker,
 // waits until the trace has been quiet for IdleTimeout (or MaxWait has
 // passed), assembles its spans and publishes the trace to the work queue.
-func (q *Queue) StartAssemblers(n int, assemble AssembleFunc) Stopper {
+func (q *Queue) StartAssemblers(n int, assemble queue.AssembleFunc) queue.Stopper {
 	a := &Assemblers{Pool: common.NewPool(), q: q, assemble: assemble}
 	a.Start(n, func() {
 		common.Pull(a.Pool, q.pendingCons, q.cfg.PollWait, a.handle, func(err error) {
@@ -301,7 +275,7 @@ func (j *assembly) done() { j.a.ack(j.marker, j.traceID) }
 // fail reports a failed step and tries the whole assembly again later.
 func (j *assembly) fail(op fault.Op, err error) {
 	j.report(op, err)
-	j.retryIn(assemblerRetryDelay)
+	j.retryIn(queue.AssemblerRetryDelay)
 }
 
 func (j *assembly) retryIn(delay time.Duration) {
