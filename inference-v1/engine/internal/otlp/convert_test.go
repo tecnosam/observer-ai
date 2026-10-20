@@ -15,7 +15,7 @@ import (
 	tracepb "go.opentelemetry.io/proto/otlp/trace/v1"
 	"google.golang.org/protobuf/proto"
 
-	"github.com/observer-ai/engine/internal/trace"
+	"github.com/observer-ai/engine/pkg/trace"
 )
 
 var testTraceID = []byte{0x5b, 0x8e, 0xfa, 0x3c, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}

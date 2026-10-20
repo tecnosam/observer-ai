@@ -60,6 +60,15 @@ scorer:
   max_retries: 3         # in-process retries after the first attempt
   backoff: [500ms, 2s, 5s]
 
+# One model per agent. The scorer section above is the default; each agent
+# listed here gets its own model, stating only what differs from it.
+agents:
+  attributes: [agent.name, service.name]         # where a trace names its agent: root span, then resource
+  # models:
+  #   support-bot:
+  #     model: kev-support
+  #     manifest: runs/support-bot/manifest.json  # see ../examples/agents.yaml
+
 policy:
   keep_threshold: 0.5
   random_floor: 0.02
@@ -73,6 +82,11 @@ observability:
     - kind: stdout
     # - kind: file
     #   path: /var/log/observer/errors.jsonl
+  # The engine's own OpenTelemetry metrics (latencies, error rates, decisions).
+  metrics:
+    # endpoint: http://localhost:4318/v1/metrics  # OTLP/HTTP; unset means off
+    # headers_env: METRICS_OTLP_HEADERS
+    interval: 15s
 
 # Where kept traces go: any number of OTLP/HTTP back ends, each sent every
 # kept trace asynchronously from its own queue (in NATS when queue.url is

@@ -173,14 +173,14 @@ paths:
               example:
                 status: ready
         "503":
-          description: NATS or Kev is not reachable.
+          description: The queue or a decision model is not reachable.
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/Status"
               example:
                 status: unavailable
-                error: "kev is not reachable: connection refused"
+                error: "model is not reachable: model kev-latest (default): connection refused"
 components:
   requestBodies:
     Trace:
@@ -251,6 +251,13 @@ components:
           type: string
           description: Your identifier for the trace. If omitted, the engine generates 32 hex characters.
           example: 7f3a91c2e8
+        agent:
+          type: string
+          description: |
+            The agent the trace came from. It picks the model that scores
+            the trace (agents.models in the config); an agent with no model
+            of its own, or no agent, gets the default model.
+          example: support-bot
         question:
           type: string
           minLength: 1
@@ -296,10 +303,13 @@ components:
           example: c68863b8105c8e95f34eba6666e18d91
     Decision:
       type: object
-      required: [trace_id, decision, p_keep, p_keep_raw, reason, severity, model, latency_ms, exported]
+      required: [trace_id, agent, decision, p_keep, p_keep_raw, reason, severity, model, latency_ms, exported]
       properties:
         trace_id:
           type: string
+        agent:
+          type: string
+          description: The trace's agent, empty if it named none.
         decision:
           type: string
           enum: [keep, drop]
@@ -339,7 +349,7 @@ components:
           description: Kev's reported latency, or the measured time if Kev reported none or on fallback.
         exported:
           type: boolean
-          description: The trace was kept and its flush to Phoenix did not fail.
+          description: The trace was kept, queued to at least one exporter, and every exporter's flush succeeded.
     Status:
       type: object
       required: [status]

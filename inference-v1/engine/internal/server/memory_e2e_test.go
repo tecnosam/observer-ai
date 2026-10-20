@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/observer-ai/engine/internal/queue"
+	"github.com/observer-ai/engine/pkg/queue"
 )
 
 // memoryBroker is the in-process broker main uses when queue.url is empty.

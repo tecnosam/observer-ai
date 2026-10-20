@@ -23,10 +23,10 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	"github.com/observer-ai/engine/internal/otlp"
-	"github.com/observer-ai/engine/internal/pipeline"
-	"github.com/observer-ai/engine/internal/queue"
-	"github.com/observer-ai/engine/internal/queue/queuetest"
-	"github.com/observer-ai/engine/internal/trace"
+	"github.com/observer-ai/engine/pkg/pipeline"
+	"github.com/observer-ai/engine/pkg/queue"
+	"github.com/observer-ai/engine/pkg/queue/queuetest"
+	"github.com/observer-ai/engine/pkg/trace"
 )
 
 // capture records what would be sent to Phoenix.

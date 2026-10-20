@@ -22,12 +22,13 @@ import (
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 
-	"github.com/observer-ai/engine/internal/export"
-	"github.com/observer-ai/engine/internal/fault"
-	"github.com/observer-ai/engine/internal/pipeline"
-	"github.com/observer-ai/engine/internal/policy"
-	"github.com/observer-ai/engine/internal/scorer"
-	"github.com/observer-ai/engine/internal/trace"
+	"github.com/observer-ai/engine/internal/common"
+	"github.com/observer-ai/engine/pkg/export"
+	"github.com/observer-ai/engine/pkg/fault"
+	"github.com/observer-ai/engine/pkg/pipeline"
+	"github.com/observer-ai/engine/pkg/policy"
+	"github.com/observer-ai/engine/pkg/scorer"
+	"github.com/observer-ai/engine/pkg/trace"
 )
 
 const (
@@ -102,6 +103,9 @@ type harnessOpts struct {
 	logger  *slog.Logger
 	// uploader, when set, receives traces that carry their original spans.
 	uploader export.Uploader
+	// models, when set, replaces the single model built from scorer.
+	models  pipeline.ModelRouter
+	metrics common.RequestMetrics
 }
 
 func newHarness(t *testing.T, o harnessOpts) *harness {
@@ -122,13 +126,16 @@ func newHarness(t *testing.T, o harnessOpts) *harness {
 	rec := tracetest.NewSpanRecorder()
 	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(rec))
 	t.Cleanup(func() { tp.Shutdown(context.Background()) })
+	if o.models == nil {
+		o.models = pipeline.SingleModel(pipeline.Model{Name: "kev-latest", Scorer: o.scorer, Temperature: pipeline.Temperature(o.temp)})
+	}
 	engine := pipeline.NewEngine(pipeline.Deps{
-		Scorer:   o.scorer,
+		Models:   o.models,
 		Policy:   policy.New(policy.Config{KeepThreshold: 0.5, RandomFloor: 0.02, SeverityHigh: 0.8}, o.rand),
 		Exporter: newExporter(t, tp, o.uploader),
 		Logger:   o.logger,
-	}, pipeline.Settings{Temperature: pipeline.Temperature(o.temp), Model: "kev-latest"})
-	srv := New(Options{Engine: engine, Queue: o.queue, MaxBodyBytes: o.maxBody})
+	})
+	srv := New(Options{Engine: engine, Queue: o.queue, MaxBodyBytes: o.maxBody, Metrics: o.metrics})
 	return &harness{srv: srv, engine: engine, queue: fq, recorder: rec}
 }
 
@@ -351,7 +358,7 @@ func TestReadyz(t *testing.T) {
 	if w.Code != http.StatusServiceUnavailable {
 		t.Errorf("status = %d, want 503 when Kev is down", w.Code)
 	}
-	if got := decodeBody[map[string]string](t, w)["error"]; !strings.Contains(got, "kev is not reachable: connection refused") {
+	if got := decodeBody[map[string]string](t, w)["error"]; !strings.Contains(got, "model is not reachable: model kev-latest (default): connection refused") {
 		t.Errorf("error = %q", got)
 	}
 
@@ -594,11 +601,11 @@ func (failingExporter) Flush(context.Context) error                        { ret
 func TestScoreWhenExportFlushFails(t *testing.T) {
 	srv := New(Options{
 		Engine: pipeline.NewEngine(pipeline.Deps{
-			Scorer:   &fakeScorer{score: fixedScore(0.9)},
+			Models:   pipeline.SingleModel(pipeline.Model{Name: "kev-latest", Scorer: &fakeScorer{score: fixedScore(0.9)}, Temperature: 1}),
 			Policy:   policy.New(policy.Config{KeepThreshold: 0.5, RandomFloor: 0, SeverityHigh: 0.8}, nil),
 			Exporter: failingExporter{},
 			Logger:   quiet,
-		}, pipeline.Settings{Temperature: 1, Model: "kev-latest"}),
+		}),
 		Queue: &fakeQueue{},
 	})
 

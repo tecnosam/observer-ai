@@ -14,22 +14,23 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"slices"
 	"syscall"
 	"time"
 
-	"github.com/observer-ai/engine/internal/broker"
-	"github.com/observer-ai/engine/internal/config"
-	"github.com/observer-ai/engine/internal/export"
-	"github.com/observer-ai/engine/internal/fault"
-	"github.com/observer-ai/engine/internal/metrics"
-	"github.com/observer-ai/engine/internal/observe"
 	"github.com/observer-ai/engine/internal/otlp"
-	"github.com/observer-ai/engine/internal/pipeline"
-	"github.com/observer-ai/engine/internal/policy"
-	"github.com/observer-ai/engine/internal/queue"
-	"github.com/observer-ai/engine/internal/scorer"
 	"github.com/observer-ai/engine/internal/server"
-	"github.com/observer-ai/engine/internal/trace"
+	"github.com/observer-ai/engine/pkg/broker"
+	"github.com/observer-ai/engine/pkg/config"
+	"github.com/observer-ai/engine/pkg/export"
+	"github.com/observer-ai/engine/pkg/fault"
+	"github.com/observer-ai/engine/pkg/metrics"
+	"github.com/observer-ai/engine/pkg/observe"
+	"github.com/observer-ai/engine/pkg/pipeline"
+	"github.com/observer-ai/engine/pkg/policy"
+	"github.com/observer-ai/engine/pkg/queue"
+	"github.com/observer-ai/engine/pkg/scorer"
+	"github.com/observer-ai/engine/pkg/trace"
 )
 
 // exportShutdownTimeout bounds the final span flush, separately from the
@@ -79,6 +80,7 @@ type app struct {
 	cfg    *config.Config
 	logger *slog.Logger
 
+	metrics    *metrics.Pipeline
 	reporter   *observe.Pipeline
 	broker     broker.AbstractFactory
 	queue      queue.AbstractBroker
@@ -93,7 +95,8 @@ type app struct {
 // start builds and starts every component, in dependency order.
 func (a *app) start(ctx context.Context) error {
 	steps := []func(context.Context) error{
-		a.startReporter, a.startBroker, a.startQueue, a.startExporter, a.startEngine, a.startWorkers, a.startOTLP, a.startHTTP,
+		a.startMetrics, a.startReporter, a.startBroker, a.startQueue, a.startExporter,
+		a.startEngine, a.startWorkers, a.startOTLP, a.startHTTP,
 	}
 	for _, step := range steps {
 		if err := step(ctx); err != nil {
@@ -105,9 +108,17 @@ func (a *app) start(ctx context.Context) error {
 	return nil
 }
 
+// startMetrics starts the engine's own OpenTelemetry metrics, or a recorder
+// that records nothing when observability.metrics.endpoint is unset.
+func (a *app) startMetrics(ctx context.Context) error {
+	m, err := metrics.Start(ctx, a.cfg.MetricsConfig())
+	a.metrics = m
+	return err
+}
+
 // startReporter builds the error pipeline every other component reports to.
 func (a *app) startReporter(context.Context) error {
-	reporter, err := observe.BuildPipeline(observe.DefaultSinkFactory{}, a.cfg.ErrorSinks(), metrics.Noop{})
+	reporter, err := observe.BuildPipeline(observe.DefaultSinkFactory{}, a.cfg.ErrorSinks(), a.metrics)
 	a.reporter = reporter
 	return err
 }
@@ -138,26 +149,26 @@ func (a *app) startExporter(ctx context.Context) error {
 		Factory:  export.OTLPBackendFactory{},
 		Queues:   a.broker.ExportQueues(a.cfg.ExportStreams()),
 		Reporter: a.reporter,
+		Metrics:  a.metrics,
 	})
 	a.exporter = exporter
 	return err
 }
 
+// startEngine builds every model (the default and one per configured
+// agent) and the engine that routes traces between them.
 func (a *app) startEngine(context.Context) error {
-	kev, err := scorer.New(a.cfg.ScorerConfig(a.reporter))
+	models, err := scorer.BuildRouter(scorer.HTTPFactory{}, a.cfg.Models(a.reporter))
 	if err != nil {
 		return err
 	}
 	a.engine = pipeline.NewEngine(pipeline.Deps{
-		Scorer:   kev,
+		Models:   models,
 		Policy:   policy.New(a.cfg.PolicyConfig(), nil),
 		Exporter: a.exporter,
 		Reporter: a.reporter,
-		Metrics:  metrics.Noop{},
+		Metrics:  a.metrics,
 		Logger:   a.logger,
-	}, pipeline.Settings{
-		Temperature: pipeline.Temperature(a.cfg.Manifest.Temperature),
-		Model:       pipeline.ModelName(a.cfg.Scorer.Model),
 	})
 	return nil
 }
@@ -180,12 +191,13 @@ func (a *app) startOTLP(context.Context) error {
 	if !a.cfg.OTLP.Enabled() {
 		return nil
 	}
-	a.receiver = otlp.NewReceiver(otlp.ReceiverConfig{Sink: a.queue, Reporter: a.reporter})
+	a.receiver = otlp.NewReceiver(otlp.ReceiverConfig{Sink: a.queue, Reporter: a.reporter, Metrics: a.metrics})
 	if err := a.receiver.Start(a.cfg.OTLP.GRPCAddr, a.cfg.OTLP.HTTPAddr); err != nil {
 		a.receiver = nil
 		return explainAddrInUse(err)
 	}
-	a.assemblers = a.queue.StartAssemblers(a.cfg.OTLP.Assemblers, otlp.Assemble)
+	assembler := otlp.Assembler{AgentAttributes: a.cfg.AgentAttributes()}
+	a.assemblers = a.queue.StartAssemblers(a.cfg.OTLP.Assemblers, assembler.Assemble)
 	return nil
 }
 
@@ -198,7 +210,7 @@ func explainAddrInUse(err error) error {
 }
 
 func (a *app) startHTTP(context.Context) error {
-	srv := server.New(server.Options{Engine: a.engine, Queue: a.queue, Reporter: a.reporter})
+	srv := server.New(server.Options{Engine: a.engine, Queue: a.queue, Reporter: a.reporter, Metrics: a.metrics})
 	a.http = &http.Server{
 		Addr:              a.cfg.Server.Addr,
 		Handler:           srv.Handler(),
@@ -225,6 +237,9 @@ func (a *app) logStart() {
 		"scorer_api_key_env", cfg.Scorer.APIKeyEnv,
 		"kev_endpoint", cfg.Scorer.Endpoint,
 		"kev_model", cfg.Scorer.Model,
+		"agent_models", agentModels(cfg),
+		"agent_attributes", cfg.Agents.Attributes,
+		"metrics_endpoint", cfg.Observability.Metrics.Endpoint,
 		"manifest_model", cfg.Manifest.Model,
 		"decision_question", cfg.Scorer.DecisionQuestion,
 		"temperature", cfg.Manifest.Temperature,
@@ -232,6 +247,16 @@ func (a *app) logStart() {
 		"random_floor", cfg.Policy.RandomFloor,
 		"exporters", exporterNames(cfg.Exporters),
 	)
+}
+
+// agentModels lists each agent with its own model as agent=model@endpoint.
+func agentModels(cfg *config.Config) []string {
+	out := make([]string, 0, len(cfg.Agents.Models))
+	for agent, m := range cfg.Agents.Models {
+		out = append(out, agent+"="+m.Model+"@"+m.Endpoint)
+	}
+	slices.Sort(out)
+	return out
 }
 
 // exporterNames lists the back ends as name=endpoint, never their headers.
@@ -283,6 +308,7 @@ func (a *app) shutdown() error {
 		a.stopOTLP(drainCtx),
 		wrapStop("stop workers", a.workers.Stop(drainCtx)),
 		a.flushExporter(),
+		a.flushMetrics(),
 	}
 	if err := errors.Join(errs...); err != nil {
 		return err
@@ -309,6 +335,14 @@ func (a *app) flushExporter() error {
 	return wrapStop("flush exporter", a.exporter.Shutdown(ctx))
 }
 
+// flushMetrics sends the last metrics, after everything that records them
+// has stopped.
+func (a *app) flushMetrics() error {
+	ctx, cancel := context.WithTimeout(context.Background(), exportShutdownTimeout)
+	defer cancel()
+	return wrapStop("flush metrics", a.metrics.Shutdown(ctx))
+}
+
 // abort stops whatever start managed to start, after a failure.
 func (a *app) abort() {
 	ctx, cancel := context.WithTimeout(context.Background(), a.cfg.Server.ShutdownTimeout.Std())
@@ -319,6 +353,9 @@ func (a *app) abort() {
 	}
 	if a.exporter != nil {
 		_ = a.exporter.Shutdown(context.Background())
+	}
+	if a.metrics != nil {
+		_ = a.metrics.Shutdown(ctx)
 	}
 	a.close()
 }

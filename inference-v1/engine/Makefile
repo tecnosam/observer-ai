@@ -67,7 +67,7 @@ golden:
 # including every Unicode code point.
 fuzz-golden:
 	$(PYTHON) testdata/gen_fuzz.py $(FUZZ)
-	OBSERVER_FUZZ_GOLDEN=$(FUZZ) go test ./internal/trace -run TestBuildStateFuzzGolden -count=1 -v
+	OBSERVER_FUZZ_GOLDEN=$(FUZZ) go test ./pkg/trace -run TestBuildStateFuzzGolden -count=1 -v
 	rm -f $(FUZZ)
 
 clean:

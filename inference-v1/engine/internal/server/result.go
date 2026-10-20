@@ -1,12 +1,13 @@
 package server
 
-import "github.com/observer-ai/engine/internal/pipeline"
+import "github.com/observer-ai/engine/pkg/pipeline"
 
 // Result is the decision for one trace, as returned by POST /v1/traces:score.
 // p_keep and p_keep_raw are null when the model could not be reached and the
 // decision was a fallback.
 type Result struct {
 	TraceID   string   `json:"trace_id"`
+	Agent     string   `json:"agent"`
 	Decision  string   `json:"decision"`
 	PKeep     *float64 `json:"p_keep"`
 	PKeepRaw  *float64 `json:"p_keep_raw"`
@@ -24,6 +25,7 @@ func resultOf(out pipeline.Outcome) Result {
 	rec, d := out.Record, out.Record.Decision
 	res := Result{
 		TraceID:   rec.Trace.TraceID,
+		Agent:     string(rec.Trace.Agent),
 		Decision:  d.Label(),
 		Reason:    string(d.Reason),
 		Severity:  string(d.Severity),

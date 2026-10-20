@@ -1,0 +1,32 @@
+# agents.yaml
+#
+# One fine-tuned model per agent. Traces from support-bot and research-agent
+# are scored by their own models; every other trace by the default (the
+# scorer section). A trace names its agent with the OpenInference span
+# attribute agent.name, or its resource's service.name; a JSON API trace
+# with its agent field.
+#
+#   cd ../engine && make run CONFIG=../examples/agents.yaml
+#
+# Each agents.models entry states only what differs from scorer and inherits
+# the rest. Point each manifest at the run directory the fine-tuning SDK
+# wrote for that agent; the ones in manifests/ are placeholders with neutral
+# temperatures.
+# Keys not listed here keep the defaults in ../engine/observer.yaml.
+
+scorer:
+  endpoint: http://localhost:8010/v1/systemone
+  model: kev-latest
+  manifest: ../engine/testdata/manifest.json
+
+agents:
+  attributes: [agent.name, service.name]
+  models:
+    support-bot:
+      model: kev-support-bot                       # same Kev server, another model
+      manifest: manifests/support-bot.json
+    research-agent:
+      endpoint: http://localhost:8011/v1/systemone # its own Kev server
+      model: kev-research-agent
+      manifest: manifests/research-agent.json
+      timeout: 20s

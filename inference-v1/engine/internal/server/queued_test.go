@@ -13,12 +13,12 @@ import (
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 
-	"github.com/observer-ai/engine/internal/fault"
-	"github.com/observer-ai/engine/internal/pipeline"
-	"github.com/observer-ai/engine/internal/queue"
-	"github.com/observer-ai/engine/internal/queue/queuetest"
-	"github.com/observer-ai/engine/internal/scorer"
-	"github.com/observer-ai/engine/internal/trace"
+	"github.com/observer-ai/engine/pkg/fault"
+	"github.com/observer-ai/engine/pkg/pipeline"
+	"github.com/observer-ai/engine/pkg/queue"
+	"github.com/observer-ai/engine/pkg/queue/queuetest"
+	"github.com/observer-ai/engine/pkg/scorer"
+	"github.com/observer-ai/engine/pkg/trace"
 )
 
 func TestProcessQueued(t *testing.T) {

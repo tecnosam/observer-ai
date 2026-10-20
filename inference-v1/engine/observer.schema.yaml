@@ -8,7 +8,7 @@
 # The engine checks more than a schema can say: several keys must agree with
 # each other. Those rules are in the descriptions, marked "Rule:".
 #
-# internal/config/schema_test.go fails if this file and the Go config drift
+# pkg/config/schema_test.go fails if this file and the Go config drift
 # apart (a key missing on either side, or a different default).
 $schema: https://json-schema.org/draft/2020-12/schema
 $id: https://observer.ai/schemas/observer.schema.yaml
@@ -267,7 +267,10 @@ properties:
 
   scorer:
     type: object
-    description: The Kev decision model that scores each trace, and the manifest of the fine-tuning run it serves.
+    description: >-
+      The default decision model: it scores every trace whose agent has no
+      model of its own under agents.models, and the manifest of the
+      fine-tuning run it serves.
     additionalProperties: false
     required: [manifest]
     properties:
@@ -341,6 +344,37 @@ properties:
           delay is random, between half the base and the base. Empty means
           500ms doubling per retry, capped at 30s.
 
+  agents:
+    type: object
+    description: >-
+      One model per agent: each trace is scored by the model fine-tuned on
+      its agent's traces. The agent is named by a span attribute (OTLP) or
+      the trace's agent field (JSON API). An agent with no model here, or a
+      trace naming no agent, is scored by the scorer section.
+    additionalProperties: false
+    properties:
+      attributes:
+        type: array
+        items: {type: string, minLength: 1}
+        default: [agent.name, service.name]
+        description: >-
+          The attributes that hold the agent's name, tried in order on the
+          trace's root span and then on its resource; the first one set wins.
+          agent.name is OpenInference's; service.name is the OpenTelemetry
+          resource's. Rule: at least one when models is set.
+      models:
+        type: object
+        description: >-
+          Agent name to its model, e.g. support-bot: {model: kev-support,
+          manifest: runs/support/manifest.json}. Each entry takes the scorer
+          section's keys and inherits every key it leaves out from it, as
+          written in the file (OBSERVER_SCORER_ENDPOINT and OBSERVER_MANIFEST
+          change only the scorer section). A relative manifest resolves against
+          this file's directory. queue.ack_wait must exceed the slowest
+          model's worst case.
+        additionalProperties:
+          $ref: '#/properties/scorer'
+
   policy:
     type: object
     description: How a keep probability becomes a keep or drop decision.
@@ -397,6 +431,41 @@ properties:
             path:
               type: string
               description: "For a file sink, the file to append to. Rule: required for kind file."
+      metrics:
+        type: object
+        default: {interval: 15s}
+        description: >-
+          The engine's own OpenTelemetry metrics, sent over OTLP/HTTP:
+          http.server.request.duration (JSON API and OTLP/HTTP),
+          rpc.server.call.duration (OTLP/gRPC), observer.scorer.duration (by
+          agent and model), observer.export.duration (by exporter),
+          observer.decisions and observer.errors. Failures carry error.type,
+          so an error rate is their count over the total. Off unless endpoint
+          is set.
+        additionalProperties: false
+        properties:
+          endpoint:
+            $ref: '#/$defs/httpURL'
+            description: >-
+              The full OTLP/HTTP metrics URL, path included, e.g.
+              http://otel-collector:4318/v1/metrics. Empty turns metrics off.
+          headers:
+            type: object
+            additionalProperties: {type: string}
+            description: Headers sent as written. Keep secrets in headers_env.
+          headers_env:
+            type: string
+            description: >-
+              Name of an environment variable holding more headers, "key=value,key2=value2".
+              OTEL_EXPORTER_OTLP_HEADERS is not read. Rule: must be set when named.
+          interval:
+            $ref: '#/$defs/duration'
+            default: 15s
+            description: "How often metrics are sent. Rule: positive."
+          resource_attributes:
+            type: object
+            additionalProperties: {type: string}
+            description: Added to service.name=observer-engine, e.g. deployment.environment.
 
   exporters:
     type: array

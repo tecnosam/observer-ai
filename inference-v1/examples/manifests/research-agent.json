@@ -1,0 +1,22 @@
+{
+  "model": "kev-research-agent",
+  "note": "Placeholder for the manifest the fine-tuning SDK writes for the research-agent agent's model (its run directory's manifest.json). The temperatures are 1.0; use the ones your own run fits.",
+  "questions": {
+    "answer_wrong": {
+      "type": "noul",
+      "instructions": "Is the final answer wrong or only partially correct for the user's question?"
+    },
+    "keep_or_drop": {
+      "type": "choice",
+      "instructions": "Should this agent trace be kept for human review?",
+      "criteria": {
+        "keep": "The final answer is wrong, only partly correct or unsupported by the evidence, or the agent misused or skipped its tools.",
+        "drop": "The final answer is correct, complete and supported by the evidence, and the agent used its tools appropriately."
+      }
+    }
+  },
+  "temperatures": {
+    "answer_wrong": 1.0,
+    "keep_or_drop": 1.0
+  }
+}

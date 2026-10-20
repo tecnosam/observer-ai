@@ -6,7 +6,7 @@ import (
 	commonpb "go.opentelemetry.io/proto/otlp/common/v1"
 	tracepb "go.opentelemetry.io/proto/otlp/trace/v1"
 
-	"github.com/observer-ai/engine/internal/trace"
+	"github.com/observer-ai/engine/pkg/trace"
 )
 
 // SpansFromTrace renders a trace record as OpenInference spans: an AGENT root

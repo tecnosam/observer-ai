@@ -20,8 +20,10 @@ import (
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 
-	"github.com/observer-ai/engine/internal/fault"
-	"github.com/observer-ai/engine/internal/observe"
+	"github.com/observer-ai/engine/internal/common"
+	"github.com/observer-ai/engine/pkg/fault"
+	"github.com/observer-ai/engine/pkg/metrics"
+	"github.com/observer-ai/engine/pkg/observe"
 )
 
 const (
@@ -48,6 +50,7 @@ type Receiver struct {
 
 	sink     Sink
 	reporter observe.Reporter
+	metrics  common.RequestMetrics
 
 	grpcServer *grpc.Server
 	httpServer *http.Server
@@ -56,21 +59,29 @@ type Receiver struct {
 // ReceiverConfig is what a Receiver is built from.
 type ReceiverConfig struct {
 	Sink     Sink
-	Reporter observe.Reporter // defaults to observe.Discard
+	Reporter observe.Reporter      // defaults to observe.Discard
+	Metrics  common.RequestMetrics // defaults to recording nothing
 }
 
 func NewReceiver(cfg ReceiverConfig) *Receiver {
 	if cfg.Reporter == nil {
 		cfg.Reporter = observe.Discard
 	}
-	r := &Receiver{sink: cfg.Sink, reporter: cfg.Reporter}
+	if cfg.Metrics == nil {
+		cfg.Metrics = metrics.Noop{}
+	}
+	r := &Receiver{sink: cfg.Sink, reporter: cfg.Reporter, metrics: cfg.Metrics}
 
-	r.grpcServer = grpc.NewServer(grpc.MaxRecvMsgSize(maxRequestBytes))
+	r.grpcServer = grpc.NewServer(grpc.MaxRecvMsgSize(maxRequestBytes), grpc.UnaryInterceptor(r.timeGRPC))
 	coltracepb.RegisterTraceServiceServer(r.grpcServer, r)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST "+HTTPPath, r.handleHTTP)
-	r.httpServer = &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 2 * time.Minute}
+	r.httpServer = &http.Server{
+		Handler:           common.InstrumentHTTP("otlp", mux, cfg.Metrics),
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       2 * time.Minute,
+	}
 	return r
 }
 
@@ -128,6 +139,17 @@ func (r *Receiver) Shutdown(ctx context.Context) error {
 		err = errors.Join(err, ctx.Err())
 	}
 	return err
+}
+
+// timeGRPC records every gRPC call's duration and status code.
+func (r *Receiver) timeGRPC(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+	start := time.Now()
+	resp, err := handler(ctx, req)
+	r.metrics.RequestFinished(ctx, metrics.Request{
+		Server: "otlp", Protocol: metrics.ProtocolGRPC, Method: info.FullMethod,
+		Status: int(status.Code(err)), Duration: time.Since(start),
+	})
+	return resp, err
 }
 
 // Export implements the OTLP gRPC TraceService.

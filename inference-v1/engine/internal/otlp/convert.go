@@ -18,7 +18,7 @@ import (
 	tracepb "go.opentelemetry.io/proto/otlp/trace/v1"
 	"google.golang.org/protobuf/proto"
 
-	"github.com/observer-ai/engine/internal/trace"
+	"github.com/observer-ai/engine/pkg/trace"
 )
 
 // OpenInference attribute names and span kinds.
@@ -112,13 +112,26 @@ func validID(id []byte, size int) bool {
 	return false
 }
 
+// Assembler builds traces from stored spans. AgentAttributes name the
+// attributes that hold the agent's name, tried in order on the root span and
+// then on its resource; the first one set names the trace's agent.
+type Assembler struct {
+	AgentAttributes []string
+}
+
+// Assemble builds a trace without looking for its agent: it goes to the
+// default model.
+func Assemble(traceID string, payloads [][]byte) (trace.Trace, error) {
+	return Assembler{}.Assemble(traceID, payloads)
+}
+
 // Assemble merges the span batches collected for one trace (as produced by
 // Split) and builds the trace record the model is asked about. The record
 // carries the merged spans in its OTLP field. It returns ErrNotScorable when
 // the spans hold no agent run with a question and an answer. A root span
 // whose output.value is set but empty gives a record with an empty
 // FinalAnswer, so a run that gave up is still scored.
-func Assemble(traceID string, payloads [][]byte) (trace.Trace, error) {
+func (a Assembler) Assemble(traceID string, payloads [][]byte) (trace.Trace, error) {
 	merged, spans, err := merge(payloads)
 	if err != nil {
 		return trace.Trace{}, err
@@ -143,6 +156,7 @@ func Assemble(traceID string, payloads [][]byte) (trace.Trace, error) {
 	tools := spansOfKind(spans, kindTool)
 	t := trace.Trace{
 		TraceID:     traceID,
+		Agent:       a.agentOf(root, resourceOf(merged, root)),
 		Question:    question,
 		FinalAnswer: answer,
 		ToolCalls:   toolCalls(tools),
@@ -152,6 +166,36 @@ func Assemble(traceID string, payloads [][]byte) (trace.Trace, error) {
 		return trace.Trace{}, fmt.Errorf("otlp: encode trace %s: %w", traceID, err)
 	}
 	return t, nil
+}
+
+// agentOf is the first configured attribute set on the root span, else on
+// its resource.
+func (a Assembler) agentOf(root *tracepb.Span, res *resourcepb.Resource) trace.AgentName {
+	for _, key := range a.AgentAttributes {
+		if v := attr(root, key); v != "" {
+			return trace.AgentName(v)
+		}
+		for _, kv := range res.GetAttributes() {
+			if kv.GetKey() == key && anyString(kv.GetValue()) != "" {
+				return trace.AgentName(anyString(kv.GetValue()))
+			}
+		}
+	}
+	return ""
+}
+
+// resourceOf is the resource the span was sent under.
+func resourceOf(td *tracepb.TracesData, span *tracepb.Span) *resourcepb.Resource {
+	for _, rs := range td.GetResourceSpans() {
+		for _, ss := range rs.GetScopeSpans() {
+			for _, s := range ss.GetSpans() {
+				if s == span {
+					return rs.GetResource()
+				}
+			}
+		}
+	}
+	return nil
 }
 
 // merge joins span batches, dropping spans already seen (an exporter that

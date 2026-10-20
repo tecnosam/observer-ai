@@ -4,7 +4,7 @@ Ready-to-run variations of the engine's config file. Each one sets only what
 differs from the defaults in [`../engine/observer.yaml`](../engine/observer.yaml);
 every key it leaves out keeps its default.
 [`../engine/observer.schema.yaml`](../engine/observer.schema.yaml) documents
-every key, and a test (`internal/config/examples_test.go`) checks that each
+every key, and a test (`pkg/config/examples_test.go`) checks that each
 example here loads.
 
 | File | Use it to |
@@ -15,6 +15,7 @@ example here loads.
 | [`review-more.yaml`](review-more.yaml) | Keep more traces for review: a lower threshold and a larger random sample |
 | [`remote-services.yaml`](remote-services.yaml) | Run against Kev, NATS and a hosted Phoenix on other machines |
 | [`langfuse.yaml`](langfuse.yaml) | Send kept traces to Langfuse as well as Phoenix |
+| [`agents.yaml`](agents.yaml) | One fine-tuned model per agent, with a default for the rest |
 
 ## Running one
 

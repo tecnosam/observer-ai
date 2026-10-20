@@ -11,10 +11,12 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/observer-ai/engine/internal/fault"
-	"github.com/observer-ai/engine/internal/observe"
-	"github.com/observer-ai/engine/internal/pipeline"
-	"github.com/observer-ai/engine/internal/trace"
+	"github.com/observer-ai/engine/internal/common"
+	"github.com/observer-ai/engine/pkg/fault"
+	"github.com/observer-ai/engine/pkg/metrics"
+	"github.com/observer-ai/engine/pkg/observe"
+	"github.com/observer-ai/engine/pkg/pipeline"
+	"github.com/observer-ai/engine/pkg/trace"
 )
 
 const (
@@ -28,7 +30,8 @@ const (
 type Options struct {
 	Engine   *pipeline.Engine
 	Queue    pipeline.Publisher
-	Reporter observe.Reporter // defaults to observe.Discard
+	Reporter observe.Reporter      // defaults to observe.Discard
+	Metrics  common.RequestMetrics // defaults to recording nothing
 	// MaxBodyBytes caps a request body; 0 means 8 MiB.
 	MaxBodyBytes int64
 }
@@ -46,6 +49,9 @@ func New(opts Options) *Server {
 	if opts.MaxBodyBytes <= 0 {
 		opts.MaxBodyBytes = defaultMaxBodyBytes
 	}
+	if opts.Metrics == nil {
+		opts.Metrics = metrics.Noop{}
+	}
 	s := &Server{opts: opts, mux: http.NewServeMux()}
 	s.mux.HandleFunc("POST /v1/traces", s.handleEnqueue)
 	s.mux.HandleFunc("POST /v1/traces:score", s.handleScore)
@@ -56,7 +62,8 @@ func New(opts Options) *Server {
 	return s
 }
 
-func (s *Server) Handler() http.Handler { return s.mux }
+// Handler serves the API, timing every request.
+func (s *Server) Handler() http.Handler { return common.InstrumentHTTP("api", s.mux, s.opts.Metrics) }
 
 // handleEnqueue answers 202 only after the queue has confirmed the trace is
 // stored, so an accepted trace survives a restart of this process.
@@ -116,7 +123,7 @@ func (s *Server) notReady(ctx context.Context) string {
 		return "queue is not reachable: " + err.Error()
 	}
 	if err := s.opts.Engine.Ready(ctx); err != nil {
-		return "kev is not reachable: " + err.Error()
+		return "model is not reachable: " + err.Error()
 	}
 	return ""
 }

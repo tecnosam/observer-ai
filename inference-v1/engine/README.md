@@ -185,10 +185,15 @@ file is loaded.
 | `scorer.timeout` | `10s` | Timeout per attempt |
 | `scorer.max_retries` | `3` | In-process retries after the first attempt |
 | `scorer.backoff` | `[500ms, 2s, 5s]` | Base delay before each retry; the last value repeats |
+| `agents.attributes` | `[agent.name, service.name]` | Span attributes naming a trace's agent, tried on the root span then its resource. See [One model per agent](#one-model-per-agent) |
+| `agents.models` | none | Agent name to its model: any `scorer` keys, the rest inherited from `scorer` |
 | `policy.keep_threshold` | `0.5` | Keep when calibrated `p_keep` reaches this |
 | `policy.random_floor` | `0.02` | Share of below-threshold traces kept at random |
 | `alert.severity_high` | `0.8` | `p_keep` at which a kept trace is `high` severity |
 | `observability.error_sinks` | `[{kind: stdout}]` | Where the engine's own errors are written, one JSON object per line: `stdout`, and/or `file` with a `path` |
+| `observability.metrics.endpoint` | empty (off) | OTLP/HTTP metrics URL for the engine's own metrics. See [Metrics](#metrics) |
+| `observability.metrics.headers`, `headers_env` | none | Headers for the metrics endpoint, as for an exporter |
+| `observability.metrics.interval` | `15s` | How often metrics are sent |
 | `exporters` | one Phoenix at `http://localhost:6006/v1/traces` | The trace back ends kept traces go to; see [Exporters](#exporters). An empty list exports nothing |
 | `exporters[].name` | (required) | Names the back end in logs, errors and its NATS stream: letters, digits, `-`, `_`; unique |
 | `exporters[].endpoint` | (required) | OTLP/HTTP traces URL, including the path |
@@ -219,9 +224,10 @@ The engine validates the config at start-up and exits with a clear error if:
 
 - a threshold is outside [0, 1], a duration does not parse, or a key is unknown
 - the decision question is missing from the manifest or is not `noul`
-- `queue.ack_wait` is not longer than the worst-case scoring time (every Kev
-  attempt timing out, plus backoff: 47.5s with the defaults), since a shorter
-  value would hand a trace to a second worker while the first is still on it
+- `queue.ack_wait` is not longer than the worst-case scoring time of the
+  slowest model (every attempt timing out, plus backoff: 47.5s with the
+  defaults), since a shorter value would hand a trace to a second worker
+  while the first is still on it
 
 ### The manifest
 
@@ -238,6 +244,50 @@ The manifest is the JSON the fine-tuning notebook writes:
 - A relative `scorer.manifest` path resolves against the config file's
   directory. The example config points at
   `../../finetune/notebooks/runs/observer-kev-0.8b-ft/manifest.json`.
+
+### One model per agent
+
+Each agent can have its own model, fine-tuned on that agent's traces. The
+`scorer` section is the default model; `agents.models` adds one per agent,
+stating only what differs:
+
+```yaml
+scorer:                                # the default: any agent not listed below
+  endpoint: http://kev:8010/v1/systemone
+  manifest: runs/default/manifest.json
+
+agents:
+  attributes: [agent.name, service.name]
+  models:
+    support-bot:
+      model: kev-support                # same Kev server, another model
+      manifest: runs/support-bot/manifest.json
+    research-agent:
+      endpoint: http://kev-gpu-2:8010/v1/systemone
+      model: kev-research
+      manifest: runs/research-agent/manifest.json
+```
+
+- **Which agent.** For OTLP traces, the first of `agents.attributes` set on
+  the root span, else on its resource: OpenInference's `agent.name`, then the
+  resource's `service.name` by default. For the JSON API, the trace's
+  `agent` field.
+- **Which model.** The agent's entry under `agents.models`, else the
+  `scorer` section. A trace that names no agent, or an agent not listed, is
+  scored by the default.
+- **Inheritance.** Each entry takes any `scorer` key (`kind`, `endpoint`,
+  `model`, `api_key_env`, `manifest`, `decision_question`, `timeout`,
+  `max_retries`, `backoff`) and inherits the others from `scorer` as written
+  in the file. `OBSERVER_SCORER_ENDPOINT` and `OBSERVER_MANIFEST` change only
+  the `scorer` section.
+- **Calibration.** Each model is calibrated with its own manifest's
+  temperature.
+- **Everywhere.** The decision log, the `/v1/traces:score` response, the
+  `eval.agent` span attribute and the metrics all carry the agent, and
+  `eval.model` the model. `/readyz` probes the default model only, so one
+  agent's model being down does not make the whole engine unready.
+
+[`../examples/agents.yaml`](../examples/agents.yaml) is a complete example.
 
 ## OTLP ingestion
 
@@ -343,6 +393,7 @@ attributes that Phoenix's instrumentors emit.
 | Trace field | Taken from |
 | --- | --- |
 | Root span | The span whose parent is not in the trace, preferring `openinference.span.kind` = `AGENT`, then `CHAIN` |
+| `agent` | The first of `agents.attributes` set on the root span, else on its resource |
 | `question` | Root span `input.value` |
 | `final_answer` | Root span `output.value` |
 | `tool_calls` | Spans with kind `TOOL`, ordered by start time |
@@ -401,6 +452,7 @@ In memory it survives only as long as the process.
 ```json
 {
   "trace_id": "7f3a91c2e8",
+  "agent": "support-bot",
   "question": "Which river flows through the capital of France?",
   "tool_calls": [{"name": "search", "args": {"query": "capital of France"}, "status": "ok"}],
   "evidence": ["Paris is the capital of France.", "The Seine flows through Paris."],
@@ -411,6 +463,7 @@ In memory it survives only as long as the process.
 - `question` and `final_answer` are required. `final_answer` may be an empty
   string for a run that ended without an answer.
 - `trace_id` is optional; the engine generates 32 hex characters if it is missing.
+- `agent` is optional and picks the model (see [One model per agent](#one-model-per-agent)).
 - `args` may be any JSON value. `status` defaults to `ok`.
 - This is the engine's own JSON API on port 8080. The OTLP receiver also
   serves a `/v1/traces` path, on port 4318, with a different body.
@@ -431,6 +484,7 @@ every exporter's back end when the response arrives.
 ```json
 {
   "trace_id": "wrong-river-001",
+  "agent": "",
   "decision": "keep",
   "p_keep": 0.626,
   "p_keep_raw": 0.6087,
@@ -465,27 +519,33 @@ status code or a field of the decision response goes missing from it.
 ### `GET /healthz` and `GET /readyz`
 
 `/healthz` returns 200 whenever the process is up. `/readyz` returns 200 only
-if the queue is up (the NATS connection, when NATS is used) and Kev answers `GET /v1/models` on the scorer
-host within 2 seconds, and 503 otherwise.
+if the queue is up (the NATS connection, when NATS is used) and the default
+model (the `scorer` section) answers `GET /v1/models` on its host within 2
+seconds, and 503 otherwise. An agent's own model is not checked: when it is
+down, only that agent's traces are affected (retried, then dead-lettered),
+so it does not take the engine out of a load balancer; watch
+`observer.scorer.duration` with `error.type` per `observer.model` for it.
 
 ## How a decision is made
 
-1. **Slice.** `trace.BuildState` renders the trace into the text the model was
+1. **Route.** The trace's agent picks its model (see
+   [One model per agent](#one-model-per-agent)).
+2. **Slice.** `trace.BuildState` renders the trace into the text the model was
    trained on (see [The slice](#the-slice-and-its-golden-files)).
-2. **Score.** The slice and the manifest questions go to Kev. Timeouts,
+3. **Score.** The slice and the model's manifest questions go to its Kev. Timeouts,
    connection errors and 5xx responses are retried in-process with jittered
    backoff (between half and all of the configured delay).
-3. **Calibrate.** `p_keep = sigmoid(logit(p_raw) / T)`, with `p_raw` clamped
+4. **Calibrate.** `p_keep = sigmoid(logit(p_raw) / T)`, with the model's `T`, with `p_raw` clamped
    to [1e-6, 1 - 1e-6].
-4. **Decide.**
+5. **Decide.**
    - `p_keep >= keep_threshold`: keep, reason `kev`.
    - Otherwise keep with probability `random_floor`, reason `random_floor`.
    - Otherwise drop, reason `below_threshold`.
-5. **Severity.** `high` if kept and `p_keep >= alert.severity_high`, `normal`
+6. **Severity.** `high` if kept and `p_keep >= alert.severity_high`, `normal`
    for other keeps, `none` for drops. This version only records severity; it
    sends no alerts.
-6. **Export.** Kept traces are queued to every exporter. Each decision produces one JSON log
-   line with `trace_id`, `decision`, `p_keep`, `reason` and `latency_ms`.
+7. **Export.** Kept traces are queued to every exporter. Each decision produces one JSON log
+   line with `trace_id`, `agent`, `decision`, `p_keep`, `reason`, `model` and `latency_ms`.
 
 ### When Kev cannot score a trace
 
@@ -680,6 +740,7 @@ Root span attributes:
 | `output.value` | string | rebuilt | The final answer |
 | `observer.source_trace_id` | string | rebuilt | The client's `trace_id` |
 | `observer.evidence.<i>` | string | rebuilt | Each evidence item, 0-based, untruncated |
+| `eval.agent` | string | both | The trace's agent; empty if it named none |
 | `eval.decision` | string | both | `keep` (dropped traces are not exported) |
 | `eval.reason` | string | both | Why: `kev` (the model), `random_floor`, or `fallback` (the model could not score it) |
 | `eval.severity` | string | both | `high` or `normal` |
@@ -708,6 +769,39 @@ Resource attributes worth setting per back end:
 
 Rebuilt spans go through a batch span processor per exporter; forwarded spans
 are sent at once, with a 10-second timeout per attempt.
+
+## Metrics
+
+With `observability.metrics.endpoint` set, the engine sends its own
+OpenTelemetry metrics over OTLP/HTTP every `interval`, to a Collector or any
+back end that takes OTLP metrics:
+
+```yaml
+observability:
+  metrics:
+    endpoint: http://otel-collector:4318/v1/metrics
+    headers_env: METRICS_OTLP_HEADERS     # optional, "key=value,..."
+    resource_attributes:
+      deployment.environment: production
+```
+
+| Instrument | Kind | Attributes | Measures |
+| --- | --- | --- | --- |
+| `http.server.request.duration` | histogram (s) | `observer.server` (`api`, `otlp`), `http.request.method`, `http.route`, `http.response.status_code` | JSON API and OTLP/HTTP requests |
+| `rpc.server.call.duration` | histogram (s) | `observer.server`, `rpc.system`, `rpc.method`, `rpc.grpc.status_code` | OTLP/gRPC calls |
+| `observer.scorer.duration` | histogram (s) | `observer.agent`, `observer.model` | Model calls, retries included |
+| `observer.export.duration` | histogram (s) | `observer.exporter` | Sends to a trace back end |
+| `observer.decisions` | counter | `observer.agent`, `observer.model`, `observer.decision`, `observer.reason` | Decided traces |
+| `observer.errors` | counter | `observer.component`, `error.type` | Errors reported to the error sinks |
+
+A failed request or call also carries `error.type`: the status code (5xx for
+HTTP, any non-OK gRPC code), or the error kind (`unavailable`, `timeout`,
+`rejected`, ...) for model calls and sends. An error rate is the count with
+`error.type` over the total count; a latency percentile comes from the
+histogram. The resource has `service.name=observer-engine` plus
+`resource_attributes`. As with exporters, the global
+`OTEL_EXPORTER_OTLP_HEADERS` is not read. The last metrics are sent on
+shutdown.
 
 ## The slice and its golden files
 
@@ -804,7 +898,7 @@ shut down (up to 10 seconds in all).
 ## Tests
 
 `make test` needs no network and no Docker. The queue tests run a real NATS
-server in-process on a loopback port (`internal/queue/queuetest`), so
+server in-process on a loopback port (`pkg/queue/queuetest`), so
 redelivery, dead-lettering and stream limits are tested against JetStream
 itself, not a fake.
 
@@ -812,18 +906,22 @@ itself, not a fake.
 
 ```
 cmd/observer/      flags, config load, wiring, graceful shutdown
-internal/pipeline/ the core: domain types, interfaces, calibration, the Engine
-internal/fault/    the error type: kind, component, operation, trace
-internal/observe/  the error pipeline and its sinks (stdout, file)
-internal/metrics/  metrics recorders (no-op for now)
-internal/config/   settings and manifest: loaders, compiler, validation, defaults
-internal/trace/    trace types, BuildState, Python repr
-internal/scorer/   Kev client, retries, calibration, error classification
-internal/policy/   keep/drop decision, random floor, severity
-internal/otlp/     OTLP gRPC and HTTP receivers, span-to-trace mapping
-internal/queue/    JetStream streams, publisher, span assembly, worker pool, dead-lettering
-internal/export/   exporters: the async dispatcher and the OTLP/HTTP back end
-internal/server/   HTTP handlers and the OpenAPI spec
+pkg/               the reusable engine, importable by other Go programs:
+  pipeline/        the core: domain types, interfaces, model routing, calibration, the Engine
+  trace/           trace types (with the agent), BuildState, Python repr
+  fault/           the error type: kind, component, operation, trace
+  observe/         the error pipeline and its sinks (stdout, file)
+  metrics/         the engine's OpenTelemetry metrics
+  config/          settings and manifests: loaders, compiler, validation, defaults
+  scorer/          Kev client, its factory, the per-agent model builder
+  policy/          keep/drop decision, random floor, severity
+  broker/          where the queues live: NATS or in memory
+  queue/           the trace queue and span store: JetStream or in memory
+  export/          exporters: the async dispatcher, its queues, the OTLP/HTTP back end
+internal/          this binary's own pieces:
+  server/          HTTP handlers and the OpenAPI spec
+  otlp/            OTLP gRPC and HTTP receivers, span-to-trace mapping
+  common/          shared helpers: NATS connection and pull loop, worker pool, retry policy, request metrics
 testdata/          trace fixtures, golden slices, fake Kev responses
 scripts/           send_samples.py: post dataset traces to a running engine
 Dockerfile         multi-stage build of the engine image

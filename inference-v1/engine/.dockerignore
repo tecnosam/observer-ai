@@ -6,4 +6,4 @@
 !internal/
 !observer.yaml
 **/*_test.go
-internal/queue/queuetest/
+pkg/queue/queuetest/
